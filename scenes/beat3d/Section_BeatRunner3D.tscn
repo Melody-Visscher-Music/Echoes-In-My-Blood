@@ -1,0 +1,107 @@
+[gd_scene format=3 uid="uid://ciljqq3o5xlrc"]
+
+[ext_resource type="Script" uid="uid://bo5mvo0rgspw0" path="res://scripts/beat3d/Section_BeatRunner3d.gd" id="1_lksyk"]
+[ext_resource type="Script" uid="uid://bn8w1532et3bd" path="res://scripts/beat3d/BeatRunnerPlayer.gd" id="2_ccaxu"]
+
+[sub_resource type="AudioStream" id="AudioStream_ccaxu"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_kgtng"]
+
+[sub_resource type="CapsuleMesh" id="CapsuleMesh_fbt0n"]
+
+[sub_resource type="CameraAttributesPractical" id="CameraAttr_player"]
+dof_blur_far_enabled = true
+dof_blur_far_distance = 50.0
+dof_blur_far_transition = 30.0
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_lksyk"]
+size = Vector3(12, 1, 50000)
+
+[sub_resource type="BoxMesh" id="BoxMesh_ccaxu"]
+size = Vector3(12, 1, 50000)
+
+[sub_resource type="Environment" id="Environment_beatrunner"]
+background_mode = 1
+background_color = Color(0.02, 0.01, 0.04, 1)
+background_energy_multiplier = 1.5
+tonemap_mode = 3
+tonemap_exposure = 0.8
+ssr_enabled = true
+ssr_max_steps = 32
+ssr_fade_in = 0.1
+ssr_fade_out = 3.0
+ssr_depth_tolerance = 0.15
+ssao_enabled = true
+sdfgi_use_occlusion = true
+sdfgi_bounce_feedback = 1.99
+glow_enabled = true
+glow_normalized = true
+glow_intensity = 2.0
+glow_bloom = 0.05
+glow_hdr_scale = 2.5
+fog_enabled = true
+fog_light_color = Color(0.24805847, 0.27228287, 0.30997485, 1)
+volumetric_fog_density = 0.002
+volumetric_fog_albedo = Color(0.31061712, 0.31061712, 0.3106171, 1)
+
+[node name="Section_BeatRunner3d" type="Node3D" unique_id=84023186]
+script = ExtResource("1_lksyk")
+wall_jump_count = 7
+runner_randomness = 1.0
+gate_preview_beats = 0.5
+gate_keep_behind_beats = 1.0
+min_gate_preview_distance = 15.0
+
+[node name="Music" type="AudioStreamPlayer" parent="." unique_id=2032172720]
+stream = SubResource("AudioStream_ccaxu")
+
+[node name="Player" type="CharacterBody3D" parent="." unique_id=750512853]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0)
+script = ExtResource("2_ccaxu")
+fur_accent_highlight = 0.04
+fur_accent_desaturate = 0.04
+fur_length = 0.1
+fur_density = 0.71
+fur_scruffiness = 0.46
+fur_thickness = 1.82
+fur_render_skin = true
+fur_lod = false
+slide_cooldown = 0.05
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Player" unique_id=1854135530]
+shape = SubResource("CapsuleShape3D_kgtng")
+
+[node name="Visual" type="MeshInstance3D" parent="Player" unique_id=1649529223]
+mesh = SubResource("CapsuleMesh_fbt0n")
+
+[node name="CameraPivot" type="Node3D" parent="Player" unique_id=458415481]
+transform = Transform3D(-1, -4.4258636e-16, 8.742278e-08, 9.444632e-10, 0.99994165, 0.0108034015, -8.741767e-08, 0.0108034015, -0.99994165, 0, 3.9849997, -10.275754)
+
+[node name="Camera3D" type="Camera3D" parent="Player/CameraPivot" unique_id=1828484516]
+transform = Transform3D(1, 0, 0, 0, 0.9531907, 0.3023699, 0, -0.3023699, 0.9531907, -5.077188e-07, -0.20196581, -5.8076277)
+attributes = SubResource("CameraAttr_player")
+fov = 62.0
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="Player" unique_id=2040175416]
+transform = Transform3D(1, 0, 0, 0, -0.8215773, 0.5700971, 0, -0.5700971, -0.8215773, 0, 0, 0)
+light_energy = 0.5
+shadow_enabled = true
+sky_mode = 1
+
+[node name="Track" type="Node3D" parent="." unique_id=1191084195]
+
+[node name="FloorBody" type="StaticBody3D" parent="Track" unique_id=328349375]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.5, 25000)
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Track/FloorBody" unique_id=1739305913]
+shape = SubResource("BoxShape3D_lksyk")
+
+[node name="FloorMesh" type="MeshInstance3D" parent="Track/FloorBody" unique_id=2019603191]
+mesh = SubResource("BoxMesh_ccaxu")
+
+[node name="Gates" type="Node3D" parent="." unique_id=1710312537]
+
+[node name="WorldFX" type="Node3D" parent="." unique_id=2038491574]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=538981958]
+environment = SubResource("Environment_beatrunner")

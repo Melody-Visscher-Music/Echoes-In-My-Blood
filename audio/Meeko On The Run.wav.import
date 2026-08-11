@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://05aq4s1pd0p3"
+path="res://.godot/imported/Meeko On The Run.wav-4d426279ae1bd8379941e838d5406fba.sample"
+
+[deps]
+
+source_file="res://audio/Meeko On The Run.wav"
+dest_files=["res://.godot/imported/Meeko On The Run.wav-4d426279ae1bd8379941e838d5406fba.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

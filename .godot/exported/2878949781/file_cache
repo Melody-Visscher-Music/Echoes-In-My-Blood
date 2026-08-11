@@ -1,0 +1,54 @@
+res://audio/Tutorial.mp3::065cce866da3b54d217e1bb7d5e61704815529d5fa13737040a2390047966736::1778056549::
+res://audio/We Clash.wav::2788b6f0729aa07547ea49591edf05cfac423b5a0d00c2777e5f6e8c06948354::1776704409::
+res://data/beatmaps/tutorial.json::353e3479de976a877b3d5488ac7a4b66::1779098276::
+res://scenes/beat3d/Section_BeatRunner3D.tscn::9908fbabd01a1953d766889851ee2794::1781787973::res://.godot/exported/2878949781/export-ad5afc9ab5395d431b9a6d2aabd41cd5-Section_BeatRunner3D.scn
+res://scenes/sections/Section_Rhythm2D.tscn::34229d82bb8867e3f83bf60af168dd5f::1776704410::res://.godot/exported/2878949781/export-23d9e302f07cd9f0faf99d820612e4e6-Section_Rhythm2D.scn
+res://scenes/Boot.tscn::7e0324135c76afe749610935371bdbf3::1776704410::res://.godot/exported/2878949781/export-102cd3dba65fd0ae3d53c527c8b2ae68-Boot.scn
+res://scenes/Main.tscn::f59921081931010db8229c5afd06cba6::1779026334::res://.godot/exported/2878949781/export-4a24720ee5e787dbe30abc634fa3679d-Main.scn
+res://scenes/SongSelect.tscn::9cde7c658aca4a29a10307feb3cc39c0::1779028457::res://.godot/exported/2878949781/export-e9d9e00b4c53d9d894d4900f4d4bcbcc-SongSelect.scn
+res://tools/ManualMapper.tscn::2f6d29713928d4447b6618adb8f0295f::1779093996::res://.godot/exported/2878949781/export-5144d4679178e41bf2993436a859bb51-ManualMapper.scn
+res://addons/so_fluffy/density_default.tres::8728496444feb91482a02005080df7f6::1781619224::res://.godot/exported/2878949781/export-01674dcf5254444e7863124c5f00d3e7-density_default.res
+res://addons/so_fluffy/icon.svg::f7b450c3b226ea6e0d5fb2ce68d18dfa75c381d57ad4e281763588a7bd4d0b59::1781619224::
+res://addons/so_fluffy/shell_material.tres::777466bfb6cc24d09276f64e8c57c721::1781619224::res://.godot/exported/2878949781/export-08c46071254ee7880ce4016dfaa676b6-shell_material.res
+res://addons/so_fluffy/so_fluffy.gdshader::9e5746ad8c2ad3468c3947d411ef7080::1781688870::
+res://addons/so_fluffy/thickness_default.tres::847c57b64180b58a06236961561d324c::1781619224::res://.godot/exported/2878949781/export-f2aa67f7db2cba1256b3b1847e2096de-thickness_default.res
+res://addons/so_fluffy/turbulence_default.tres::1aeb68e57bb2625246e8073b13bbda3c::1781687266::res://.godot/exported/2878949781/export-b127fe17d374cb7a2936013b58cfa4df-turbulence_default.res
+res://assets/track/LightPost.glb::c85c8b3db163fa4d0ad786c440490dd4a6502345e485d86ab203df548e005e22::1781556254::
+res://assets/track/TrackStraight_10m.glb::846961e922da0f4f62d1e1922c81d0fd5c98a0de018aee1b1d550aa28af99653::1781218735::
+res://assets/track/TrackStraight_10m_Curb.png::89be350784f0669930bfe69c4d283cf3530ebc0e475f86ed284f050fac28e377::1781218823::
+res://assets/track/TrackStraight_10m_Curb_1.png::d7349a340065f1d8525e6792d55c998e149130267c96462b216a0818df64a437::1781218823::
+res://assets/track/TrackStraight_10m_Curb_2.png::89be350784f0669930bfe69c4d283cf3d972b4f21e2cf372083cc588aaf6b184::1781218824::
+res://assets/track/TrackStraight_10m_Curb_3.png::b0457f8f4feaf53590c303444028eeabbaf4e8e1e4732810e4cf65868f60c781::1781218824::
+res://assets/track/TrackStraight_10m_Curb_4.png::89be350784f0669930bfe69c4d283cf3b360b14623f1dbeeb62731e7b439dec2::1781218824::
+res://assets/track/TrackStraight_10m_Curb_5.png::d7349a340065f1d8525e6792d55c998ee4269f26fc44c7ea51d0f0667b07dfee::1781218824::
+res://assets/track/TrackStraight_10m_Curb_6.png::b0457f8f4feaf53590c303444028eeab1f3694c69a2b89feb8fd64ade65223f4::1781218824::
+res://assets/track/TrackStraight_10m_Floor_Asphalt.png::89be350784f0669930bfe69c4d283cf3645655c324eacc63b0a0c5a6374c579b::1781218824::
+res://assets/track/TrackStraight_10m_Floor_Asphalt_8.png::a9db0def2feb0d880631e0ef73e9d2e2b3df0714080499536906cabdf99cb606::1781218824::
+res://assets/track/TrackStraight_10m_Floor_Asphalt_9.png::17b21d0529e47518a5781084be38bba654ab0cd9de589dc6539ef803270a1245::1781218824::
+res://assets/track/TrackStraight_10m_Floor_Asphalt_10.png::b3d35f68aed2fe82c196590448b67c7f6a9bdbb23ae769c3cd688b8dfef4267c::1781218824::
+res://assets/track/TrackStraight_10m_LaneLines_Light 2.png::49d4385651d961acea8b1f05c4ff1e6f7a098587d98fcffb1d0a1c774ad537a9::1781218824::
+res://assets/track/TrackStraight_10m_LaneLines_Light 2_12.png::89be350784f0669930bfe69c4d283cf35220c62bf53f7f9445a0e5f4771c91e0::1781218824::
+res://assets/track/TrackTurn90L_r20m.glb::254d60121400ef2b98113886e11361224f2bedbbbe239393ec7e78c765d2b45c::1781218806::
+res://assets/track/TrackTurn90L_r20m_asphalt_09_color.jpg::23e2b92f8d054c3490feee6c16a99efad8ebd1ac3f5dd93b888ef3fc3e2d0c6a::1781218826::
+res://assets/track/TrackTurn90L_r20m_asphalt_09_metallic-asphalt_09_roughness.png::6be44867baf0d5ce2ec13c89a3aaff72c337cb396ea8e7767334972143c60075::1781218827::
+res://assets/track/TrackTurn90L_r20m_asphalt_09_normal.jpg::f269940efb12e570d446135faf9cc2cbc0e2cc2d2a3d9c4b28db785ca87a7391::1781218825::
+res://assets/track/TrackTurn90R_r20m.glb::ffb75fc22e247d851e655ed817768e28b785f6c4b460e303eb39176086c09248::1781218760::
+res://assets/track/TrackTurn90R_r20m_asphalt_09_color.jpg::23e2b92f8d054c3490feee6c16a99efac48faa50a693e12d68b2111b220321ad::1781218829::
+res://assets/track/TrackTurn90R_r20m_asphalt_09_metallic-asphalt_09_roughness.png::6be44867baf0d5ce2ec13c89a3aaff7279736474973e6af865f3cbdda6d24443::1781218830::
+res://assets/track/TrackTurn90R_r20m_asphalt_09_normal.jpg::f269940efb12e570d446135faf9cc2cb5ecce11d295d7cce04091e2b7cc86846::1781218828::
+res://assets/track/WJLedge_01.glb::350dc0d9dc8dcb01c9a230a68f44b955d373d084f7f0cd9ce8c94fa309f1b042::1781773326::
+res://assets/track/WJLedge_02.glb::9a75391fbaa94e529d2a01a10aecd431d1722a1b0807e6c14072f4e77e18682b::1781773162::
+res://assets/track/WJLedge_03.glb::f4fcd4f267c7c40e4236c4ded6292fbaa19594b20b67435850febf013f61e133::1781776490::
+res://assets/track/WJLedge_04.glb::c1bdd176cf4a48ea74807d4f3958194d1ded2c12139607a9c7d73eced187b24b::1781776528::
+res://assets/track/WJLedge_05.glb::06d9b509c7e0e745d4437a25b03e5690b3fd54e818a2f261a9b06e43e94152f2::1781776544::
+res://assets/track/WJLedge_06.glb::e80d233611ef236f850da869aaf7cd5ed28194693c4f8827f332a1220eda71ad::1781776598::
+res://assets/track/WJLedge_07.glb::61606de7163db13c510eac88db78a0a2c8b2a04848551d6ee66815dbf9c63df3::1781776611::
+res://assets/SIAGCharacter.glb::0f9096341e9b6771dbab039ef93ba7e397f203c548aeb7698e08adae1fb93afa::1781620811::
+res://audio/Echoes in my blood.wav::57b7f15d16400b6d4ce7f24e8369b71d48de50443eda9270a89fd2c031cf703d::1781004170::
+res://audio/Raw Possesion.mp3::134fcb606bae2e8070a83f04389b12a9541448f4b717f154db345b9c62146734::1781516308::
+res://data/beatmaps/echoes_in_my_blood.json::944b4e54f828a3ba71b1f8751372a7ab::1781008589::
+res://data/beatmaps/raw_possesion.json::d8cb10a6aa2f6ffc6c8a908af875c2f4::1781614649::
+res://data/beatmaps/we_clash.json::fe4d9b2c7a99f9ad4d6b3c71e0b90c6f::1781682373::
+res://Graphics/ChatGPT Image Apr 17, 2026, 07_26_59 PM.png::1c965706f5d55cdabb95afba1105e175bb95df659c38ee25497eec130d38f8e6::1776468152::
+res://scenes/GameScene.tscn::82e4d38029d9ea486b8cd2b9f05c58e0::1779026248::res://.godot/exported/2878949781/export-15024b5764635ac5d5eac182fd173676-GameScene.scn
+res://scenes/HowToPlay.tscn::30132e957acc9763cf22848b9f373b6a::1779027531::res://.godot/exported/2878949781/export-2505ee343b0f0cb26b3868bfdc46af32-HowToPlay.scn

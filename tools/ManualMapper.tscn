@@ -1,0 +1,101 @@
+[gd_scene format=3 uid="uid://dvt3h73wrcau6"]
+
+[ext_resource type="Script" uid="uid://ccwqis8aitwqb" path="res://tools/ManualMapper.gd" id="1"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_hvhd3"]
+bg_color = Color(0.7402084, 0.44650003, 0.95, 0.27450982)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_xqyhk"]
+bg_color = Color(0.41000003, 0.5771667, 1, 0.27450982)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1314b"]
+bg_color = Color(3.9948522e-06, 0.70793754, 0.5023089, 0.27450982)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_l5afl"]
+bg_color = Color(0.71, 0.5916667, 0, 0.27450982)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_hpg62"]
+bg_color = Color(1, 0.34633332, 0.26, 0.27450982)
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_o45sn"]
+bg_color = Color(0.98, 0, 0.9473334, 0.6627451)
+
+[node name="ManualMapper" type="Control" unique_id=510626480]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("1")
+
+[node name="AudioStreamPlayer" type="AudioStreamPlayer" parent="." unique_id=1091686680]
+
+[node name="Top" type="HBoxContainer" parent="." unique_id=1677620031]
+layout_mode = 1
+anchors_preset = 10
+anchor_right = 1.0
+offset_bottom = 31.0
+grow_horizontal = 2
+
+[node name="BeatmapKey" type="LineEdit" parent="Top" unique_id=1603765827]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/normal = SubResource("StyleBoxFlat_hvhd3")
+placeholder_text = "Beatmap key"
+
+[node name="BPM" type="LineEdit" parent="Top" unique_id=1514074097]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/normal = SubResource("StyleBoxFlat_xqyhk")
+text = "150"
+placeholder_text = "BPM"
+
+[node name="Offset" type="LineEdit" parent="Top" unique_id=171741481]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/normal = SubResource("StyleBoxFlat_1314b")
+text = "0"
+placeholder_text = "Offset ms"
+
+[node name="Path" type="LineEdit" parent="Top" unique_id=1649867149]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_styles/normal = SubResource("StyleBoxFlat_l5afl")
+placeholder_text = "Song path (mp3/wav/ogg)"
+
+[node name="Buttons" type="HBoxContainer" parent="." unique_id=1930139340]
+layout_mode = 1
+anchors_preset = -1
+anchor_top = 0.068
+anchor_right = 1.0
+anchor_bottom = 0.117000006
+offset_left = 12.0
+offset_top = -0.06400299
+offset_right = -1.0
+offset_bottom = 0.18399811
+
+[node name="LoadChart" type="Button" parent="Buttons" unique_id=870271823]
+layout_mode = 2
+theme_override_styles/normal = SubResource("StyleBoxFlat_hpg62")
+theme_override_styles/hover = SubResource("StyleBoxFlat_o45sn")
+text = "Load Chart"
+
+[node name="Info" type="Label" parent="." unique_id=1204553308]
+layout_mode = 1
+anchors_preset = -1
+anchor_left = 0.094000004
+anchor_top = 0.045
+anchor_right = 0.99100006
+anchor_bottom = 0.133
+offset_left = -0.288002
+offset_top = -0.16000175
+offset_right = 11.36792
+offset_bottom = -0.18399811
+grow_horizontal = 2
+grow_vertical = 2
+theme_override_colors/font_color = Color(0.9681969, 0.72605115, 0.8164255, 1)
+text = "P: Pick | Space: Pause/Resume | Home/Ctrl+Bksp: Reset | Q/E: speed ±0.05 (Ctrl=±0.01) | [ ]: Latency ±5ms | F1: Preview | F2: Minimap | F3: Grid | F4: Quantize | F5: Audio Calib | Ctrl+S: Save | Ctrl+B: Backup | Ctrl+Alt+D: Main Menu | Shift+LMB add, Ctrl+RMB delete"
+autowrap_mode = 1
+
+[connection signal="pressed" from="Buttons/LoadChart" to="." method="_on_load_chart"]
