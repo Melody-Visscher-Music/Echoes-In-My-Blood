@@ -83,7 +83,7 @@ attributes = SubResource("CameraAttr_player")
 fov = 62.0
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="Player" unique_id=2040175416]
-transform = Transform3D(1, 0, 0, 0, -0.8215773, 0.5700971, 0, -0.5700971, -0.8215773, 0, 0, 0)
+transform = Transform3D(-0.9928723, 0.067946404, 0.09791881, -0.0039993813, -0.84010875, 0.54240346, 0.119116805, 0.53814566, 0.8343924, 0, 0, 0)
 light_energy = 0.5
 shadow_enabled = true
 sky_mode = 1

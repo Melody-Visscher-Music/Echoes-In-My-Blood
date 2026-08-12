@@ -2209,7 +2209,10 @@ def _strip_suffix(name):
 # The project's assets/track — used when the field in Colour Tools is empty
 # and no smart guess hits (fresh unsaved scene + installed add-on has neither
 # a .blend location nor a useful __file__, which otherwise finds nothing).
-_PROJECT_ASSETS_FALLBACK = r"C:\Users\maike\Documents\siag\assets\track"
+_PROJECT_ASSETS_FALLBACK = os.environ.get(
+    "SIAG_ASSETS",
+    os.path.join(os.path.expanduser("~"), "Documents", "siag", "assets", "track"),
+)
 
 
 def _assets_dir():

@@ -903,7 +903,7 @@ func _attach_so_fluffy(model: Node3D) -> void:
 			_so_fluffy_accent_nodes.append(accent_node)
 
 	# ── Apply shape / physics to ALL nodes via _set_fur_all ────────────────
-	_set_fur_all(&"number_of_shells",         fur_shells)
+	_set_fur_all(&"number_of_shells",         GraphicsQuality.scale_fur_shells(fur_shells))
 	_set_fur_all(&"length",                   fur_length)
 	_set_fur_all(&"density",                  fur_density)
 	_set_fur_all(&"scruffiness",              fur_scruffiness)

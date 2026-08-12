@@ -273,6 +273,23 @@ func _build_options_panel() -> Control:
 	fps_opt.item_selected.connect(func(idx: int) -> void: Engine.max_fps = fps_vals[idx])
 	fps_row.add_child(fps_opt)
 
+	var quality_row := _opt_row(vbox, "Quality", s)
+	var quality_opt := OptionButton.new()
+	var quality_ids: Array[String] = GraphicsQuality.TIERS   # ["low","medium","high","ultra"]
+	for qid: String in quality_ids:
+		quality_opt.add_item(qid.capitalize())
+	var qi := quality_ids.find(GraphicsQuality.tier)
+	quality_opt.selected = qi if qi >= 0 else 1
+	quality_opt.item_selected.connect(func(idx: int) -> void: GraphicsQuality.set_tier(quality_ids[idx]))
+	quality_row.add_child(quality_opt)
+
+	var quality_note := Label.new()
+	quality_note.text = "Auto-picked from your hardware on first launch — change it here anytime."
+	quality_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	quality_note.add_theme_font_size_override("font_size", int(12 * s))
+	quality_note.add_theme_color_override("font_color", Color(0.5, 0.5, 0.62, 1.0))
+	vbox.add_child(quality_note)
+
 	# ── Bottom buttons ────────────────────────────────────────────────────────
 	var sp := Control.new()
 	sp.custom_minimum_size = Vector2(0, int(6 * s))

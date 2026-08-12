@@ -29,6 +29,7 @@ driver/driver="default"
 
 Run="*res://autoload/Run.gd"
 GameConfig="*res://autoload/GameConfig.gd"
+GraphicsQuality="*res://autoload/GraphicsQuality.gd"
 RNG="*res://autoload/RNG.gd"
 Save="*res://autoload/Save.gd"
 ContentDB="*res://autoload/ContentDB.gd"
@@ -40,8 +41,12 @@ file_logging/enable_file_logging=true
 
 [display]
 
+window/size/viewport_width=1920
+window/size/viewport_height=1080
 window/size/mode=3
 window/size/initial_position_type=0
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
 window/vsync/vsync_mode=2
 
 [editor_plugins]

@@ -115,6 +115,8 @@ const _COUNTDOWN_DURATION: float = 1.5   # seconds of settle time before music s
 var _countdown_label:  Label  = null       # big center number (3 / 2 / 1 / GO!)
 var _countdown_title:  Label  = null       # song name shown during countdown
 var _beatmap_title:    String = ""         # parsed from JSON, shown in countdown
+var _warmup_done:      bool   = false      # set true once _warmup_shader_precompile() finishes;
+											# _start_level() will not fire until this is true
 
 # ── Pause state ───────────────────────────────────────────────────────────────
 var _paused: bool = false
@@ -468,6 +470,7 @@ func _ready() -> void:
 	player.set_physics_process(false)
 	_countdown_timer = _COUNTDOWN_DURATION
 	_spawn_countdown_ui()
+	_warmup_shader_precompile()   # runs in the background — see _update_countdown()
 
 
 func _process(delta: float) -> void:
@@ -671,8 +674,44 @@ func _spawn_countdown_ui() -> void:
 
 func _update_countdown(delta: float) -> void:
 	_countdown_timer -= delta
-	if _countdown_timer <= 0.0:
+	# Also wait on _warmup_done — if shader warm-up is still forcing gates
+	# visible to compile their pipelines, don't cut over to real gameplay
+	# (and its normal distance-windowed gate visibility) out from under it.
+	if _countdown_timer <= 0.0 and _warmup_done:
 		_start_level()
+
+
+## Gates only become visible within min_gate_preview_distance while the
+## player is stationary (see _update_gate_visibility()) — so most of a
+## level's gate variety never actually gets *drawn*, and therefore never
+## gets its render pipeline compiled by the GPU driver, until the player
+## runs into an unseen gate type mid-level. That's the real source of the
+## "choppy first 10-20 seconds" stutter, worst on levels that throw varied
+## gates at the player immediately with no lead-in.
+##
+## Fix: force every already-built gate visible for a handful of frames
+## right now, hidden behind the countdown's dark overlay, so the driver
+## compiles every unique gate pipeline while the player is still looking
+## at "GET READY" — then hide them again and hand back to
+## _update_gate_visibility() for normal distance-windowed reveal. Never
+## touches _gate_animated, so each gate's pop-in reveal tween still plays
+## the first time the player actually approaches it later.
+func _warmup_shader_precompile() -> void:
+	for gate in gate_nodes:
+		if gate != null and gate.process_mode != Node.PROCESS_MODE_DISABLED:
+			gate.visible = true
+
+	# A handful of real frames — enough for the renderer to submit draw
+	# calls for everything now visible and for the driver to work through
+	# compiling whatever pipelines it hasn't seen yet this run.
+	for _i in range(8):
+		await get_tree().process_frame
+
+	for gate in gate_nodes:
+		if gate != null:
+			gate.visible = false
+
+	_warmup_done = true
 
 
 func _start_level() -> void:
@@ -793,9 +832,18 @@ func _load_chart_and_build_plan() -> void:
 
 	# Remove beats that are too close together to be physically playable.
 	# The minimum gap scales with BPM: at high tempo we allow denser gates (down
-	# to 0.20 s hard floor for reaction time); at slow tempo we respect beat spacing.
+	# to a hard floor for reaction time); at slow tempo we respect beat spacing.
+	# Originally (0.20, ×0.55), which killed 1-2 out of every hardstyle
+	# double/triple/quadruple kick. First loosened to (0.08, ×0.35) — still not
+	# enough: at 150-160 BPM (Echoes in My Blood's range), 16th-note kick rolls
+	# sit at beat_s/4 ≈ 0.094-0.1 s apart, and ×0.35 was landing at ~0.13-0.14 s
+	# — still above the roll spacing, so it was still eating every other kick.
+	# Now ×0.22 (comfortably under beat_s/4, with margin for tap-timing jitter
+	# in the captured chart) so a full 16th-note roll survives intact at these
+	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
+	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.20, _raw_beat_s * 0.55)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.28)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
@@ -6968,6 +7016,12 @@ func _setup_world_environment() -> void:
 	env.fog_light_color    = Color(0.12, 0.04, 0.25, 1.0)
 	env.fog_light_energy   = 1.0
 	env.fog_density        = 0.008
+
+	# Quality-tier extras (SSR/SSAO/SSIL) — this Environment is the one that
+	# actually renders (this WorldEnvironment is added to the tree after the
+	# scene's own, so it supersedes it), so this is the correct place to
+	# apply Options > Display > Quality.
+	GraphicsQuality.apply_environment_overrides(env)
 
 	we.environment = env
 	_melody_env = env

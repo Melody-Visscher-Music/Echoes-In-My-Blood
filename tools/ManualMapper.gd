@@ -63,7 +63,7 @@ var _analyzer_dbg_last_progress_key: String = ""
 # ============================================================
 # External tools
 # ============================================================
-@export var python_executable: String = "C:/Users/maike/Documents/siag/tools/.venv/Scripts/pythonw.exe"
+@export var python_executable: String = ProjectSettings.globalize_path("res://tools/.venv/Scripts/pythonw.exe")
 @export var analyzer_script_path: String = "res://tools/BeatmapAnalyzer.py"
 @export var analysis_output_dir: String = "res://data/Analysis/" # auto-fallback to user://analysis/ if not writable
 
