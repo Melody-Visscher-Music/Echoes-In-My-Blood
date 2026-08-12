@@ -30,7 +30,7 @@ The game takes place entirely within the span of a **4 -5 months**. Everything �
 **Final Boss Unlock:** The Xevia boss fight only unlocks once the player has completed every single level with **80% accuracy or higher**. The player has to earn being Meeko at full power — mirroring the secret training Meeko does in the story before the final confrontation.
 
 **BPM Arc:**
-- Level 1 — 150 BPM (bouncy house / light hardstyle)
+- Level 1 — 130 BPM (bouncy house / light hardstyle)
 - Mid game — melodic, mid-tempo - 160-180 BPM (hardstyle)
 - Late game (Meeko track) — 185 BPM (rawstyle/hard techno)
 - Final boss (Xevia fight) — 230 BPM (Speedcore)
@@ -265,7 +265,7 @@ This is told as DLC specifically so it doesn't soften Xevia during the main game
 - options menu
 - jumps and slide sound in level
 - procedual level gen (random gate placement each run)
-- low detailed and low polly meeko asset\
+- low detailed and low polly meeko asset
 - lyrical system
 - Audio Calibration (for wired vs bluetooth latency sync - Fully Automated now)
 
