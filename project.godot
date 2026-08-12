@@ -44,14 +44,28 @@ file_logging/enable_file_logging=true
 window/size/viewport_width=1920
 window/size/viewport_height=1080
 window/size/mode=3
-window/size/initial_position_type=0
+window/size/initial_position_type=4
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
-window/vsync/vsync_mode=2
 
 [editor_plugins]
 
 enabled=PackedStringArray("res://addons/so_fluffy/plugin.cfg")
+
+[file_customization]
+
+folder_colors={
+"res://Graphics/": "pink",
+"res://addons/": "red",
+"res://assets/": "orange",
+"res://audio/": "yellow",
+"res://autoload/": "green",
+"res://blender/": "teal",
+"res://data/": "blue",
+"res://fonts/": "purple",
+"res://scenes/": "gray",
+"res://scripts/": "gray"
+}
 
 [input]
 

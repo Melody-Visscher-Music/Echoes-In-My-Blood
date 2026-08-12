@@ -128,6 +128,11 @@ var _pause_option: int          = 0       # 0 = RESUME, 1 = RESTART, 2 = MAIN ME
 # ── Gate spawn animation ──────────────────────────────────────────────────────
 var _gate_animated: Array[bool] = []      # true once the gate's intro tween has fired
 
+# ── Gate color-cycle material cache ────────────────────────────────────────────
+# Flat per-gate material lists collected once at build time (see _collect_cycle_mats),
+# so _update_color_cycle can pulse gates without a per-frame recursive tree walk.
+var _gate_cycle_mats: Array[Array] = []
+
 # ── City buildings ────────────────────────────────────────────────────────────
 # One material per BUILDING (all window strips on a building share it) — much
 # cheaper than one material per strip.  One roof light per building.
@@ -843,7 +848,7 @@ func _load_chart_and_build_plan() -> void:
 	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
 	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.28)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.35)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
@@ -2776,6 +2781,7 @@ func _build_all_gate_visuals() -> void:
 	gate_world_zs.clear()
 	gate_culled.clear()
 	_gate_animated.clear()
+	_gate_cycle_mats.clear()
 
 	_judge_index = 0
 	_vis_start_idx = 0
@@ -2792,6 +2798,7 @@ func _build_all_gate_visuals() -> void:
 		gate_success.append(false)
 		gate_world_zs.append(gate.global_position.z)
 		_gate_animated.append(false)
+		_gate_cycle_mats.append(_collect_cycle_mats(gate))
 
 	# WJ geometry is now spawned path-aware in _spawn_wj_geometry_on_path() after
 	# _build_track_path(), so _spawn_section_geometry() is no longer called here.
@@ -9227,25 +9234,26 @@ func _spawn_track_decorations() -> void:
 			lp_pd += lp_spacing
 
 
-## Blends the emission of all MeshInstance3D children (recursively) toward live_col.
-## Gate meshes store their original colour in the "base_color" meta — used here to
-## preserve shape readability while the world palette shifts.
-func _apply_cycle_to_node_meshes(node: Node3D, live_col: Color) -> void:
+## One-time collection (at gate-build time) of the StandardMaterial3D overrides
+## under a gate's VisRoot, so _update_color_cycle can pulse them every frame via
+## a flat array instead of re-walking the node tree. Same matching rule as the
+## old per-frame walk: only mi.material_override entries are tracked — authored
+## Blender-piece meshes use surface materials and are unaffected either way.
+func _collect_cycle_mats(node: Node3D) -> Array[StandardMaterial3D]:
 	var vis: Node3D = node.get_node_or_null("VisRoot") as Node3D
 	if vis == null:
 		vis = node
-	_cycle_meshes_recursive(vis, live_col)
-
-
-func _cycle_meshes_recursive(node: Node, live_col: Color) -> void:
-	for child in node.get_children():
-		if child is MeshInstance3D:
-			var mi: MeshInstance3D = child as MeshInstance3D
+	var out: Array[StandardMaterial3D] = []
+	var stack: Array[Node] = [vis]
+	while not stack.is_empty():
+		var n: Node = stack.pop_back()
+		if n is MeshInstance3D:
+			var mi: MeshInstance3D = n as MeshInstance3D
 			if mi.material_override is StandardMaterial3D:
-				var mat: StandardMaterial3D = mi.material_override as StandardMaterial3D
-				mat.emission = mat.emission.lerp(live_col, 0.04)
-		if child.get_child_count() > 0:
-			_cycle_meshes_recursive(child, live_col)
+				out.append(mi.material_override as StandardMaterial3D)
+		for c in n.get_children():
+			stack.append(c)
+	return out
 
 
 func _update_color_cycle(song_t: float) -> void:
@@ -9303,7 +9311,9 @@ func _update_color_cycle(song_t: float) -> void:
 				continue
 			if not gate.visible:
 				continue
-			_apply_cycle_to_node_meshes(gate, live_col)
+			if i < _gate_cycle_mats.size():
+				for mat: StandardMaterial3D in _gate_cycle_mats[i]:
+					mat.emission = mat.emission.lerp(live_col, 0.04)
 
 	# ── Floor ────────────────────────────────────────────────────────────────
 	if _floor_material != null:
