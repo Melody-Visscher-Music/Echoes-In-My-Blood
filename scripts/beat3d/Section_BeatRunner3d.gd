@@ -27,6 +27,7 @@ extends Node3D
 @onready var world_fx_root: Node3D = $WorldFX
 @onready var floor_mesh: MeshInstance3D    = $Track/FloorBody/FloorMesh
 @onready var _floor_body: StaticBody3D     = $Track/FloorBody
+@warning_ignore("unused_private_class_variable")
 @onready var _floor_col: CollisionShape3D  = $Track/FloorBody/CollisionShape3D
 @export var color_cycle_enabled: bool = true
 @export var color_cycle_period_s: float = 14.0
@@ -71,6 +72,7 @@ var gate_culled: Array[bool] = []   # permanently hidden — _update_gate_visibi
 var _judge_index: int = 0
 var _vis_start_idx: int = 0   # lower-bound cursor for visibility loop
 var _world_index: int = 0
+@warning_ignore("unused_private_class_variable")
 var _halo_preview_index: int = 0   # unused; kept to avoid parser errors on old references
 
 var _floor_material: StandardMaterial3D = null
@@ -142,6 +144,7 @@ var _city_pulse_t:     float = 0.0   # 0-1, set to 1 on each beat, decays in _pr
 var _electric_zones:   Array[Dictionary] = []  # [{start_t, end_t}] seconds; empty = all city
 
 # ── Electric theme ────────────────────────────────────────────────────────────
+@warning_ignore("unused_private_class_variable")
 var _elec_obs_mats:   Array[StandardMaterial3D] = []   # obstacle arc meshes — pulse hard
 var _elec_env_mats:   Array[StandardMaterial3D] = []   # pylon tip glows — pulse subtly
 var _elec_arc_lights: Array[OmniLight3D]        = []   # shared lights from both
@@ -848,7 +851,7 @@ func _load_chart_and_build_plan() -> void:
 	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
 	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.35)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.43)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
@@ -2480,6 +2483,7 @@ func _gen_alternating_vert(beat_count: int, start_lane: int) -> Array[String]:
 
 # 42. THREE_PHASE — phrase split into thirds: breathe / zigzag / rush arc.
 func _gen_three_phase(beat_count: int, start_lane: int) -> Array[String]:
+	@warning_ignore("integer_division")
 	var third: int = maxi(1, beat_count / 3)
 	var rest:  int = beat_count - third * 2
 	var p1: Array[String] = _gen_breathe(third, start_lane)
@@ -3359,6 +3363,7 @@ func _make_fence_post(height: float) -> Node3D:
 	var entry: Dictionary = (_piece_lib.first_of("fence_post") if _piece_lib != null else {})
 	if not entry.is_empty():
 		var auth_h: float = maxf(0.1, float(entry.params.get("height", 2.5)))
+		@warning_ignore("shadowed_global_identifier")
 		var wrap := Node3D.new()
 		var inst: Node3D = _piece_lib.instance(entry)
 		inst.rotation_degrees.y = 180.0
@@ -6209,7 +6214,9 @@ func _catch_spark(idx: int) -> void:
 	# Ramping FLOW multiplier: climbs with each consecutive catch, resets on a miss.
 	_grind_miss_streak  = 0
 	_grind_flow_streak += 1
+	@warning_ignore("integer_division")
 	_grind_flow_mult    = mini(1 + _grind_flow_streak / 3, _GRIND_FLOW_MULT_MAX)
+	
 
 	# Award score scaled by the flow multiplier (its own ramp, not the gate combo).
 	var pts: int = _GRIND_SCORE_PER_SPARK * _grind_flow_mult
@@ -7658,6 +7665,7 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 		return
 
 	var t_s:      float = _song_time()
+	@warning_ignore("unused_variable")
 	var vit:      float = _world_vitality
 	var init_col_a: Color = _current_cycle_color(t_s) if GameConfig.color_cycle_affects_halos else GameConfig.halo_color_a
 	var init_col_b: Color = GameConfig.halo_color_b   if GameConfig.halo_dual_color           else init_col_a

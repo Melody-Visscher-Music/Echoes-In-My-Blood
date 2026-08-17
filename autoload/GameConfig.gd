@@ -15,7 +15,7 @@ var hair_color:   Color = Color(0.90, 0.74,  0.10,  1.0)  # golden-blonde
 # ── Level colors ───────────────────────────────────────────────────────────────
 var level_color_a:       Color = Color(1.00, 0.45, 0.70, 1.0)    # pink  (cycle A)
 var level_color_b:       Color = Color(0.45, 0.82, 1.00, 1.0)    # cyan  (cycle B)
-var floor_color:         Color = Color(0.943, 0.948, 0.952, 1.0) # light grey floor
+var floor_color:         Color = Color(0.103, 0.113, 0.121, 1.0) # light grey floor
 var color_cycle_enabled:         bool  = true
 var color_cycle_affects_gates:   bool  = true   # gates tinted by cycle colour
 var color_cycle_affects_halos:   bool  = true   # halo rings follow cycle colour

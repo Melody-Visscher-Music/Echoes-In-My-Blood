@@ -20,6 +20,7 @@ run/main_scene="res://scenes/Boot.tscn"
 config/features=PackedStringArray("4.6", "Forward Plus")
 run/max_fps=120
 boot_splash/bg_color=Color(0, 0, 0, 1)
+config/windows_native_icon="res://Graphics/Echoes in my blood icon.ico"
 
 [audio]
 
