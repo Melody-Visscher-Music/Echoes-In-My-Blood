@@ -243,7 +243,7 @@ This is told as DLC specifically so it doesn't soften Xevia during the main game
 - Anne minigame full design and implementation
 - world/city map to select where to go (level, Anne's lab, shop, ect, Replacement of level select (for stoy still same level select in free play))
 - QOL changes
-- fully feldged out story writing
+- fully fledged out story writing
 - world assets models in blender
 - story mode
 - free play mode
@@ -263,7 +263,7 @@ This is told as DLC specifically so it doesn't soften Xevia during the main game
 - main menu
 - song select
 - options menu
-- jumps and slide sound in level
+- jumps and slide sound in level (temporarily removed)
 - procedual level gen (random gate placement each run)
 - low detailed and low polly meeko asset
 - lyrical system
