@@ -70,4 +70,7 @@ func _advance() -> void:
 	if _idx + 1 < _screens.size():
 		_show_screen(_idx + 1)
 	else:
-		get_tree().change_scene_to_file("res://scenes/Main.tscn")
+		# ShaderWarmup.tscn precompiles piece shaders once per version/quality
+		# tier, then hands off to Main.tscn itself (near-instant skip on every
+		# later launch once nothing's changed).
+		get_tree().change_scene_to_file("res://scenes/ShaderWarmup.tscn")

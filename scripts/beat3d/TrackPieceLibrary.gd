@@ -74,6 +74,14 @@ func of_type(t: String) -> Array:
 	return _by_type.get(t, [])
 
 
+## Every discovered piece, regardless of type — used by ShaderWarmup.gd to
+## instance one of everything so the GPU driver compiles each piece's render
+## pipeline once, up front, instead of the first time it's actually seen in
+## a level.
+func all_entries() -> Array[Dictionary]:
+	return _entries
+
+
 ## Returns the authored ledge for a given 1-based jump index (1 = first landing,
 ## 2 = second, … 8 = eighth).  Falls back to the generic wj_ledge if no
 ## index-specific piece exists, then to an empty dict if neither is present.

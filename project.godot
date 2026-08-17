@@ -91,6 +91,7 @@ textures/vram_compression/import_s3tc_bptc=true
 textures/vram_compression/import_etc2_astc=true
 lights_and_shadows/directional_shadow/size=2048
 anti_aliasing/quality/screen_space_aa=1
+occlusion_culling/use_occlusion_culling=true
 mesh_lod/lod_change/threshold_pixels=8.0
 lights_and_shadows/positional_shadow/atlas_size=1024
 global_illumination/sdfgi/enabled=false

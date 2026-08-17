@@ -120,6 +120,15 @@ var _beatmap_title:    String = ""         # parsed from JSON, shown in countdow
 var _warmup_done:      bool   = false      # set true once _warmup_shader_precompile() finishes;
 											# _start_level() will not fire until this is true
 
+# ── Level-build loading screen ─────────────────────────────────────────────────
+# _ready() used to build the entire level (gates, path, WJ geometry, floors,
+# decorations, city) synchronously in a single frame — a real freeze on a
+# dense level or slower machine, separate from shader-compile stutter. It now
+# awaits a frame between build stages and shows progress here instead.
+var _loading_layer: CanvasLayer = null
+var _loading_label: Label       = null
+var _loading_bar:   ProgressBar = null
+
 # ── Pause state ───────────────────────────────────────────────────────────────
 var _paused: bool = false
 @warning_ignore("unused_private_class_variable")
@@ -418,6 +427,14 @@ func _pick_random_lyric_font() -> void:
 
 
 func _ready() -> void:
+	# Disable input/physics immediately — level geometry now builds across
+	# several frames below (each _loading_step() yields one frame), so the
+	# player must not be able to move or fall through a half-built track
+	# while that's happening. Re-enabled in _start_level() as before.
+	player.input_disabled = true
+	player.set_physics_process(false)
+	_build_loading_ui()
+
 	# Apply user settings before any world/material setup
 	_pick_random_lyric_font()
 	_fx_tween_host = Node.new()
@@ -429,28 +446,46 @@ func _ready() -> void:
 	color_cycle_enabled = GameConfig.color_cycle_enabled
 	gate_preview_beats  = GameConfig.gate_preview_beats
 	_resolve_beatmap_from_run()
+
+	await _loading_step("Loading level…", 0.05)
 	_setup_world_environment()
 	_prepare_floor_material()
 	_load_chart_and_build_plan()
 	player.set_beat_duration(_runner_avg_beat_s)
+
+	await _loading_step("Scanning track pieces…", 0.15)
 	_piece_lib = TrackPieceLibrary.new()
 	_piece_lib.scan()                 # authored Blender pieces (assets/track) — BEFORE gate visuals
+
+	await _loading_step("Placing gates…", 0.30)
 	_build_all_gate_visuals()         # places gates at initial Z positions (no geometry yet)
 	_prescan_wj_zone()                # estimate WJ bounds from plan so path can protect the band
+
+	await _loading_step("Building track path…", 0.45)
 	_build_track_path()               # turns spread from 100 m onwards; only WJ band protected
 	_reposition_gates_on_path()       # move every gate to its correct world position on the path
+
+	await _loading_step("Building wall-jump geometry…", 0.58)
 	_spawn_wj_geometry_on_path()      # path-aware WJ geometry + gate lifts + WJ zone culling
 	# _cull_turn_zone_gates() — no longer needed; arc turns are smooth enough to play
 	_place_authored_corners()         # authored Blender corners — before path floors
+
+	await _loading_step("Laying floors…", 0.70)
 	_floor_body.visible = false       # hide the 50 km scene floor — path segments take over
 	_spawn_path_floors()              # spawn per-segment floor bodies
 	_spawn_corner_pieces()            # fill 90° gap pads at each turn junction
+
+	await _loading_step("Adding decorations…", 0.82)
 	_spawn_track_decorations()
 	_spawn_arc_decorations()          # outer barrier, inner accent, entry beacons
 	_spawn_floor_grid()
+
+	await _loading_step("Building the city…", 0.90)
 	_spawn_city_buildings()
 	if not _electric_zones.is_empty():
 		_spawn_electric_environment()
+
+	await _loading_step("Finishing up…", 0.97)
 	_setup_music()   # assigns stream only — does NOT play yet
 
 	var cb := Callable(self, "_on_music_finished")
@@ -471,14 +506,72 @@ func _ready() -> void:
 		_cam_fov_base = _camera.fov
 	_cam_prev_lane = player.current_lane
 
+	if _loading_layer != null:
+		_loading_layer.queue_free()
+		_loading_layer = null
+
 	# ── Countdown — hold everything until the engine has had time to settle ──
-	# IMPORTANT: disable physics too so the player doesn't run through early gates
-	# while the countdown is on screen.
-	player.input_disabled = true
-	player.set_physics_process(false)
+	# input/physics are already disabled from the top of _ready() and stay
+	# that way through the countdown too.
 	_countdown_timer = _COUNTDOWN_DURATION
 	_spawn_countdown_ui()
 	_warmup_shader_precompile()   # runs in the background — see _update_countdown()
+
+
+## Small dark full-screen loading overlay shown while _ready() builds the
+## level across multiple frames (see the loading-screen comment block near
+## the top of this file). Freed right before _spawn_countdown_ui() takes
+## over with "GET READY".
+func _build_loading_ui() -> void:
+	_loading_layer = CanvasLayer.new()
+	_loading_layer.layer = 49   # just under CountdownLayer (50)
+	_loading_layer.name  = "LoadingLayer"
+	add_child(_loading_layer)
+
+	var root := Control.new()
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_loading_layer.add_child(root)
+
+	var bg := ColorRect.new()
+	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	bg.color = Color(0.05, 0.02, 0.09, 1.0)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(bg)
+
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	root.add_child(center)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 12)
+	vb.custom_minimum_size = Vector2(420, 0)
+	center.add_child(vb)
+
+	_loading_label = Label.new()
+	_loading_label.text = "Loading level…"
+	_loading_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_loading_label.add_theme_font_size_override("font_size", 20)
+	_loading_label.add_theme_color_override("font_color", Color(0.80, 0.70, 1.00, 0.9))
+	vb.add_child(_loading_label)
+
+	_loading_bar = ProgressBar.new()
+	_loading_bar.min_value = 0.0
+	_loading_bar.max_value = 1.0
+	_loading_bar.value     = 0.0
+	_loading_bar.show_percentage = false
+	_loading_bar.custom_minimum_size = Vector2(0, 14)
+	vb.add_child(_loading_bar)
+
+
+## Updates the loading overlay and yields one frame so the bar/label above
+## actually gets drawn before the next (potentially heavy) build stage runs.
+func _loading_step(text: String, frac: float) -> void:
+	if _loading_label != null:
+		_loading_label.text = text
+	if _loading_bar != null:
+		_loading_bar.value = frac
+	await get_tree().process_frame
 
 
 func _process(delta: float) -> void:
@@ -7056,7 +7149,13 @@ func _spawn_floor_grid() -> void:
 	var line_t: float = 0.035
 	var grid_col: Color = Color(0.401, 0.117, 0.65, 0.0)
 
-	# Per-segment lane divider lines (one per lane gap per path segment)
+	# These lines are fully static (no per-frame recolor anywhere), every
+	# lane-gap line shares the same width/height/color, and only length
+	# varies per segment — an ideal MultiMesh target: one unit-length box
+	# mesh, per-instance transform scales it to the right length. One draw
+	# call for the whole track's divider grid instead of one MeshInstance3D
+	# per lane-gap per segment.
+	var xforms: Array[Transform3D] = []
 	for seg_var in _track_segs:
 		var seg: TrackSeg = seg_var as TrackSeg
 		var seg_len: float = minf(seg.length, end_path - seg.path_start)
@@ -7067,13 +7166,36 @@ func _spawn_floor_grid() -> void:
 
 		for i in range(player.lane_xs.size() - 1):
 			var lx: float = (player.lane_xs[i] + player.lane_xs[i + 1]) * 0.5
-			var line: MeshInstance3D = _make_box_mesh(Vector3(line_t, line_h, seg_len), grid_col)
-			line.position = seg_mid + seg.right * lx + Vector3(0.0, line_h * 0.5, 0.0)
-			line.rotation_degrees.y = seg_y_rot
-			var lmat: StandardMaterial3D = line.material_override as StandardMaterial3D
-			if lmat != null:
-				lmat.emission_energy_multiplier = 1.4
-			world_fx_root.add_child(line)
+			var pos: Vector3 = seg_mid + seg.right * lx + Vector3(0.0, line_h * 0.5, 0.0)
+			var basis := Basis.IDENTITY.scaled(Vector3(1.0, 1.0, seg_len))
+			basis = basis.rotated(Vector3.UP, deg_to_rad(seg_y_rot))
+			xforms.append(Transform3D(basis, pos))
+
+	if xforms.is_empty():
+		return
+
+	var unit_mesh := BoxMesh.new()
+	unit_mesh.size = Vector3(line_t, line_h, 1.0)
+
+	var grid_mat := StandardMaterial3D.new()
+	grid_mat.albedo_color               = grid_col
+	grid_mat.metallic                   = 0.05
+	grid_mat.roughness                  = 0.68
+	grid_mat.emission_enabled           = true
+	grid_mat.emission                   = grid_col
+	grid_mat.emission_energy_multiplier = 1.4
+
+	var grid_mm := MultiMesh.new()
+	grid_mm.transform_format = MultiMesh.TRANSFORM_3D
+	grid_mm.mesh = unit_mesh
+	grid_mm.instance_count = xforms.size()
+	for i in range(xforms.size()):
+		grid_mm.set_instance_transform(i, xforms[i])
+
+	var grid_mmi := MultiMeshInstance3D.new()
+	grid_mmi.multimesh = grid_mm
+	grid_mmi.material_override = grid_mat
+	world_fx_root.add_child(grid_mmi)
 
 
 # ── Neon city buildings ───────────────────────────────────────────────────────
@@ -7169,7 +7291,30 @@ func _spawn_city_buildings() -> void:
 				body.rotation_degrees.y = _path_y_rot_at(bz)
 				world_fx_root.add_child(body)
 
-				# ── Window strips — all share ONE material per building ───────
+				# Occluder matched exactly to the opaque body's own bounds —
+				# lets Godot's occlusion culling skip rendering anything fully
+				# hidden behind a building (from another building, decorations,
+				# etc.) without touching frustum culling, which already runs
+				# regardless. Only added for procedural bodies, where the exact
+				# box dimensions are known; authored buildings are skipped here
+				# rather than guessing at bounds and risking something visible
+				# getting incorrectly culled.
+				var occ := OccluderInstance3D.new()
+				var box_occ := BoxOccluder3D.new()
+				box_occ.size = Vector3(bw, bh, bd)
+				occ.occluder = box_occ
+				occ.position = body.position
+				occ.rotation_degrees.y = body.rotation_degrees.y
+				world_fx_root.add_child(occ)
+
+				# ── Window strips — one MultiMesh per building instead of one
+				# MeshInstance3D per strip. Every strip in a building already
+				# shares the same box size and Y-rotation (only its height
+				# differs), so batching them is a pure draw-call win — the
+				# shared win_mat / _city_bldg_mats pulse system below is
+				# completely untouched, it just now recolors a
+				# MultiMeshInstance3D's material_override instead of N
+				# individual MeshInstance3Ds.
 				var win_col: Color = win_palette[(bldg_i + ri * 3) % win_palette.size()]
 				var win_mat := StandardMaterial3D.new()
 				win_mat.albedo_color               = win_col.darkened(0.30)
@@ -7180,17 +7325,29 @@ func _spawn_city_buildings() -> void:
 
 				var strip_h:  float = 0.14
 				var strip_gap: float = 2.2
+				var strip_rot: float = _path_y_rot_at(bz)
+				var strip_positions: Array[Vector3] = []
 				var win_y:    float = strip_gap
 				while win_y < bh - 0.5:
-					var strip := MeshInstance3D.new()
-					var sm    := BoxMesh.new()
-					sm.size = Vector3(bw + 0.04, strip_h, 0.10)
-					strip.mesh = sm
-					strip.material_override = win_mat   # shared — no extra material object
-					strip.position = _path_world_pos(bz, blat, win_y + strip_h * 0.5)
-					strip.rotation_degrees.y = _path_y_rot_at(bz)
-					world_fx_root.add_child(strip)
+					strip_positions.append(_path_world_pos(bz, blat, win_y + strip_h * 0.5))
 					win_y += strip_gap
+
+				if not strip_positions.is_empty():
+					var strip_mesh := BoxMesh.new()
+					strip_mesh.size = Vector3(bw + 0.04, strip_h, 0.10)
+
+					var strip_mm := MultiMesh.new()
+					strip_mm.transform_format = MultiMesh.TRANSFORM_3D
+					strip_mm.mesh = strip_mesh
+					strip_mm.instance_count = strip_positions.size()
+					var strip_basis := Basis.IDENTITY.rotated(Vector3.UP, deg_to_rad(strip_rot))
+					for si in range(strip_positions.size()):
+						strip_mm.set_instance_transform(si, Transform3D(strip_basis, strip_positions[si]))
+
+					var strip_mmi := MultiMeshInstance3D.new()
+					strip_mmi.multimesh = strip_mm
+					strip_mmi.material_override = win_mat
+					world_fx_root.add_child(strip_mmi)
 
 				# ── One roof light per building ───────────────────────────────
 				var rlight := OmniLight3D.new()
@@ -7678,12 +7835,22 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 		return
 
 	# ── Material A (primary — every odd segment, or everything when mono) ──
+	# Unshaded + additive: these are pure glow rings, not lit geometry, so
+	# skipping the PBR lighting model (SSAO/SSR/shadow lookups per fragment)
+	# is free quality-neutral perf, and additive blend is cheaper to composite
+	# than alpha-over for potentially hundreds of overlapping transparent
+	# rings in a dense hold tunnel — it also doesn't need correct back-to-
+	# front sort order to look right, unlike alpha blending. transparency
+	# stays TRANSPARENCY_ALPHA (required to land in the transparent pass at
+	# all); albedo alpha is still what the existing fade tweens drive.
 	var rmat := StandardMaterial3D.new()
 	rmat.albedo_color               = Color(init_col_a.r, init_col_a.g, init_col_a.b, 0.0)
 	rmat.emission_enabled           = true
 	rmat.emission                   = init_col_a
-	rmat.emission_energy_multiplier = 2.5
+	rmat.emission_energy_multiplier = 4.0
 	rmat.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
+	rmat.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
+	rmat.blend_mode                 = BaseMaterial3D.BLEND_MODE_ADD
 
 	# ── Material B (secondary — every even segment; only used if dual_color) ──
 	var rmat_b: StandardMaterial3D = null
@@ -7692,8 +7859,10 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 		rmat_b.albedo_color               = Color(init_col_b.r, init_col_b.g, init_col_b.b, 0.0)
 		rmat_b.emission_enabled           = true
 		rmat_b.emission                   = init_col_b
-		rmat_b.emission_energy_multiplier = 2.5
+		rmat_b.emission_energy_multiplier = 4.0
 		rmat_b.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
+		rmat_b.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
+		rmat_b.blend_mode                 = BaseMaterial3D.BLEND_MODE_ADD
 
 	# Pivot sits at track centre at ring path dist; shape nodes are children
 	var pivot := Node3D.new()
@@ -7753,10 +7922,10 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 
 	# Fade in quickly
 	var rtw_in := _fx_tween_host.create_tween()
-	rtw_in.tween_property(rmat, "albedo_color:a", 0.50, 0.15)
+	rtw_in.tween_property(rmat, "albedo_color:a", 0.80, 0.15)
 	if rmat_b != null:
 		var rtw_in_b := _fx_tween_host.create_tween()
-		rtw_in_b.tween_property(rmat_b, "albedo_color:a", 0.44, 0.15)
+		rtw_in_b.tween_property(rmat_b, "albedo_color:a", 0.70, 0.15)
 
 	# Stay visible until camera clears it, then fade out.
 	# For hold notes (note_dur > 0), add the hold duration so the halo persists
