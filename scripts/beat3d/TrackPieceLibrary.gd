@@ -30,6 +30,13 @@ const PIECES_DIR := "res://assets/track"
 var _entries: Array[Dictionary] = []
 var _by_type: Dictionary = {}            # type -> Array[Dictionary]
 
+# In the editor, both "Piece.glb" and its companion "Piece.glb.import" are
+# real, separate files on disk — after suffix-trimming, both resolve to the
+# same res:// path. This guards against scanning (and registering) the same
+# piece twice in that case; in an exported build only the .import companion
+# is ever listed, so this is a no-op there.
+var _seen_paths: Dictionary = {}
+
 # Optional player character scene discovered during scanning.
 var character_scene: PackedScene = null
 var character_source: String = ""
@@ -55,6 +62,7 @@ func clear() -> void:
 			t.free()
 	_entries.clear()
 	_by_type.clear()
+	_seen_paths.clear()
 	character_scene = null
 	character_source = ""
 
@@ -197,11 +205,20 @@ func _scan_dir(path: String) -> void:
 				_scan_dir(path.path_join(fn))
 		else:
 			var full: String = path.path_join(fn)
-			# In exported builds imported scenes appear as .remap files.
+			# In exported builds, imported resources show up in the directory
+			# listing as their companion metadata file — .remap in some
+			# configurations, but this project's export actually surfaces
+			# .import (e.g. "TrackStraight_20m.glb.import") — confirmed via
+			# debug logging against a real exported build. Strip whichever
+			# suffix is present to get back the original res:// path.
 			if full.ends_with(".remap"):
 				full = full.trim_suffix(".remap")
+			elif full.ends_with(".import"):
+				full = full.trim_suffix(".import")
 			var ext: String = full.get_extension().to_lower()
-			if ext == "glb" or ext == "gltf" or ext == "tscn" or ext == "scn":
+			if (ext == "glb" or ext == "gltf" or ext == "tscn" or ext == "scn") \
+					and not _seen_paths.has(full):
+				_seen_paths[full] = true
 				_scan_scene(full)
 		fn = dir.get_next()
 	dir.list_dir_end()

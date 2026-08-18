@@ -944,7 +944,7 @@ func _load_chart_and_build_plan() -> void:
 	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
 	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.43)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.50)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
