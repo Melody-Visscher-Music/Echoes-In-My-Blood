@@ -32,12 +32,19 @@ extends Node3D
 @export var color_cycle_enabled: bool = true
 @export var color_cycle_period_s: float = 14.0
 @export var color_cycle_gate_blend: float = 0.18
-@export var color_cycle_floor_blend: float = 0.20
+@export var color_cycle_floor_blend: float = 0.85
 
 @export var cycle_color_a: Color = Color(1.00, 0.45, 0.70, 1.0) # pink
 @export var cycle_color_b: Color = Color(0.45, 0.82, 1.00, 1.0) # baby blue
-@export var cycle_color_c: Color = Color(0.30, 0.85, 0.55, 1.0) # green
-@export var cycle_color_d: Color = Color(0.95, 0.78, 0.30, 1.0) # warm gold
+# Two separate jobs, both sourced from Options:
+#  - GameConfig.level_color_a/b are the LEFT/RIGHT lane identity colors —
+#    read directly by _action_color(), always in effect, no toggle.
+#  - cycle_color_a here is also the static ambient color used for the
+#    floor/world glow whenever color_cycle_enabled is false (no animation).
+#    cycle_color_b is unused for the ambient system — while the cycle is
+#    enabled that ambient color is randomized on purpose (see
+#    _random_cycle_stop_color), not driven by either swatch.
+# cycle_color_c / cycle_color_d have been retired entirely.
 @export_enum("tutorial_fixed", "song_seeded", "run_random") var runner_pattern_mode: String = "run_random"
 @export var runner_seed_override: int = 0
 @export_range(0.0, 1.0, 0.01) var runner_randomness: float = 0.35
@@ -86,12 +93,41 @@ var _gates_hit:  int   = 0   # total notes hit
 var _gates_missed: int = 0   # total notes missed
 var _health_pct: float = 0.50   # 0.0 – 1.0, starts at 50 %
 
-var _hud_score_label:  Label     = null
-var _hud_combo_label:  Label     = null
-var _hud_hp_fill:      ColorRect = null   # inner fill bar
-var _hud_hp_label:     Label     = null   # "HP" caption
-var _hud_flash:        ColorRect = null
-var _hud_wj_label:     Label     = null   # "WALL JUMP ×2!" flash label
+var _hud_score_label:   Label     = null
+var _hud_score_cap:     Label     = null   # "SCORE" caption — rainbow-cycled with the number
+var _hud_combo_label:   Label     = null
+var _hud_score_group:   Control   = null   # score+combo card — fades to a low-profile idle
+											# opacity when nothing's happening, snaps back on
+											# a hit/miss, so it stays out of the way of the lanes
+var _hud_score_idle_tw: Tween     = null
+var _hud_score_card:    Panel     = null   # rainbow-cycled border/glow (Meeko's "echoes")
+var _hud_score_prev:    int       = 0      # last displayed score — lets us pop up "+N" and detect increases
+var _hud_score_flash_tw: Tween    = null   # brightness pulse on the number itself
+var _hud_score_card_w:  float     = 0.0    # cached card geometry — reused to place "+N" popups
+var _hud_score_card_m:  float     = 0.0
+var _hud_hp_label:      Label     = null   # "HP" caption
+var _hud_hp_pct_label:  Label     = null   # "72%" readout — stored directly (was find_child())
+var _hud_hp_group:      Control   = null
+var _hud_hp_bar_w:      float     = 0.0    # single source of truth for the bar's pixel width
+var _hud_hp_bar_h:      float     = 16.0   # ditto for height (drives the pill corner radius)
+var _hud_hp_fill_tw:    Tween     = null   # smooth width slide on damage/heal
+var _hud_hp_displayed_pct: float  = 0.25   # the value currently being animated toward/from —
+											# lets a new hit/miss retarget mid-slide smoothly
+var _hud_hp_pulse_tw:   Tween     = null   # looping low-HP warning pulse; only runs while critical
+var _hud_rainbow_hue:   float     = 0.0    # drives the ever-shifting "echoes" colour cycle (score
+											# card + progress bar — smooth continuous drift)
+var _hud_prog_cap:      ColorRect = null   # song-progress bar's leading-edge glow cap
+
+# HP bar: one continuous pill-shaped bar. Colour drifts smoothly (see
+# _update_hud_hp_color) — same cycle as the score card, same speed, reverse
+# direction. (Built on "N flush zones" machinery from an earlier multi-colour
+# version — set _HUD_HP_SEGMENTS back above 1 to bring that back.)
+const _HUD_HP_SEGMENTS:  int   = 1
+var _hud_hp_seg_w:       float          = 0.0   # pixel width of one segment
+var _hud_hp_seg_tracks:  Array[Panel]   = []
+var _hud_hp_seg_fills:   Array[Panel]   = []
+var _hud_flash:         ColorRect = null
+var _hud_wj_label:      Label     = null   # "WALL JUMP ×2!" flash label
 
 # 3D speed streaks — elongated particles that rush past the player at high combo
 var _speed_streaks:     GPUParticles3D          = null
@@ -305,6 +341,7 @@ var _grind_rail_active:  bool      = false
 var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
+var _grind_rail_mats:    Array[StandardMaterial3D] = []   # rebuilt each segment; colored by GameConfig.level_color_rail, cycle-overridable
 
 # Spark nodes for the active segment (rebuilt on each segment entry)
 var _spark_nodes:       Array[Node3D] = []
@@ -440,10 +477,11 @@ func _ready() -> void:
 	_fx_tween_host = Node.new()
 	_fx_tween_host.name = "FxTweenHost"
 	add_child(_fx_tween_host)
-	cycle_color_a       = GameConfig.level_color_a
-	cycle_color_b       = GameConfig.level_color_b
-	_floor_base_albedo  = GameConfig.floor_color
-	color_cycle_enabled = GameConfig.color_cycle_enabled
+	cycle_color_a        = GameConfig.level_color_a
+	cycle_color_b        = GameConfig.level_color_b
+	_floor_base_albedo   = GameConfig.floor_color
+	color_cycle_enabled  = GameConfig.color_cycle_enabled
+	color_cycle_period_s = GameConfig.color_cycle_period_s
 	gate_preview_beats  = GameConfig.gate_preview_beats
 	_resolve_beatmap_from_run()
 
@@ -575,6 +613,10 @@ func _loading_step(text: String, frac: float) -> void:
 
 
 func _process(delta: float) -> void:
+	# HUD "echoes" rainbow chrome — always animating, independent of countdown/pause/song
+	# state, so the colour drift never visibly stutters or freezes.
+	_update_hud_rainbow(delta)
+
 	# ── Countdown phase — wait for engine to settle before starting music ────
 	# (runs even if stream is null so the countdown can still fire and unblock input)
 	if not _level_started:
@@ -676,7 +718,11 @@ func _process(delta: float) -> void:
 
 	# Recolour any live halo rings each frame.
 	# Alpha is preserved so the fade-in / fade-out tweens still work correctly.
-	var _halo_col_a: Color = _current_cycle_color(t_s) if GameConfig.color_cycle_affects_halos else GameConfig.halo_color_a
+	# Halos cycle on their OWN independent random stream (_current_halo_cycle_color)
+	# rather than sharing _current_cycle_color with gates/floor/rail/world — sharing
+	# one function meant every cycle-affected thing showed the identical color at
+	# the identical instant, which read as the halo's color "spilling" onto gates.
+	var _halo_col_a: Color = _current_halo_cycle_color(t_s)
 	if not _active_halo_mats.is_empty():
 		for hmat in _active_halo_mats:
 			if is_instance_valid(hmat):
@@ -3109,10 +3155,14 @@ func _track_full_width() -> float:
 ## Returns the tint colour for each gate action type.
 func _action_color(action: String) -> Color:
 	match action:
-		"left":       return Color(1.00, 0.35, 0.65, 1.0)  # pink
-		"right":      return Color(0.30, 0.65, 1.00, 1.0)  # blue
-		"jump":       return Color(0.30, 1.00, 0.55, 1.0)  # green
-		"slide":      return Color(0.0, 0.821, 0.729, 1.0)  # orange
+		# Left/right/jump/slide gates all take their color straight from
+		# Options — that's their actual purpose: per-type identity color,
+		# always in effect, independent of the ambient Color Cycle toggle
+		# below (which can further override them when it's in random mode).
+		"left":       return GameConfig.level_color_a
+		"right":      return GameConfig.level_color_b
+		"jump":       return GameConfig.level_color_jump
+		"slide":      return GameConfig.level_color_slide
 		"wall_left":  return Color(1.00, 0.55, 0.10, 1.0)  # orange
 		"wall_right": return Color(1.00, 0.55, 0.10, 1.0)  # orange
 	return Color(0.85, 0.85, 0.85, 1.0)
@@ -5149,6 +5199,8 @@ func _award_near_miss(_idx: int) -> void:
 	lbl.text = "NEAR!"
 	lbl.add_theme_font_size_override("font_size", 32)
 	lbl.add_theme_color_override("font_color", Color(1.00, 0.82, 0.10, 1.0))
+	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	lbl.add_theme_constant_override("outline_size", 6)
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.set_anchors_preset(Control.PRESET_CENTER)
 	lbl.grow_horizontal = Control.GROW_DIRECTION_BOTH
@@ -5171,6 +5223,7 @@ func _award_near_miss(_idx: int) -> void:
 
 func _create_hud() -> void:
 	_health_pct = 0.25
+	_hud_hp_displayed_pct = _health_pct
 
 	var cl := CanvasLayer.new()
 	cl.layer = 20
@@ -5181,73 +5234,87 @@ func _create_hud() -> void:
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	cl.add_child(root)
 
-	# ── Score + Combo block (top-right) ───────────────────────────────────────
-	var score_glow := ColorRect.new()
-	score_glow.anchor_left  = 1.0; score_glow.anchor_right  = 1.0
-	score_glow.anchor_top   = 0.0; score_glow.anchor_bottom = 0.0
-	score_glow.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	score_glow.offset_left  = -210; score_glow.offset_right  = -10
-	score_glow.offset_top   = 10;   score_glow.offset_bottom = 102
-	score_glow.color = Color(0.65, 0.18, 1.00, 0.38)
-	score_glow.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(score_glow)
+	var s: float = _hud_s()
 
-	var score_bg := ColorRect.new()
-	score_bg.anchor_left  = 1.0; score_bg.anchor_right  = 1.0
-	score_bg.anchor_top   = 0.0; score_bg.anchor_bottom = 0.0
-	score_bg.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	score_bg.offset_left  = -208; score_bg.offset_right  = -12
-	score_bg.offset_top   = 12;   score_bg.offset_bottom = 100
-	score_bg.color = Color(0.04, 0.02, 0.10, 0.90)
-	score_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(score_bg)
+	# ── Score + Combo card (top-right) ────────────────────────────────────────
+	# Everything lives under one Control (_hud_score_group) so the whole cluster
+	# can fade to a low, out-of-the-way "idle" opacity a moment after the last
+	# hit/miss and snap back the instant something happens — see _hud_score_bump().
+	_hud_score_group = Control.new()
+	_hud_score_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_hud_score_group.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(_hud_score_group)
 
-	var score_cap := Label.new()
-	score_cap.text = "SCORE"
-	score_cap.anchor_left  = 1.0; score_cap.anchor_right  = 1.0
-	score_cap.anchor_top   = 0.0; score_cap.anchor_bottom = 0.0
-	score_cap.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	score_cap.offset_left  = -202; score_cap.offset_right  = -18
-	score_cap.offset_top   = 18;   score_cap.offset_bottom = 36
-	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	score_cap.add_theme_color_override("font_color", Color(0.68, 0.28, 1.00, 0.65))
-	score_cap.add_theme_font_size_override("font_size", 10)
-	score_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(score_cap)
+	var card_w: float = 196.0 * s
+	var card_h: float = 92.0  * s
+	var card_m: float = 14.0  * s
+	_hud_score_card_w = card_w
+	_hud_score_card_m = card_m
+
+	var score_card := Panel.new()
+	score_card.anchor_left  = 1.0; score_card.anchor_right  = 1.0
+	score_card.anchor_top   = 0.0; score_card.anchor_bottom = 0.0
+	score_card.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	score_card.offset_left   = -(card_m + card_w); score_card.offset_right  = -card_m
+	score_card.offset_top    = card_m;             score_card.offset_bottom = card_m + card_h
+	score_card.add_theme_stylebox_override("panel", _hud_card_style(Color(0.55, 0.16, 0.85, 1.0)))
+	score_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hud_score_group.add_child(score_card)
+	_hud_score_card = score_card   # border/glow repainted every frame — see _update_hud_rainbow
+
+	var score_margin := MarginContainer.new()
+	score_margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	score_margin.add_theme_constant_override("margin_left",   int(18 * s))
+	score_margin.add_theme_constant_override("margin_right",  int(16 * s))
+	score_margin.add_theme_constant_override("margin_top",    int(12 * s))
+	score_margin.add_theme_constant_override("margin_bottom", int(12 * s))
+	score_margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	score_card.add_child(score_margin)
+
+	var score_vbox := VBoxContainer.new()
+	score_vbox.add_theme_constant_override("separation", int(1 * s))
+	score_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	score_margin.add_child(score_vbox)
+
+	_hud_score_cap = Label.new()
+	_hud_score_cap.text = "SCORE"
+	_hud_score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_hud_score_cap.add_theme_color_override("font_color", Color(0.74, 0.52, 1.00, 0.75))
+	_hud_score_cap.add_theme_font_size_override("font_size", int(11 * s))
+	_hud_score_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	score_vbox.add_child(_hud_score_cap)
 
 	_hud_score_label = Label.new()
 	_hud_score_label.text = "0"
-	_hud_score_label.anchor_left  = 1.0; _hud_score_label.anchor_right  = 1.0
-	_hud_score_label.anchor_top   = 0.0; _hud_score_label.anchor_bottom = 0.0
-	_hud_score_label.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	_hud_score_label.offset_left  = -202; _hud_score_label.offset_right  = -16
-	_hud_score_label.offset_top   = 34;   _hud_score_label.offset_bottom = 72
 	_hud_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_score_label.add_theme_color_override("font_color", Color(1.00, 0.50, 0.85, 1.0))
-	_hud_score_label.add_theme_font_size_override("font_size", 30)
+	_hud_score_label.add_theme_color_override("font_color", Color(1.00, 0.55, 0.86, 1.0))
+	_hud_score_label.add_theme_font_size_override("font_size", int(33 * s))
 	_hud_score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_score_label)
+	_hud_score_label.pivot_offset = Vector2(card_w * 0.5, 14 * s)   # punch-scale grows from centre
+	score_vbox.add_child(_hud_score_label)
 
 	_hud_combo_label = Label.new()
 	_hud_combo_label.text = ""
-	_hud_combo_label.anchor_left  = 1.0; _hud_combo_label.anchor_right  = 1.0
-	_hud_combo_label.anchor_top   = 0.0; _hud_combo_label.anchor_bottom = 0.0
-	_hud_combo_label.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	_hud_combo_label.offset_left  = -202; _hud_combo_label.offset_right  = -16
-	_hud_combo_label.offset_top   = 72;   _hud_combo_label.offset_bottom = 92
 	_hud_combo_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_combo_label.add_theme_color_override("font_color", Color(1.00, 0.88, 0.22, 1.0))
-	_hud_combo_label.add_theme_font_size_override("font_size", 13)
+	_hud_combo_label.add_theme_color_override("font_color", Color(1.00, 0.88, 0.30, 1.0))
+	_hud_combo_label.add_theme_font_size_override("font_size", int(15 * s))
 	_hud_combo_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_combo_label)
+	score_vbox.add_child(_hud_combo_label)
 
 	# ── Health bar (top-left) ─────────────────────────────────────────────────
-	# Layout: [HP label] [████░░░░░░] percentage bar
-	var bar_w:   float = 180.0
-	var bar_h:   float = 16.0
-	var bar_x:   float = 12.0
-	var bar_y:   float = 12.0
-	var label_w: float = 28.0
+	# Layout: [HP label] [pill-shaped bar] [percentage]. Grouped so the low-HP
+	# warning pulse (see _hud_update_low_health_warning) can tint the whole thing.
+	_hud_hp_group = Control.new()
+	_hud_hp_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_hud_hp_group.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	root.add_child(_hud_hp_group)
+
+	_hud_hp_bar_w = 216.0 * s
+	_hud_hp_bar_h = 19.0 * s
+	var bar_h:   float = _hud_hp_bar_h
+	var bar_x:   float = 16.0 * s
+	var bar_y:   float = 16.0 * s
+	var label_w: float = 30.0 * s
 
 	# "HP" label
 	_hud_hp_label = Label.new()
@@ -5256,75 +5323,69 @@ func _create_hud() -> void:
 	_hud_hp_label.anchor_top    = 0.0; _hud_hp_label.anchor_bottom = 0.0
 	_hud_hp_label.offset_left   = bar_x
 	_hud_hp_label.offset_right  = bar_x + label_w
-	_hud_hp_label.offset_top    = bar_y
-	_hud_hp_label.offset_bottom = bar_y + bar_h + 12
+	_hud_hp_label.offset_top    = bar_y - 2 * s
+	_hud_hp_label.offset_bottom = bar_y + bar_h
 	_hud_hp_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_hud_hp_label.add_theme_color_override("font_color", Color(1.00, 0.45, 0.72, 0.80))
-	_hud_hp_label.add_theme_font_size_override("font_size", 11)
+	_hud_hp_label.add_theme_color_override("font_color", Color(1.00, 0.55, 0.75, 0.90))
+	_hud_hp_label.add_theme_font_size_override("font_size", int(13 * s))
+	_hud_hp_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
+	_hud_hp_label.add_theme_constant_override("outline_size", int(3 * s))
 	_hud_hp_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_hp_label)
+	_hud_hp_group.add_child(_hud_hp_label)
 
-	var bx: float = bar_x + label_w + 4.0
+	var bx: float = bar_x + label_w + 6.0 * s
 
-	# Outer glow border
-	var bar_glow := ColorRect.new()
-	bar_glow.anchor_left = 0.0; bar_glow.anchor_right  = 0.0
-	bar_glow.anchor_top  = 0.0; bar_glow.anchor_bottom = 0.0
-	bar_glow.offset_left   = bx - 2;       bar_glow.offset_right  = bx + bar_w + 2
-	bar_glow.offset_top    = bar_y - 2;    bar_glow.offset_bottom = bar_y + bar_h + 2
-	bar_glow.color = Color(1.00, 0.35, 0.65, 0.30)
-	bar_glow.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(bar_glow)
+	# ONE continuous pill-shaped bar made of 3 flush segments (no gap between them) —
+	# only the first segment rounds its left end and only the last rounds its right
+	# end (see _hud_pill_style_sides), so it reads as a single bar. Colour drifts
+	# smoothly (see _update_hud_hp_color). Health % is one continuous 0–1 value;
+	# a segment fills proportionally to how much of ITS third is covered.
+	_hud_hp_seg_w = _hud_hp_bar_w / float(_HUD_HP_SEGMENTS)
+	_hud_hp_seg_tracks.clear(); _hud_hp_seg_fills.clear()
 
-	# Dark track background
-	var bar_track := ColorRect.new()
-	bar_track.anchor_left = 0.0; bar_track.anchor_right  = 0.0
-	bar_track.anchor_top  = 0.0; bar_track.anchor_bottom = 0.0
-	bar_track.offset_left   = bx;       bar_track.offset_right  = bx + bar_w
-	bar_track.offset_top    = bar_y;    bar_track.offset_bottom = bar_y + bar_h
-	bar_track.color = Color(0.04, 0.02, 0.10, 0.92)
-	bar_track.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(bar_track)
+	for i in range(_HUD_HP_SEGMENTS):
+		var seg_x: float = bx + float(i) * _hud_hp_seg_w
+		var round_l: bool = i == 0
+		var round_r: bool = i == _HUD_HP_SEGMENTS - 1
 
-	# Half-fill marker (faint line at 50%)
-	var half_marker := ColorRect.new()
-	half_marker.anchor_left = 0.0; half_marker.anchor_right  = 0.0
-	half_marker.anchor_top  = 0.0; half_marker.anchor_bottom = 0.0
-	half_marker.offset_left   = bx + bar_w * 0.5 - 1
-	half_marker.offset_right  = bx + bar_w * 0.5 + 1
-	half_marker.offset_top    = bar_y
-	half_marker.offset_bottom = bar_y + bar_h
-	half_marker.color = Color(1.0, 1.0, 1.0, 0.20)
-	half_marker.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(half_marker)
+		var seg_track := Panel.new()
+		seg_track.anchor_left = 0.0; seg_track.anchor_right  = 0.0
+		seg_track.anchor_top  = 0.0; seg_track.anchor_bottom = 0.0
+		seg_track.offset_left   = seg_x;    seg_track.offset_right  = seg_x + _hud_hp_seg_w
+		seg_track.offset_top    = bar_y;    seg_track.offset_bottom = bar_y + bar_h
+		seg_track.add_theme_stylebox_override("panel", _hud_pill_style_sides(
+			Color(0.05, 0.02, 0.09, 0.90), bar_h * 0.5, round_l, round_r, Color(1.00, 0.35, 0.65, 0.55)))
+		seg_track.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		seg_track.pivot_offset = Vector2(_hud_hp_seg_w * 0.5, bar_h * 0.5)   # for the heal punch-scale
+		_hud_hp_group.add_child(seg_track)
+		_hud_hp_seg_tracks.append(seg_track)
 
-	# Fill rect — we animate its right offset to show current HP%
-	_hud_hp_fill = ColorRect.new()
-	_hud_hp_fill.anchor_left = 0.0; _hud_hp_fill.anchor_right  = 0.0
-	_hud_hp_fill.anchor_top  = 0.0; _hud_hp_fill.anchor_bottom = 0.0
-	_hud_hp_fill.offset_left   = bx
-	_hud_hp_fill.offset_right  = bx + bar_w * _health_pct
-	_hud_hp_fill.offset_top    = bar_y
-	_hud_hp_fill.offset_bottom = bar_y + bar_h
-	_hud_hp_fill.color = Color(0.35, 1.00, 0.55, 1.0)   # green at start (mid)
-	_hud_hp_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_hp_fill)
+		var seg_fill := Panel.new()
+		seg_fill.anchor_left = 0.0; seg_fill.anchor_right  = 0.0
+		seg_fill.anchor_top  = 0.0; seg_fill.anchor_bottom = 1.0
+		seg_fill.offset_left  = 0.0
+		seg_fill.offset_right = _hud_hp_seg_w * clampf(_health_pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
+		seg_fill.add_theme_stylebox_override("panel",
+			_hud_pill_style_sides(Color(0.35, 1.00, 0.55, 1.0), bar_h * 0.5, round_l, round_r))
+		seg_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		seg_track.add_child(seg_fill)
+		_hud_hp_seg_fills.append(seg_fill)
 
 	# Percentage text (right of bar)
-	var pct_label := Label.new()
-	pct_label.name = "HpPctLabel"
-	pct_label.text = "50%"
-	pct_label.anchor_left = 0.0; pct_label.anchor_right  = 0.0
-	pct_label.anchor_top  = 0.0; pct_label.anchor_bottom = 0.0
-	pct_label.offset_left   = bx + bar_w + 6
-	pct_label.offset_right  = bx + bar_w + 56
-	pct_label.offset_top    = bar_y
-	pct_label.offset_bottom = bar_y + bar_h + 4
-	pct_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	pct_label.add_theme_color_override("font_color", Color(0.90, 0.90, 0.95, 0.70))
-	pct_label.add_theme_font_size_override("font_size", 11)
-	pct_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(pct_label)
+	_hud_hp_pct_label = Label.new()
+	_hud_hp_pct_label.text = "50%"
+	_hud_hp_pct_label.anchor_left = 0.0; _hud_hp_pct_label.anchor_right  = 0.0
+	_hud_hp_pct_label.offset_left   = bx + _hud_hp_bar_w + 8 * s
+	_hud_hp_pct_label.offset_right  = bx + _hud_hp_bar_w + 8 * s + 58 * s
+	_hud_hp_pct_label.offset_top    = bar_y - 2 * s
+	_hud_hp_pct_label.offset_bottom = bar_y + bar_h
+	_hud_hp_pct_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_hud_hp_pct_label.add_theme_color_override("font_color", Color(0.90, 0.90, 0.95, 0.75))
+	_hud_hp_pct_label.add_theme_font_size_override("font_size", int(13 * s))
+	_hud_hp_pct_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
+	_hud_hp_pct_label.add_theme_constant_override("outline_size", int(3 * s))
+	_hud_hp_pct_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_hud_hp_group.add_child(_hud_hp_pct_label)
 
 	# ── Song progress bar (bottom of screen) ─────────────────────────────────
 	var prog_bg := ColorRect.new()
@@ -5357,6 +5418,7 @@ func _create_hud() -> void:
 	prog_cap.color = Color(1.0, 0.75, 1.0, 0.85)
 	prog_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(prog_cap)
+	_hud_prog_cap = prog_cap   # recoloured every frame — see _update_hud_rainbow
 
 	# ── Full-screen edge flash (hit / miss feedback) ───────────────────────────
 	_hud_flash = ColorRect.new()
@@ -5375,6 +5437,8 @@ func _create_hud() -> void:
 	_hud_wj_label.offset_top   = 100;  _hud_wj_label.offset_bottom = 140
 	_hud_wj_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hud_wj_label.add_theme_color_override("font_color",   Color(1.00, 0.82, 0.10, 1.0))
+	_hud_wj_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	_hud_wj_label.add_theme_constant_override("outline_size", 7)
 	_hud_wj_label.add_theme_font_size_override("font_size", 26)
 	_hud_wj_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hud_wj_label.visible = false
@@ -5390,6 +5454,8 @@ func _create_hud() -> void:
 	_hud_grind_label.offset_top    = -52;  _hud_grind_label.offset_bottom = -18
 	_hud_grind_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hud_grind_label.add_theme_color_override("font_color",   Color(1.00, 0.60, 0.10, 1.0))
+	_hud_grind_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	_hud_grind_label.add_theme_constant_override("outline_size", 6)
 	_hud_grind_label.add_theme_font_size_override("font_size", 18)
 	_hud_grind_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hud_grind_label.visible = false
@@ -5406,6 +5472,8 @@ func _create_hud() -> void:
 	_hud_charge_label.offset_top    = -92;  _hud_charge_label.offset_bottom = -58
 	_hud_charge_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_hud_charge_label.add_theme_color_override("font_color", Color(0.45, 0.95, 1.00, 1.0))
+	_hud_charge_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	_hud_charge_label.add_theme_constant_override("outline_size", 6)
 	_hud_charge_label.add_theme_font_size_override("font_size", 20)
 	_hud_charge_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hud_charge_label.visible = false
@@ -6096,6 +6164,7 @@ func _grind_clear_track(total_lat: float, h: float, prefer_under: bool) -> float
 func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 	if _grind_rail_root == null:
 		return
+	_grind_rail_mats.clear()
 
 	# Authored Blender rail pieces — tile them along the path. The piece bakes
 	# its own lateral offset (author rails as side LEFT → lands at +3.35, the
@@ -6146,12 +6215,13 @@ func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 		var mi := MeshInstance3D.new()
 		mi.mesh = bm
 		var mat := StandardMaterial3D.new()
-		mat.albedo_color              = Color(1.00, 0.55, 0.10, 1.0)
+		mat.albedo_color              = GameConfig.level_color_rail
 		mat.emission_enabled          = true
-		mat.emission                  = Color(1.00, 0.55, 0.10, 1.0)
+		mat.emission                  = GameConfig.level_color_rail
 		mat.emission_energy_multiplier = 6.0
 		mi.material_override          = mat
 		node.add_child(mi)
+		_grind_rail_mats.append(mat)
 
 
 func _build_spark_node(pd: float) -> Node3D:
@@ -6159,6 +6229,13 @@ func _build_spark_node(pd: float) -> Node3D:
 	var root := Node3D.new()
 	root.position           = _path_world_pos(pd, _GRIND_RAIL_LATERAL + off.x, _GRIND_SPARK_H + off.y)
 	root.rotation_degrees.y = _path_y_rot_at(pd)
+
+	# Each spark orb gets its own random color, rolled once here and never
+	# touched again — NOT tied to the Color Cycle system at all, on purpose.
+	# Uses the run's seeded RNG so replays of the same seed get the same
+	# spark colors. Once red, always that red; the next orb might roll
+	# bright green — independent every time.
+	var orb_col: Color = Color.from_hsv(_runner_rng.randf(), _CYCLE_RANDOM_SAT, _CYCLE_RANDOM_VAL)
 
 	# Authored Blender spark ("spark") replaces orb + glow ring; the point
 	# light and catch-pop effects stay procedural either way.
@@ -6168,7 +6245,7 @@ func _build_spark_node(pd: float) -> Node3D:
 		sp_inst.rotation_degrees.y = 180.0
 		root.add_child(sp_inst)
 		var sp_light := OmniLight3D.new()
-		sp_light.light_color  = Color(1.00, 0.82, 0.30, 1.0)
+		sp_light.light_color  = orb_col
 		sp_light.light_energy = 0.9
 		sp_light.omni_range   = 4.5
 		root.add_child(sp_light)
@@ -6180,9 +6257,9 @@ func _build_spark_node(pd: float) -> Node3D:
 	var mi := MeshInstance3D.new()
 	mi.mesh  = sm
 	var mat := StandardMaterial3D.new()
-	mat.albedo_color              = Color(1.00, 0.90, 0.20, 1.0)
+	mat.albedo_color              = orb_col
 	mat.emission_enabled          = true
-	mat.emission                  = Color(1.00, 0.90, 0.20, 1.0)
+	mat.emission                  = orb_col
 	mat.emission_energy_multiplier = 9.0
 	mi.material_override          = mat
 	root.add_child(mi)
@@ -6195,9 +6272,9 @@ func _build_spark_node(pd: float) -> Node3D:
 	var di := MeshInstance3D.new()
 	di.mesh = dm
 	var dmat := StandardMaterial3D.new()
-	dmat.albedo_color              = Color(1.00, 0.70, 0.05, 0.70)
+	dmat.albedo_color              = Color(orb_col.r, orb_col.g, orb_col.b, 0.70)
 	dmat.emission_enabled          = true
-	dmat.emission                  = Color(1.00, 0.70, 0.05, 1.0)
+	dmat.emission                  = orb_col
 	dmat.emission_energy_multiplier = 4.0
 	dmat.transparency              = BaseMaterial3D.TRANSPARENCY_ALPHA
 	di.material_override           = dmat
@@ -6205,7 +6282,7 @@ func _build_spark_node(pd: float) -> Node3D:
 
 	# Point light
 	var light := OmniLight3D.new()
-	light.light_color  = Color(1.00, 0.82, 0.30, 1.0)
+	light.light_color  = orb_col
 	light.light_energy = 0.9
 	light.omni_range   = 4.5
 	root.add_child(light)
@@ -6238,6 +6315,7 @@ func _despawn_grind_rail() -> void:
 
 	if is_instance_valid(_grind_rail_root): _grind_rail_root.queue_free()
 	_grind_rail_root = null
+	_grind_rail_mats.clear()
 
 	if _hud_grind_label != null:
 		_hud_grind_label.visible = false
@@ -6400,6 +6478,8 @@ func _show_grind_banner(text: String, col: Color) -> void:
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.add_theme_font_size_override("font_size", 44)
 	lbl.add_theme_color_override("font_color", col)
+	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	lbl.add_theme_constant_override("outline_size", 8)
 	lbl.set_anchors_preset(Control.PRESET_CENTER)
 	lbl.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	lbl.grow_vertical   = Control.GROW_DIRECTION_BOTH
@@ -6453,7 +6533,26 @@ func _activate_wj_bonus() -> void:
 
 func _update_hud_score() -> void:
 	if _hud_score_label != null:
+		var delta: int = _score - _hud_score_prev
+		_hud_score_prev = _score
+		var changed: bool = delta != 0
 		_hud_score_label.text = str(_score)
+		if changed:
+			# Punch-scale...
+			var stw := create_tween()
+			stw.tween_property(_hud_score_label, "scale", Vector2(1.16, 1.16), 0.06) \
+				.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+			stw.tween_property(_hud_score_label, "scale", Vector2.ONE, 0.16) \
+				.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+			# ...plus a bright flash-pulse so an increase reads as a beat, not just new text.
+			if _hud_score_flash_tw != null and _hud_score_flash_tw.is_valid():
+				_hud_score_flash_tw.kill()
+			_hud_score_label.modulate = Color(2.0, 2.0, 2.0, 1.0)
+			_hud_score_flash_tw = create_tween()
+			_hud_score_flash_tw.tween_property(_hud_score_label, "modulate", Color.WHITE, 0.24) \
+				.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+		if delta > 0:
+			_hud_spawn_score_popup(delta)
 	if _hud_combo_label != null:
 		if _combo >= 2:
 			var m: int = _score_multiplier()
@@ -6463,33 +6562,250 @@ func _update_hud_score() -> void:
 				_hud_combo_label.text = "× %d  COMBO" % _combo
 		else:
 			_hud_combo_label.text = ""
+	_hud_score_bump()
 
 
-func _update_hud_health() -> void:
-	if _hud_hp_fill == null:
+## Keeps the score card at full opacity while things are happening, then lets it
+## settle to a translucent idle state a moment after the last hit/miss — so it
+## reads clearly in the moment but doesn't compete for attention with the lanes
+## during a quiet stretch. Called on every score update.
+func _hud_score_bump() -> void:
+	if _hud_score_group == null:
+		return
+	if _hud_score_idle_tw != null and _hud_score_idle_tw.is_valid():
+		_hud_score_idle_tw.kill()
+	_hud_score_group.modulate.a = 1.0
+	_hud_score_idle_tw = create_tween()
+	_hud_score_idle_tw.tween_interval(2.2)
+	_hud_score_idle_tw.tween_property(_hud_score_group, "modulate:a", 0.62, 0.5)
+
+
+## Floating "+N" that pops up above the score card and drifts up while fading —
+## extra flair so a big hit reads as a moment, not just a number changing.
+## Drives its own offsets directly (not "position") since a freshly-added
+## Control's position isn't valid until the next layout pass — offsets are.
+func _hud_spawn_score_popup(delta_pts: int) -> void:
+	if _hud_score_group == null or delta_pts <= 0:
+		return
+	var lbl := Label.new()
+	lbl.text = "+%d" % delta_pts
+	lbl.anchor_left  = 1.0; lbl.anchor_right  = 1.0
+	lbl.anchor_top   = 0.0; lbl.anchor_bottom = 0.0
+	lbl.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	lbl.offset_left   = -(_hud_score_card_m + _hud_score_card_w)
+	lbl.offset_right  = -_hud_score_card_m
+	lbl.offset_top    = _hud_score_card_m - 6.0
+	lbl.offset_bottom = _hud_score_card_m + 18.0
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	lbl.add_theme_font_size_override("font_size", 15)
+	lbl.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 1.0))
+	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	lbl.add_theme_constant_override("outline_size", 4)
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	lbl.modulate.a   = 0.0
+	_hud_score_group.add_child(lbl)
+
+	var top0: float = lbl.offset_top
+	var bot0: float = lbl.offset_bottom
+	var tw_move := create_tween()
+	tw_move.tween_method(func(v: float) -> void:
+		lbl.offset_top    = top0 + v
+		lbl.offset_bottom = bot0 + v
+	, 0.0, -30.0, 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+
+	var tw_fade := create_tween()
+	tw_fade.tween_property(lbl, "modulate:a", 1.0, 0.08)
+	tw_fade.tween_interval(0.32)
+	tw_fade.tween_property(lbl, "modulate:a", 0.0, 0.30)
+	tw_fade.tween_callback(lbl.queue_free)
+
+
+## force_pulse: play the heal-pulse even if HP is already capped at 100% (or
+## otherwise can't visually increase) — set true from a successful gate hit so
+## the bar still gives positive feedback for "you did that right" at full HP,
+## where the fill itself has nothing left to show for it.
+func _update_hud_health(force_pulse: bool = false) -> void:
+	if _hud_hp_seg_fills.is_empty():
 		return
 	var pct: float = clamp(_health_pct, 0.0, 1.0)
-	# Bar fill: right offset tracks percentage
-	# We need the left offset to derive bar width. Left offset is fixed at bx.
-	var bar_left: float  = _hud_hp_fill.offset_left   # same bx as creation
-	var bar_total: float = 180.0
-	_hud_hp_fill.offset_right = bar_left + bar_total * pct
 
-	# Colour: green (full) → yellow (50%) → red (empty)
-	var fill_col: Color
-	if pct >= 0.5:
-		fill_col = Color(0.35, 1.00, 0.55, 1.0).lerp(Color(1.00, 0.88, 0.22, 1.0), (1.0 - pct) * 2.0)
-	else:
-		fill_col = Color(1.00, 0.88, 0.22, 1.0).lerp(Color(1.00, 0.18, 0.18, 1.0), (0.5 - pct) * 2.0)
-	_hud_hp_fill.color = fill_col
+	if force_pulse or pct > _hud_hp_displayed_pct + 0.0005:
+		_hud_hp_heal_pulse()
 
-	# Update percentage text
-	var root: Control = _hud_hp_fill.get_parent() as Control
-	if root != null:
-		var pct_lbl: Label = root.find_child("HpPctLabel", false, false) as Label
-		if pct_lbl != null:
-			pct_lbl.text = "%d%%" % int(pct * 100.0)
-			pct_lbl.add_theme_color_override("font_color", fill_col.lightened(0.25))
+	# Animate width + the percentage readout together via tween_method so the bar
+	# visibly slides from the old value to the new one over half a second, rather
+	# than snapping instantly. Segment colour is NOT touched here — each segment's
+	# strobe colour is owned entirely by _update_hud_rainbow, independent of this.
+	if _hud_hp_fill_tw != null and _hud_hp_fill_tw.is_valid():
+		_hud_hp_fill_tw.kill()
+	_hud_hp_fill_tw = create_tween()
+	_hud_hp_fill_tw.tween_method(_hud_hp_apply_display, _hud_hp_displayed_pct, pct, 0.55) \
+		.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+
+	_hud_update_low_health_warning(pct)
+
+
+## Punch-scale + brightness flash on the bar itself when HP goes UP — mirrors the
+## score's pulse so a heal reads as a beat, not just a bar quietly sliding wider.
+## Applied to the segment Panels directly (not _hud_hp_group), since the group's
+## own modulate is already owned by the low-HP warning loop — this stays clear of it.
+## Each segment gets its own two tweens (scale sequence + fade); harmless if a
+## fast heal streak restarts one mid-flight — Tween just keeps driving the
+## property toward whatever the newest target is.
+func _hud_hp_heal_pulse() -> void:
+	for track in _hud_hp_seg_tracks:
+		if track == null:
+			continue
+		track.scale    = Vector2.ONE
+		track.modulate = Color(1.7, 1.7, 1.7, 1.0)
+
+		var seq := create_tween()
+		seq.tween_property(track, "scale", Vector2(1.0, 1.35), 0.07) \
+			.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		seq.tween_property(track, "scale", Vector2.ONE, 0.18) \
+			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+
+		var fade := create_tween()
+		fade.tween_property(track, "modulate", Color.WHITE, 0.22) \
+			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+
+
+## One animated frame of the HP bar's slide — called continuously by the tween in
+## _update_hud_health. Each of the 3 segments fills proportionally to how much of
+## its own third the current (animated) health value covers.
+func _hud_hp_apply_display(pct: float) -> void:
+	_hud_hp_displayed_pct = pct
+	if _hud_hp_pct_label != null:
+		_hud_hp_pct_label.text = "%d%%" % int(round(pct * 100.0))
+	for i in range(_hud_hp_seg_fills.size()):
+		var frac: float = clampf(pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
+		var seg_fill: Panel = _hud_hp_seg_fills[i]
+		if seg_fill != null:
+			seg_fill.offset_right = _hud_hp_seg_w * frac
+
+
+## Below this HP the bar gently pulses to make sure a distracted player notices —
+## resting state otherwise stays calm so it never fights for attention on its own.
+const _HUD_LOW_HP_THRESHOLD: float = 0.20
+
+func _hud_update_low_health_warning(pct: float) -> void:
+	if _hud_hp_group == null:
+		return
+	var critical: bool = pct < _HUD_LOW_HP_THRESHOLD
+	var pulsing: bool  = _hud_hp_pulse_tw != null and _hud_hp_pulse_tw.is_valid()
+	if critical and not pulsing:
+		_hud_hp_pulse_tw = _hud_hp_group.create_tween().set_loops()
+		_hud_hp_pulse_tw.tween_property(_hud_hp_group, "modulate", Color(1.5, 0.55, 0.55, 1.0), 0.35) \
+			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		_hud_hp_pulse_tw.tween_property(_hud_hp_group, "modulate", Color.WHITE, 0.35) \
+			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	elif not critical and pulsing:
+		_hud_hp_pulse_tw.kill()
+		_hud_hp_group.modulate = Color.WHITE
+
+
+## "Echoes in his blood" — Meeko's HUD chrome never settles on one colour. The
+## score card and the HP bar both drift smoothly and continuously through the
+## same hue cycle at the same speed, but in OPPOSITE directions — score runs
+## red→orange→yellow→green→blue→purple while the HP bar runs the reverse, so
+## they're always sweeping past each other rather than moving in lockstep.
+const _HUD_RAINBOW_SAT: float = 0.72
+const _HUD_RAINBOW_VAL: float = 1.0
+
+func _update_hud_rainbow(delta: float) -> void:
+	_hud_rainbow_hue = fmod(_hud_rainbow_hue + delta * 0.055, 1.0)   # ~18 s per full loop
+
+	if _hud_score_card != null:
+		var c_border: Color = Color.from_hsv(fmod(_hud_rainbow_hue, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
+		_hud_score_card.add_theme_stylebox_override("panel", _hud_card_style(c_border))
+	if _hud_score_cap != null:
+		var c_cap: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.08, 1.0), _HUD_RAINBOW_SAT * 0.8, 1.0)
+		_hud_score_cap.add_theme_color_override("font_color", Color(c_cap.r, c_cap.g, c_cap.b, 0.80))
+	if _hud_score_label != null:
+		var c_num: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.14, 1.0), _HUD_RAINBOW_SAT * 0.55, 1.0)
+		_hud_score_label.add_theme_color_override("font_color", c_num)
+
+	_update_hud_hp_color()
+
+	if _hud_progress_fill != null:
+		var c_prog: Color = Color.from_hsv(fmod(_hud_rainbow_hue * 0.8 + 0.60, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
+		_hud_progress_fill.color = c_prog
+		if _hud_prog_cap != null:
+			_hud_prog_cap.color = Color(c_prog.r, c_prog.g, c_prog.b, 0.90).lightened(0.35)
+
+
+## HP bar colour — same hue cycle as the score card, same speed (both driven by
+## _hud_rainbow_hue), running backwards (1.0 - hue instead of hue). Fill and
+## outline always match (computed once, applied to both).
+func _update_hud_hp_color() -> void:
+	var c: Color = Color.from_hsv(fmod(1.0 - _hud_rainbow_hue, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
+	for i in range(_hud_hp_seg_tracks.size()):
+		var round_l: bool = i == 0
+		var round_r: bool = i == _hud_hp_seg_tracks.size() - 1
+
+		var seg_track: Panel = _hud_hp_seg_tracks[i]
+		if seg_track != null:
+			seg_track.add_theme_stylebox_override("panel", _hud_pill_style_sides(
+				Color(0.05, 0.02, 0.09, 0.90), _hud_hp_bar_h * 0.5, round_l, round_r, c))
+
+		var seg_fill: Panel = _hud_hp_seg_fills[i] if i < _hud_hp_seg_fills.size() else null
+		if seg_fill != null:
+			seg_fill.add_theme_stylebox_override("panel",
+				_hud_pill_style_sides(c, _hud_hp_bar_h * 0.5, round_l, round_r))
+
+	if _hud_hp_pct_label != null:
+		_hud_hp_pct_label.add_theme_color_override("font_color", c.lightened(0.35))
+
+
+## Viewport-relative scale for the persistent gameplay HUD, matched to the same
+## 1920×1080 reference and clamp style HowToPlay's cards use, kept slightly
+## tighter so the HUD never grows large enough to crowd the play lanes.
+func _hud_s() -> float:
+	var vp := get_viewport().get_visible_rect().size if get_viewport() else Vector2(1920, 1080)
+	return clampf(minf(vp.x / 1920.0, vp.y / 1080.0), 0.75, 1.3)
+
+
+## Rounded card stylebox with a soft built-in glow (StyleBoxFlat's own shadow),
+## used for the score/combo card — replaces the old stacked glow+bg ColorRects.
+func _hud_card_style(border_col: Color) -> StyleBoxFlat:
+	var sf := StyleBoxFlat.new()
+	sf.bg_color     = Color(0.04, 0.02, 0.10, 0.90)
+	sf.border_color = border_col
+	sf.border_width_left = 1; sf.border_width_right  = 1
+	sf.border_width_top  = 1; sf.border_width_bottom = 1
+	sf.corner_radius_top_left     = 10; sf.corner_radius_top_right    = 10
+	sf.corner_radius_bottom_left  = 10; sf.corner_radius_bottom_right = 10
+	sf.shadow_color = Color(border_col.r, border_col.g, border_col.b, 0.35)
+	sf.shadow_size  = 8
+	return sf
+
+
+## Fully-rounded ("pill") stylebox — used for both the HP bar track and its fill,
+## so the fill always reads as a rounded cap rather than a square bar poking out
+## of a rounded frame. border_col is optional (fill panel has no border).
+func _hud_pill_style(fill_col: Color, radius: float, border_col: Color = Color(0, 0, 0, 0)) -> StyleBoxFlat:
+	return _hud_pill_style_sides(fill_col, radius, true, true, border_col)
+
+
+## Same as _hud_pill_style, but each end's rounding can be switched off. Used by
+## the segmented HP bar: only the FIRST segment rounds its left corners and only
+## the LAST rounds its right corners, with every segment butted flush against
+## its neighbour (no gap) — so the three colours read as one continuous pill-
+## shaped bar with coloured zones, not three separate rounded chips in a row.
+func _hud_pill_style_sides(fill_col: Color, radius: float, round_left: bool, round_right: bool,
+		border_col: Color = Color(0, 0, 0, 0)) -> StyleBoxFlat:
+	var sf := StyleBoxFlat.new()
+	sf.bg_color = fill_col
+	var r: int = int(radius)
+	sf.corner_radius_top_left     = r if round_left  else 0
+	sf.corner_radius_bottom_left  = r if round_left  else 0
+	sf.corner_radius_top_right    = r if round_right else 0
+	sf.corner_radius_bottom_right = r if round_right else 0
+	if border_col.a > 0.0:
+		sf.border_color = border_col
+		sf.border_width_left = 1; sf.border_width_right  = 1
+		sf.border_width_top  = 1; sf.border_width_bottom = 1
+	return sf
 
 
 func _hud_flash_color(col: Color, duration: float) -> void:
@@ -6540,8 +6856,8 @@ func _on_gate_scored(success: bool) -> void:
 		_health_pct = clamp(_health_pct + 0.01, 0.0, 1.0)
 		_world_vitality = clamp(_world_vitality + 0.07, 0.0, 1.0)
 		_update_hud_score()
-		_update_hud_health()
-		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.28), 0.30)
+		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
+		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.14), 0.30)   # softened — this fires on every hit
 		# Combo label bounce
 		if _hud_combo_label != null and _combo >= 2:
 			var ctw := create_tween()
@@ -6564,7 +6880,7 @@ func _on_gate_scored(success: bool) -> void:
 		_health_pct = clamp(_health_pct - 0.10, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health()
-		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.45), 0.40)
+		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.30), 0.40)   # softened — was washing out the lanes on miss
 		_shake_camera()
 		# Combo label flash red then vanish
 		if _hud_combo_label != null:
@@ -6598,6 +6914,8 @@ func _show_streak_milestone(combo: int) -> void:
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.add_theme_font_size_override("font_size", 46)
 	lbl.add_theme_color_override("font_color", col)
+	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
+	lbl.add_theme_constant_override("outline_size", 8)
 	lbl.set_anchors_preset(Control.PRESET_CENTER)
 	lbl.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	lbl.grow_vertical   = Control.GROW_DIRECTION_BOTH
@@ -7001,6 +7319,7 @@ func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
 	body_mat.albedo_color     = Color(0.04, 0.02, 0.08, 1.0)
 	body_mat.emission_enabled = false
 	body.material_override    = body_mat
+	body.set_meta("no_cycle", true)   # never recolored by the color cycle system
 	node.add_child(body)
 
 	# One shared material for every strip on this facade (no per-strip overhead)
@@ -7824,7 +8143,7 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 	var t_s:      float = _song_time()
 	@warning_ignore("unused_variable")
 	var vit:      float = _world_vitality
-	var init_col_a: Color = _current_cycle_color(t_s) if GameConfig.color_cycle_affects_halos else GameConfig.halo_color_a
+	var init_col_a: Color = _current_halo_cycle_color(t_s)
 	var init_col_b: Color = GameConfig.halo_color_b   if GameConfig.halo_dual_color           else init_col_a
 
 	var ahead: float     = player.forward_speed * 0.55
@@ -9095,24 +9414,55 @@ func _smooth01(x: float) -> float:
 	var y: float = clampf(x, 0.0, 1.0)
 	return y * y * (3.0 - 2.0 * y)
 
+const _CYCLE_RANDOM_SAT: float = 0.75
+const _CYCLE_RANDOM_VAL: float = 0.95
+
+## Deterministic-but-unpredictable hue for cycle stop `idx` — same idx always
+## gives the same color (so the blend between two consecutive stops stays
+## stable frame to frame), but consecutive idx values land on unrelated hues,
+## which is what makes the running cycle read as genuinely random.
+func _random_cycle_stop_color(idx: int) -> Color:
+	var h: float = fposmod(sin(float(idx) * 12.9898) * 43758.5453, 1.0)
+	return Color.from_hsv(h, _CYCLE_RANDOM_SAT, _CYCLE_RANDOM_VAL)
+
 func _current_cycle_color(song_t: float) -> Color:
 	if not color_cycle_enabled:
+		# Cycle off: hold a single static color — whatever the player picked
+		# in Options (Cycle Color A), no animation.
 		return cycle_color_a
 
-	var period: float = max(6.0, color_cycle_period_s)
-	var u: float = fposmod(song_t / period, 1.0) * 4.0
+	# Cycle on: genuinely random — a fresh random hue every stop, smoothly
+	# blended into the next. The Options A/B swatches are NOT used here on
+	# purpose; randomness is the point once the cycle is enabled. Floor is
+	# 0.05s just to keep the divide sane — the Options slider itself only
+	# goes down to 0.2s (deliberately harsh/strobe-fast; player is warned).
+	var period: float = max(0.05, color_cycle_period_s)
+	var u: float = song_t / period
 	var seg: int = int(floor(u))
 	var t: float = _smooth01(u - float(seg))
+	return _random_cycle_stop_color(seg).lerp(_random_cycle_stop_color(seg + 1), t)
 
-	match seg:
-		0:
-			return cycle_color_a.lerp(cycle_color_b, t)
-		1:
-			return cycle_color_b.lerp(cycle_color_c, t)
-		2:
-			return cycle_color_c.lerp(cycle_color_d, t)
-		_:
-			return cycle_color_d.lerp(cycle_color_a, t)
+
+## Independent random hue for HALOS — different hash than
+## _random_cycle_stop_color on purpose, so halos and gates/floor/rail/world
+## cycle to DIFFERENT colors at the same moment instead of all matching (that
+## exact match was what read as halo color "spilling" onto nearby gates).
+func _random_halo_stop_color(idx: int) -> Color:
+	var h: float = fposmod(sin(float(idx) * 78.233) * 12543.789, 1.0)
+	return Color.from_hsv(h, _CYCLE_RANDOM_SAT, _CYCLE_RANDOM_VAL)
+
+## Halos: random when Color Cycle is on AND the "Halos" affect-toggle is on
+## (own independent random stream, see above); otherwise held static at the
+## player's own dedicated Halo Color A pick — never derived from anything
+## gates/floor/rail are showing.
+func _current_halo_cycle_color(song_t: float) -> Color:
+	if not color_cycle_enabled or not GameConfig.color_cycle_affects_halos:
+		return GameConfig.halo_color_a
+	var period: float = max(0.05, color_cycle_period_s)
+	var u: float = song_t / period
+	var seg: int = int(floor(u))
+	var t: float = _smooth01(u - float(seg))
+	return _random_halo_stop_color(seg).lerp(_random_halo_stop_color(seg + 1), t)
 
 func _spawn_track_decorations() -> void:
 	var tw:      float = _track_full_width()
@@ -9426,7 +9776,11 @@ func _collect_cycle_mats(node: Node3D) -> Array[StandardMaterial3D]:
 		var n: Node = stack.pop_back()
 		if n is MeshInstance3D:
 			var mi: MeshInstance3D = n as MeshInstance3D
-			if mi.material_override is StandardMaterial3D:
+			# Structural "body" meshes (e.g. the dark silhouette box in
+			# _make_bldg_facade) are tagged no_cycle so they NEVER get
+			# recolored — they're meant to stay a fixed dark neutral always,
+			# cycle on or off, static or random.
+			if not mi.get_meta("no_cycle", false) and mi.material_override is StandardMaterial3D:
 				out.append(mi.material_override as StandardMaterial3D)
 		for c in n.get_children():
 			stack.append(c)
@@ -9434,8 +9788,12 @@ func _collect_cycle_mats(node: Node3D) -> Array[StandardMaterial3D]:
 
 
 func _update_color_cycle(song_t: float) -> void:
-	if not color_cycle_enabled:
-		return
+	# NOTE: no early-return on color_cycle_enabled here — when the toggle is
+	# off, _current_cycle_color() already returns a single static color (the
+	# player's Options pick), and everything below still needs to run once to
+	# actually apply it to gates/floor/world. The toggle only switches the
+	# COLOR SOURCE (random cycling vs. static pick), not whether this system
+	# runs at all.
 
 	# ── Ambient spark emitter — init lazily, follow player, update density/color ──
 	_ensure_spark_ambient()
@@ -9488,9 +9846,31 @@ func _update_color_cycle(song_t: float) -> void:
 				continue
 			if not gate.visible:
 				continue
-			if i < _gate_cycle_mats.size():
+			if i < _gate_cycle_mats.size() and color_cycle_enabled:
 				for mat: StandardMaterial3D in _gate_cycle_mats[i]:
-					mat.emission = mat.emission.lerp(live_col, 0.04)
+					# Random mode only: override BOTH the base surface color
+					# AND emission. The gates' actual visible "identity"
+					# color (the window-strip trim) is emission-driven — its
+					# albedo barely shows on screen — so albedo-only left it
+					# looking unchanged. The dark structural body meshes are
+					# excluded via the no_cycle mesh tag in
+					# _collect_cycle_mats, so this never bleeds onto parts
+					# that are meant to stay a fixed dark neutral.
+					mat.albedo_color = mat.albedo_color.lerp(live_col, color_cycle_gate_blend)
+					if mat.emission_enabled:
+						mat.emission = mat.emission.lerp(live_col, color_cycle_gate_blend)
+
+	# ── Grind rail ───────────────────────────────────────────────────────────
+	if GameConfig.color_cycle_affects_rail and color_cycle_enabled:
+		for rmat: StandardMaterial3D in _grind_rail_mats:
+			if rmat == null:
+				continue
+			# The rail is an inherently glow-strip look (authored with a
+			# strong emission to begin with), so unlike gates, tint both
+			# albedo AND emission together here — otherwise the surface and
+			# its own glow would drift out of sync and look like a bug.
+			rmat.albedo_color = rmat.albedo_color.lerp(live_col, color_cycle_gate_blend)
+			rmat.emission     = rmat.emission.lerp(live_col, color_cycle_gate_blend)
 
 	# ── Floor ────────────────────────────────────────────────────────────────
 	if _floor_material != null:

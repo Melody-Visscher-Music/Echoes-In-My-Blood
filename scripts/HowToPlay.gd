@@ -6,12 +6,22 @@ var _hint_lbl: Label    # small note telling the player which mode is active
 
 var _is_gamepad: bool = false
 
+# ── Scroll-gated confirm ─────────────────────────────────────────────────────
+var _scroller:   ScrollContainer  # the page's scroll view
+var _confirm_cb: CheckBox         # "I've read this" — locked until scrolled to bottom
+var _play_btn:   Button           # Continue/SELECT SONG — locked until checkbox is checked
+
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_build_ui()
 	_detect_initial_device()
 	_apply_device()
+	get_viewport().size_changed.connect(_update_scroll_gate)
+	# Layout/scroll extents aren't final until after the first frame, so defer
+	# the initial check (also covers the case where content fits without any
+	# scrolling being needed at all — the gate opens immediately then).
+	call_deferred("_update_scroll_gate")
 
 
 # Switch column when the player uses a different input device.
@@ -89,6 +99,10 @@ func _build_ui() -> void:
 	wrapper.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 	wrapper.custom_minimum_size   = Vector2(0.0, vp_h)
 	scroller.add_child(wrapper)
+
+	_scroller = scroller
+	scroller.get_v_scroll_bar().changed.connect(_update_scroll_gate)
+	scroller.get_v_scroll_bar().value_changed.connect(func(_v: float) -> void: _update_scroll_gate())
 
 	var panel := PanelContainer.new()
 	panel.custom_minimum_size = Vector2(_panel_w(), 0)
@@ -202,11 +216,24 @@ func _build_ui() -> void:
 	_row(md, "Seeded",   "Same gate layout every run for a given song",      s)
 	_row(md, "Random",   "Fresh layout every attempt — maximum replayability", s)
 
-	# ── Button row ────────────────────────────────────────────────────────────
+	# ── Scroll-gated confirm checkbox ────────────────────────────────────────
 	var sp := Control.new()
 	sp.custom_minimum_size = Vector2(0, int(6 * s))
 	vbox.add_child(sp)
 
+	var confirm_row := HBoxContainer.new()
+	confirm_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	confirm_row.add_theme_constant_override("separation", int(10 * s))
+	vbox.add_child(confirm_row)
+
+	_confirm_cb = CheckBox.new()
+	_confirm_cb.text = "I've read through the tutorial"
+	_confirm_cb.disabled = true   # unlocked once the page has been scrolled to the bottom
+	_confirm_cb.add_theme_font_size_override("font_size", int(15 * s))
+	_confirm_cb.toggled.connect(func(_pressed: bool) -> void: _update_continue_btn())
+	confirm_row.add_child(_confirm_cb)
+
+	# ── Button row ────────────────────────────────────────────────────────────
 	var btn_row := HBoxContainer.new()
 	btn_row.alignment = BoxContainer.ALIGNMENT_CENTER
 	btn_row.add_theme_constant_override("separation", int(20 * s))
@@ -224,10 +251,12 @@ func _build_ui() -> void:
 	play_btn.text = "SELECT SONG →"
 	play_btn.custom_minimum_size = Vector2(int(220 * s), int(52 * s))
 	_style_btn(play_btn, s)
+	play_btn.disabled = true   # unlocked once the confirm checkbox is checked
 	play_btn.pressed.connect(func() -> void:
 		get_tree().change_scene_to_file("res://scenes/SongSelect.tscn"))
-	play_btn.call_deferred("grab_focus")
 	btn_row.add_child(play_btn)
+	_play_btn = play_btn
+	back_btn.call_deferred("grab_focus")   # play_btn starts disabled, so focus BACK instead
 
 
 # ── Layout helpers ─────────────────────────────────────────────────────────────
@@ -315,3 +344,29 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event.is_action_pressed("ui_cancel"):
 		get_viewport().set_input_as_handled()
 		get_tree().change_scene_to_file("res://scenes/Main.tscn")
+
+
+# ── Scroll-gated confirm ─────────────────────────────────────────────────────
+
+## Unlocks the confirm checkbox once the tutorial has been scrolled to the
+## bottom. One-way: once unlocked it stays unlocked (scrolling back up to
+## re-read shouldn't re-lock progress the player already earned). Also
+## unlocks immediately if the content is short enough that no scrolling is
+## needed at all, on any screen size.
+func _update_scroll_gate() -> void:
+	if _scroller == null or _confirm_cb == null or not _confirm_cb.disabled:
+		_update_continue_btn()
+		return
+	var vbar := _scroller.get_v_scroll_bar()
+	var nothing_to_scroll: bool = vbar.max_value <= vbar.page + 0.5
+	var reached_bottom: bool    = vbar.value >= vbar.max_value - vbar.page - 1.0
+	if nothing_to_scroll or reached_bottom:
+		_confirm_cb.disabled = false
+	_update_continue_btn()
+
+
+## Continue is only clickable once the (unlocked) confirm checkbox is checked.
+func _update_continue_btn() -> void:
+	if _play_btn == null:
+		return
+	_play_btn.disabled = _confirm_cb == null or not _confirm_cb.button_pressed

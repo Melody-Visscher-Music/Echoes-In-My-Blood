@@ -458,14 +458,28 @@ func _build_gameplay_panel() -> Control:
 
 	# ── LEVEL COLORS ──────────────────────────────────────────────────────────
 	_opt_section(vbox, "LEVEL COLORS", s)
-	_opt_color(vbox, "Cycle Color A  (pink)", GameConfig.level_color_a,
+	_opt_color(vbox, "Left Gate Color  (pink)", GameConfig.level_color_a,
 		func(c: Color) -> void: GameConfig.level_color_a = c, s)
-	_opt_color(vbox, "Cycle Color B  (blue)", GameConfig.level_color_b,
+	_opt_color(vbox, "Right Gate Color  (blue)", GameConfig.level_color_b,
 		func(c: Color) -> void: GameConfig.level_color_b = c, s)
+	_opt_color(vbox, "Jump Gate Color  (green)", GameConfig.level_color_jump,
+		func(c: Color) -> void: GameConfig.level_color_jump = c, s)
+	_opt_color(vbox, "Slide Gate Color  (teal)", GameConfig.level_color_slide,
+		func(c: Color) -> void: GameConfig.level_color_slide = c, s)
+	_opt_color(vbox, "Grind Rail Color  (orange)", GameConfig.level_color_rail,
+		func(c: Color) -> void: GameConfig.level_color_rail = c, s)
 	_opt_color(vbox, "Floor Color", GameConfig.floor_color,
 		func(c: Color) -> void: GameConfig.floor_color = c, s)
 	_opt_toggle(vbox, "Color Cycle", GameConfig.color_cycle_enabled,
 		func(on: bool) -> void: GameConfig.color_cycle_enabled = on, s)
+
+	var cycle_speed_val := Label.new()
+	cycle_speed_val.text = "%.1fs" % GameConfig.color_cycle_period_s
+	_opt_slider(vbox, "Color Cycle Speed  (sec/color — lower = faster)",
+		0.1, 5.0, 0.1, GameConfig.color_cycle_period_s, cycle_speed_val,
+		func(v: float) -> void:
+			GameConfig.color_cycle_period_s = v
+			cycle_speed_val.text = "%.1fs" % v, s)
 
 	# ── CYCLE AFFECTS ─────────────────────────────────────────────────────────
 	_opt_section(vbox, "COLOR CYCLE AFFECTS", s)
@@ -477,6 +491,8 @@ func _build_gameplay_panel() -> Control:
 		func(on: bool) -> void: GameConfig.color_cycle_affects_floor  = on, s)
 	_opt_toggle(vbox, "World Deco", GameConfig.color_cycle_affects_world,
 		func(on: bool) -> void: GameConfig.color_cycle_affects_world  = on, s)
+	_opt_toggle(vbox, "Grind Rail", GameConfig.color_cycle_affects_rail,
+		func(on: bool) -> void: GameConfig.color_cycle_affects_rail   = on, s)
 
 	# ── GAMEPLAY ──────────────────────────────────────────────────────────────
 	_opt_section(vbox, "GAMEPLAY", s)
@@ -859,7 +875,13 @@ func _htp_row(parent: Node, key: String, desc: String, s: float = 1.0) -> void:
 # ── Button handlers ────────────────────────────────────────────────────────────
 
 func _on_new_game() -> void:
-	get_tree().change_scene_to_file("res://scenes/HowToPlay.tscn")
+	# Tutorial is a one-time, first-launch-only screen: once any song has a
+	# registered high score, the player has already played, so skip straight
+	# to song select on every later launch.
+	if Save.has_any_high_score():
+		get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+	else:
+		get_tree().change_scene_to_file("res://scenes/HowToPlay.tscn")
 
 func _on_continue() -> void:
 	pass  # Not yet implemented

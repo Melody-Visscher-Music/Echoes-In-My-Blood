@@ -13,14 +13,22 @@ var fur_color:    Color = Color(0.09, 0.08,  0.11,  1.0)  # dark charcoal
 var hair_color:   Color = Color(0.90, 0.74,  0.10,  1.0)  # golden-blonde
 
 # ── Level colors ───────────────────────────────────────────────────────────────
-var level_color_a:       Color = Color(1.00, 0.45, 0.70, 1.0)    # pink  (cycle A)
-var level_color_b:       Color = Color(0.45, 0.82, 1.00, 1.0)    # cyan  (cycle B)
+var level_color_a:       Color = Color(1.00, 0.45, 0.70, 1.0)    # pink  (left gates)
+var level_color_b:       Color = Color(0.45, 0.82, 1.00, 1.0)    # cyan  (right gates)
+var level_color_jump:    Color = Color(0.30, 1.00, 0.55, 1.0)    # green (jump gates)
+var level_color_slide:   Color = Color(0.0,  0.821, 0.729, 1.0)  # teal  (slide gates)
+var level_color_rail:    Color = Color(1.00, 0.55, 0.10, 1.0)    # orange (grind rail)
 var floor_color:         Color = Color(0.103, 0.113, 0.121, 1.0) # light grey floor
 var color_cycle_enabled:         bool  = true
+# Seconds per random-color stop while Color Cycle is on — player-tunable,
+# 5.0 (slowest) down to 0.2 (fastest / strobe-fast, deliberately harsh —
+# player has been warned at boot, their call).
+var color_cycle_period_s:        float = 5.0
 var color_cycle_affects_gates:   bool  = true   # gates tinted by cycle colour
 var color_cycle_affects_halos:   bool  = true   # halo rings follow cycle colour
 var color_cycle_affects_floor:   bool  = true   # floor pulses with cycle colour
-var color_cycle_affects_world:   bool  = true   # strips / gems / arches / rails
+var color_cycle_affects_world:   bool  = true   # strips / gems / arches / floor-edge rails
+var color_cycle_affects_rail:    bool  = true   # grind-rail gameplay hazard
 
 # ── Gameplay ───────────────────────────────────────────────────────────────────
 var wall_jumps_enabled:  bool  = true
@@ -30,8 +38,8 @@ var halo_preview_beats:  float = 2.2   # how many beats ahead halo rings spawn
 
 # ── Halo ───────────────────────────────────────────────────────────────────────
 var halo_shape:       String = "circle"  # one of: circle triangle square pentagon hexagon star diamond cross heart
-var halo_size:        float  = 5.8    # radius of the halo ring
-var halo_dual_color:  bool   = false  # second colour on alternating segments
+var halo_size:        float  = 4.2    # radius of the halo ring
+var halo_dual_color:  bool   = true  # second colour on alternating segments
 var halo_color_a:     Color  = Color(1.00, 0.45, 0.70, 1.0)  # primary colour (used when cycle is off)
 var halo_color_b:     Color  = Color(0.45, 0.82, 1.0,  1.0)  # secondary / dual colour
 
@@ -281,12 +289,17 @@ func save() -> void:
 	cfg.set_value("appearance", "hair_color",      hair_color)
 	cfg.set_value("level",      "color_a",         level_color_a)
 	cfg.set_value("level",      "color_b",         level_color_b)
+	cfg.set_value("level",      "color_jump",      level_color_jump)
+	cfg.set_value("level",      "color_slide",     level_color_slide)
+	cfg.set_value("level",      "color_rail",      level_color_rail)
 	cfg.set_value("level",      "floor_color",     floor_color)
 	cfg.set_value("level",      "color_cycle",              color_cycle_enabled)
+	cfg.set_value("level",      "color_cycle_period_s",     color_cycle_period_s)
 	cfg.set_value("level",      "cycle_affects_gates",      color_cycle_affects_gates)
 	cfg.set_value("level",      "cycle_affects_halos",      color_cycle_affects_halos)
 	cfg.set_value("level",      "cycle_affects_floor",      color_cycle_affects_floor)
 	cfg.set_value("level",      "cycle_affects_world",      color_cycle_affects_world)
+	cfg.set_value("level",      "cycle_affects_rail",       color_cycle_affects_rail)
 	cfg.set_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	cfg.set_value("gameplay",   "lives_per_song",       lives_per_song)
 	cfg.set_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
@@ -314,12 +327,17 @@ func load_from_disk() -> void:
 	hair_color          = cfg.get_value("appearance", "hair_color",      hair_color)
 	level_color_a       = cfg.get_value("level",      "color_a",         level_color_a)
 	level_color_b       = cfg.get_value("level",      "color_b",         level_color_b)
+	level_color_jump    = cfg.get_value("level",      "color_jump",      level_color_jump)
+	level_color_slide   = cfg.get_value("level",      "color_slide",     level_color_slide)
+	level_color_rail    = cfg.get_value("level",      "color_rail",      level_color_rail)
 	floor_color         = cfg.get_value("level",      "floor_color",     floor_color)
 	color_cycle_enabled          = cfg.get_value("level", "color_cycle",              color_cycle_enabled)
+	color_cycle_period_s         = cfg.get_value("level", "color_cycle_period_s",     color_cycle_period_s)
 	color_cycle_affects_gates    = cfg.get_value("level", "cycle_affects_gates",      color_cycle_affects_gates)
 	color_cycle_affects_halos    = cfg.get_value("level", "cycle_affects_halos",      color_cycle_affects_halos)
 	color_cycle_affects_floor    = cfg.get_value("level", "cycle_affects_floor",      color_cycle_affects_floor)
 	color_cycle_affects_world    = cfg.get_value("level", "cycle_affects_world",      color_cycle_affects_world)
+	color_cycle_affects_rail     = cfg.get_value("level", "cycle_affects_rail",       color_cycle_affects_rail)
 	wall_jumps_enabled  = cfg.get_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	lives_per_song      = cfg.get_value("gameplay",   "lives_per_song",       lives_per_song)
 	gate_preview_beats  = cfg.get_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
@@ -338,19 +356,24 @@ func reset_defaults() -> void:
 	hair_color          = Color(0.90, 0.74,  0.10,  1.0)
 	level_color_a       = Color(1.00, 0.45,  0.70,  1.0)
 	level_color_b       = Color(0.45, 0.82,  1.00,  1.0)
+	level_color_jump    = Color(0.30, 1.00,  0.55,  1.0)
+	level_color_slide   = Color(0.0,  0.821, 0.729, 1.0)
+	level_color_rail    = Color(1.00, 0.55,  0.10,  1.0)
 	floor_color         = Color(0.943, 0.948, 0.952, 1.0)
 	color_cycle_enabled          = true
+	color_cycle_period_s         = 5.0
 	color_cycle_affects_gates    = true
 	color_cycle_affects_halos    = true
 	color_cycle_affects_floor    = true
 	color_cycle_affects_world    = true
+	color_cycle_affects_rail     = true
 	wall_jumps_enabled  = true
 	lives_per_song      = 3
-	gate_preview_beats  = 8.0
+	gate_preview_beats  = 2.5
 	halo_preview_beats  = 2.2
 	halo_shape          = "circle"
-	halo_size           = 5.8
-	halo_dual_color     = false
+	halo_size           = 4.2
+	halo_dual_color     = true
 	halo_color_a        = Color(1.00, 0.45, 0.70, 1.0)
 	halo_color_b        = Color(0.45, 0.82, 1.0,  1.0)
 	Run.song_lives      = 3

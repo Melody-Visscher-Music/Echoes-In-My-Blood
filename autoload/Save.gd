@@ -29,6 +29,15 @@ func get_high_score(song_key: String) -> Dictionary:
 		"combo": int(cfg.get_value(song_key, "combo", 0)),
 	}
 
+## Returns true if a high score has been registered for ANY song. Used to
+## gate the first-launch tutorial: once any record exists, the player has
+## already played, so the tutorial is skipped on later launches.
+func has_any_high_score() -> bool:
+	var cfg := ConfigFile.new()
+	if cfg.load(_HS_PATH) != OK:
+		return false
+	return cfg.get_sections().size() > 0
+
 ## Wipes every high score record and the used-seed log (dev tool).
 func clear_all_high_scores() -> void:
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(_HS_PATH))
