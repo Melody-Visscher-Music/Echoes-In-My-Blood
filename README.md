@@ -32,7 +32,7 @@ The game takes place entirely within the span of a **4 -5 months**. Everything �
 **BPM Arc:**
 - Level 1 — 130 BPM (bouncy house / light hardstyle)
 - Mid game — melodic, mid-tempo - 160-180 BPM (hardstyle)
-- Late game (Meeko track) — 185 BPM (rawstyle/hard techno)
+- Late game (Meeko track) — 185-220 BPM (rawstyle/hard techno)
 - Final boss (Xevia fight) — 230 BPM (Speedcore)
 
 ---
