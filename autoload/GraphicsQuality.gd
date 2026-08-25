@@ -26,6 +26,7 @@ extends Node
 ##   - world_fx_wisps           melody wisps spawned per track side, per event
 ##   - world_fx_spires          melody light spires on/off
 ##   - city_buildings_per_side  skyline density
+##   - laser_fixtures           beat-driven side lasers in the pool (0 = off)
 ##   - fur_physics              so_fluffy spring simulation on/off
 ## Without these, every tier from "low" to "max" ran the exact same per-frame
 ## script workload and only the render resolution changed — which is why
@@ -57,6 +58,7 @@ const PRESETS: Dictionary = {
 		"world_fx_wisps": 1,
 		"world_fx_spires": false,
 		"city_buildings_per_side": 8,
+		"laser_fixtures": 0,
 		"fur_physics": false,
 		"ambient_light_spacing_m": 50.0,
 		"gem_spacing_m": 64.0,
@@ -80,6 +82,7 @@ const PRESETS: Dictionary = {
 		"world_fx_wisps": 2,
 		"world_fx_spires": true,
 		"city_buildings_per_side": 12,
+		"laser_fixtures": 8,
 		"fur_physics": false,
 		"ambient_light_spacing_m": 35.0,
 		"gem_spacing_m": 48.0,
@@ -103,6 +106,7 @@ const PRESETS: Dictionary = {
 		"world_fx_wisps": 4,
 		"world_fx_spires": true,
 		"city_buildings_per_side": 18,
+		"laser_fixtures": 14,
 		"fur_physics": true,
 		"ambient_light_spacing_m": 25.0,
 		"gem_spacing_m": 32.0,
@@ -132,6 +136,7 @@ const PRESETS: Dictionary = {
 		"world_fx_wisps": 5,
 		"world_fx_spires": true,
 		"city_buildings_per_side": 18,
+		"laser_fixtures": 18,
 		"fur_physics": true,
 		"ambient_light_spacing_m": 25.0,
 		"gem_spacing_m": 32.0,
@@ -167,6 +172,7 @@ const PRESETS: Dictionary = {
 		"world_fx_wisps": 5,
 		"world_fx_spires": true,
 		"city_buildings_per_side": 18,
+		"laser_fixtures": 22,
 		"fur_physics": true,
 		"ambient_light_spacing_m": 20.0,
 		"gem_spacing_m": 32.0,

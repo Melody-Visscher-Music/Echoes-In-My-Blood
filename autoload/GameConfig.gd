@@ -33,6 +33,21 @@ var color_cycle_affects_rail:    bool  = true   # grind-rail gameplay hazard
 # ── Gameplay ───────────────────────────────────────────────────────────────────
 var wall_jumps_enabled:  bool  = true
 var lives_per_song:      int   = 3
+
+## Laser fixtures in the trackside rig. -1 means AUTO: follow the graphics
+## quality tier, which is what keeps a weak machine on 0 unless the player
+## deliberately asks for more. 0..LASER_COUNT_MAX overrides the tier outright.
+const LASER_COUNT_AUTO: int = -1
+const LASER_COUNT_MAX:  int = 100
+var laser_count:         int   = LASER_COUNT_AUTO
+
+## Screen-space reflections, ambient occlusion, indirect lighting and SDFGI, per
+## the graphics tier. OFF by default and deliberately so: the tier's environment
+## pass was dead code until the WorldEnvironment fix (see
+## Section_BeatRunner3d._setup_world_environment), so every hour the game has
+## ever been played was played without it. Measured at ~35-40 % of the frame
+## rate on ultra, so switching it on is the player's call, not a silent upgrade.
+var advanced_lighting:   bool  = false
 var gate_preview_beats:  float = 8.0   # how many beats ahead gates become visible
 var halo_preview_beats:  float = 2.2   # how many beats ahead halo rings spawn
 
@@ -317,6 +332,8 @@ func save() -> void:
 	cfg.set_value("level",      "cycle_affects_rail",       color_cycle_affects_rail)
 	cfg.set_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	cfg.set_value("gameplay",   "lives_per_song",       lives_per_song)
+	cfg.set_value("display",    "laser_count",          laser_count)
+	cfg.set_value("display",    "advanced_lighting",    advanced_lighting)
 	cfg.set_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
 	cfg.set_value("gameplay",   "halo_preview_beats",   halo_preview_beats)
 	cfg.set_value("halo",       "shape",        halo_shape)
@@ -356,6 +373,9 @@ func load_from_disk() -> void:
 	color_cycle_affects_rail     = cfg.get_value("level", "cycle_affects_rail",       color_cycle_affects_rail)
 	wall_jumps_enabled  = cfg.get_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	lives_per_song      = cfg.get_value("gameplay",   "lives_per_song",       lives_per_song)
+	advanced_lighting   = bool(cfg.get_value("display", "advanced_lighting", advanced_lighting))
+	laser_count         = clampi(int(cfg.get_value("display", "laser_count", laser_count)),
+		LASER_COUNT_AUTO, LASER_COUNT_MAX)
 	gate_preview_beats  = cfg.get_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
 	halo_preview_beats  = cfg.get_value("gameplay",   "halo_preview_beats",   halo_preview_beats)
 	halo_shape          = cfg.get_value("halo",  "shape",       halo_shape)
@@ -385,6 +405,8 @@ func reset_defaults() -> void:
 	color_cycle_affects_rail     = true
 	wall_jumps_enabled  = true
 	lives_per_song      = 3
+	laser_count         = LASER_COUNT_AUTO
+	advanced_lighting   = false
 	gate_preview_beats  = 2.5
 	halo_preview_beats  = 2.2
 	halo_shape          = "circle"

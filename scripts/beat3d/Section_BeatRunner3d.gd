@@ -291,10 +291,12 @@ var _fx_step_lights_on: bool = true            # quality tier may switch these o
 var _fx_step_lights: Array[OmniLight3D] = []   # [0] = left foot, [1] = right foot
 var _fx_step_tweens: Array[Tween]       = [null, null]
 var _fx_beat_light:  OmniLight3D        = null
+var _laser_rig:      LaserRig           = null   # beat-driven side lasers
 var _fx_beat_tween:  Tween              = null
 
 # Melody visual system — env reference for fog colour pulses
 var _melody_env: Environment = null
+var _sky_mat:    ShaderMaterial = null
 var _fx_tween_host: Node = null   # PROCESS_MODE_INHERIT — pauses with SceneTree
 var _lyrics_scan_idx: int = 0   # monotonic cursor for _update_lyrics (see there)
 # Pooled world FX — halo rings, melody spires and wisps. Every one of these used
@@ -790,6 +792,13 @@ func _process(delta: float) -> void:
 	# Song progress bar
 	_update_hud_progress(t_s)
 
+	# Laser rig: re-seed fixtures ahead of the player, then sweep them. Both are
+	# driven off song time rather than wall-clock, so the motion stays locked to
+	# the music even if the frame rate moves.
+	if _laser_rig != null:
+		_laser_rig.advance(_player_path_dist)
+		_laser_rig.tick(t_s, _beat_phase)
+
 	# slow palette drift. (Was guarded by has_method("_update_color_cycle") — a
 	# String-to-StringName conversion plus a method-table lookup every frame, for a
 	# function defined a few hundred lines below in this same file.)
@@ -858,8 +867,7 @@ func _process(delta: float) -> void:
 	# the identical instant, which read as the halo's color "spilling" onto gates.
 	if _visual_tick(_TICK_HALO, delta) > 0.0 and _fx_pool != null:
 		var _halo_col_a: Color = _current_halo_cycle_color(t_s)
-		# B colour: if dual_color use GameConfig.halo_color_b, else follow A
-		var _halo_col_b: Color = GameConfig.halo_color_b if GameConfig.halo_dual_color else _halo_col_a
+		var _halo_col_b: Color = _current_halo_cycle_color_b(t_s) 			if GameConfig.halo_dual_color else _halo_col_a
 		_fx_pool.update_halo_colors(_halo_col_a, _halo_col_b)
 
 	# only show gates a few beats ahead instead of the whole song at once
@@ -1127,6 +1135,10 @@ func _load_chart_and_build_plan() -> void:
 	# feasibility check used during plan building sees the correct BPM-scaled gravity
 	# and jump velocity. Safe to call again later — set_beat_duration is idempotent.
 	player.set_beat_duration(_runner_avg_beat_s)
+	# The laser rig is built long before this, so hand it the real tempo now —
+	# otherwise its sweep stays on the placeholder 0.5 s beat all song.
+	if _laser_rig != null:
+		_laser_rig.set_beat(_runner_avg_beat_s)
 
 	# Let SongSelect override the pattern mode via the Run autoload
 	var run_mode: String = str(Run.get("runner_pattern_mode")).strip_edges()
@@ -3527,12 +3539,19 @@ func _vis_wall_gate(root: Node3D, action: String, tint: Color) -> void:
 func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 		tint: Color, seg_count: int = 8, z_pos: float = 0.0) -> StandardMaterial3D:
 
-	# Shared material — all frames use this; crackle tween drives emission
+	# Shared material — all frames use this; crackle tween drives emission.
+	#
+	# Electric-zone energies are scaled to ~0.45 of what they were. They were
+	# authored against a glow pass that never actually ran (the WorldEnvironment
+	# was dead code), so once real bloom arrived, values in the 13-25 range
+	# cleared the HDR threshold by more than twenty times over and washed the
+	# whole zone white. The crackle RANGE is preserved proportionally, so the
+	# lightning still reads as lightning — it just no longer saturates.
 	var mat := StandardMaterial3D.new()
 	mat.albedo_color               = Color.WHITE
 	mat.emission_enabled           = true
 	mat.emission                   = tint.lightened(0.4)
-	mat.emission_energy_multiplier = 7.0
+	mat.emission_energy_multiplier = 3.2
 
 	# Four distinct zigzag shapes — snapping between them mimics lightning reshaping
 	var zz_variants: Array = [
@@ -3594,7 +3613,7 @@ func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 		flip_tween.tween_callback(cb.bind(next_fi, frame_roots))
 
 	# Background crackle on the shared material
-	var energies: Array[float] = [7.0, 12.0, 5.0, 10.0, 6.5, 13.0, 4.5, 9.0, 7.5, 11.0]
+	var energies: Array[float] = [3.2, 5.4, 2.3, 4.5, 2.9, 5.9, 2.0, 4.1, 3.4, 5.0]
 	var times:    Array[float] = [0.06, 0.03, 0.08, 0.04, 0.065, 0.025, 0.09, 0.04, 0.05, 0.03]
 	var ctw := parent.create_tween().set_loops()
 	for ei in range(energies.size()):
@@ -3610,7 +3629,7 @@ func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 	smat.albedo_color               = Color.WHITE
 	smat.emission_enabled           = true
 	smat.emission                   = tint.lightened(0.6)
-	smat.emission_energy_multiplier = 25.0
+	smat.emission_energy_multiplier = 11.0   # was 25.0 — see the note on `mat` above
 	spark.material_override = smat
 	spark.position = Vector3(from_x, y, z_pos)
 	parent.add_child(spark)
@@ -4978,16 +4997,20 @@ func _spawn_wj_geometry_on_path() -> void:
 		smat.albedo_color               = Color.WHITE
 		smat.emission_enabled           = true
 		smat.emission                   = col
-		smat.emission_energy_multiplier = 4.5 if is_safe else 6.0
+		smat.emission_energy_multiplier = 2.4 if is_safe else 3.2
 		strip.material_override = smat
 		lane_ramp.add_child(strip)
 
 		# Dangerous lanes: crackle tween for electric flicker
 		if not is_safe:
+			# Same ~0.45 scaling as the arcs: the flicker pattern is untouched,
+			# only its ceiling. A peak of 8.6 still sits an order of magnitude
+			# above ordinary track neon, so a dangerous lane stays unmistakably
+			# hot — which matters, because this is a gameplay readability cue.
 			var zap_e: Array[float] = [
-				8.0, 2.5, 16.0, 3.5, 11.0, 1.8, 14.0, 5.0, 18.0, 2.0,
-				9.5, 4.0, 13.0, 1.5, 7.0, 17.0, 3.0, 10.5, 2.2, 15.0,
-				4.5, 12.0, 1.6, 8.5, 19.0, 3.2, 6.5, 14.5, 2.8, 11.5
+				3.6, 1.1, 7.2, 1.6, 5.0, 0.8, 6.3, 2.3, 8.1, 0.9,
+				4.3, 1.8, 5.9, 0.7, 3.2, 7.7, 1.4, 4.7, 1.0, 6.8,
+				2.0, 5.4, 0.7, 3.8, 8.6, 1.4, 2.9, 6.5, 1.3, 5.2
 			]
 			var zap_t: Array[float] = [
 				0.04, 0.09, 0.018, 0.07, 0.035, 0.10, 0.022, 0.06, 0.012, 0.08,
@@ -5373,9 +5396,10 @@ func _award_near_miss(_idx: int) -> void:
 		return
 
 	var lbl := Label.new()
-	lbl.text = "NEAR!"
-	lbl.add_theme_font_size_override("font_size", 32)
-	lbl.add_theme_color_override("font_color", Color(1.00, 0.82, 0.10, 1.0))
+	lbl.text = "NEAR"
+	lbl.add_theme_font_override("font", UiStyle.display(900, 4.0))
+	lbl.add_theme_font_size_override("font_size", 30)
+	lbl.add_theme_color_override("font_color", UiStyle.GOLD)
 	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
 	lbl.add_theme_constant_override("outline_size", 6)
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -6412,31 +6436,8 @@ func _spawn_score_popup(world_pos: Vector3, pts: int, mult: int) -> void:
 
 # Big centred banner (PERFECT FLOW / DROPPED). Mirrors _show_streak_milestone.
 func _show_grind_banner(text: String, col: Color) -> void:
-	if _hud_flash == null:
-		return
-	var root: Control = _hud_flash.get_parent() as Control
-	if root == null:
-		return
-	var lbl := Label.new()
-	lbl.text = text
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	lbl.add_theme_font_size_override("font_size", 44)
-	lbl.add_theme_color_override("font_color", col)
-	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	lbl.add_theme_constant_override("outline_size", 8)
-	lbl.set_anchors_preset(Control.PRESET_CENTER)
-	lbl.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	lbl.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	lbl.mouse_filter    = Control.MOUSE_FILTER_IGNORE
-	lbl.modulate.a      = 0.0
-	root.add_child(lbl)
-	var tw := create_tween()
-	tw.tween_property(lbl, "modulate:a", 1.0, 0.10)
-	tw.tween_property(lbl, "modulate", Color(col.r * 1.3, col.g * 1.3, col.b * 1.3, 1.0), 0.10)
-	tw.tween_property(lbl, "modulate", Color(col.r, col.g, col.b, 1.0), 0.12)
-	tw.tween_interval(0.70)
-	tw.tween_property(lbl, "modulate:a", 0.0, 0.25)
-	tw.tween_callback(lbl.queue_free)
+	if _hud != null:
+		_hud.show_callout(text, col, 0.70)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -6613,7 +6614,8 @@ func _hud_show_dev_toast(msg: String) -> void:
 	toast.offset_left  = -300; toast.offset_right  = 300
 	toast.offset_top   = 80;   toast.offset_bottom = 120
 	toast.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	toast.add_theme_font_size_override("font_size", 20)
+	toast.add_theme_font_override("font", UiStyle.body())
+	toast.add_theme_font_size_override("font_size", 18)
 	toast.add_theme_color_override("font_color", Color(1.0, 0.75, 0.20))
 	toast.modulate.a = 0.0
 	toast.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -6673,41 +6675,18 @@ func _on_gate_scored(success: bool) -> void:
 
 
 func _show_streak_milestone(combo: int) -> void:
-	if _hud_flash == null:
+	if _hud == null:
 		return
-	var root: Control = _hud_flash.get_parent() as Control
-	if root == null:
-		return
-
+	# Milestone colours pulled onto the shared palette so a streak banner reads
+	# as part of the same kit as the rest of the HUD.
 	var col: Color
 	match combo:
-		15:  col = Color(0.90, 0.85, 0.20)   # gold
-		30:  col = Color(0.30, 0.90, 1.00)   # cyan
-		75:  col = Color(0.65, 0.30, 1.00)   # purple
+		15:  col = UiStyle.GOLD
+		30:  col = UiStyle.CYAN
+		75:  col = UiStyle.VIOLET
 		100: col = Color(1.00, 0.40, 0.20)   # orange
-		_:   col = Color(1.00, 1.00, 1.00)   # white (200+)
-
-	var lbl := Label.new()
-	lbl.text = "★  ×%d  STREAK!  ★" % combo
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	lbl.add_theme_font_size_override("font_size", 46)
-	lbl.add_theme_color_override("font_color", col)
-	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	lbl.add_theme_constant_override("outline_size", 8)
-	lbl.set_anchors_preset(Control.PRESET_CENTER)
-	lbl.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	lbl.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	lbl.mouse_filter    = Control.MOUSE_FILTER_IGNORE
-	lbl.modulate.a      = 0.0
-	root.add_child(lbl)
-
-	var tw := create_tween()
-	tw.tween_property(lbl, "modulate:a", 1.0, 0.10)
-	tw.tween_property(lbl, "modulate", Color(col.r * 1.3, col.g * 1.3, col.b * 1.3, 1.0), 0.08)
-	tw.tween_property(lbl, "modulate", Color(col.r, col.g, col.b, 1.0), 0.12)
-	tw.tween_interval(0.65)
-	tw.tween_property(lbl, "modulate:a", 0.0, 0.22)
-	tw.tween_callback(lbl.queue_free)
+		_:   col = Color.WHITE               # 200+
+	_hud.show_callout("★  ×%d  STREAK  ★" % combo, col, 0.65)
 
 
 func _trigger_death() -> void:
@@ -7169,12 +7148,25 @@ func _shake_camera() -> void:
 
 # ── World environment (neon cyberpunk look) ───────────────────────────────────
 func _setup_world_environment() -> void:
-	var we := WorldEnvironment.new()
 	var env := Environment.new()
 
-	# Near-black deep-purple background
-	env.background_mode  = Environment.BG_COLOR
-	env.background_color = Color(0.018, 0.008, 0.050, 1.0)
+	# Sky, not a flat fill. The old BG_COLOR was most of why the background read
+	# as empty: above the skyline there was literally nothing to look at.
+	# shaders/world/night_sky.gdshader adds a gradient, a horizon glow, stars and
+	# two nebula bands for roughly the cost of the flat colour it replaces.
+	var sky_mat := ShaderMaterial.new()
+	sky_mat.shader = load("res://shaders/world/night_sky.gdshader")
+	sky_mat.set_shader_parameter("detail",
+		2 if GraphicsQuality.get_setting("world_fx_spires", true) else 0)
+	var sky := Sky.new()
+	sky.sky_material = sky_mat
+	sky.radiance_size = Sky.RADIANCE_SIZE_256
+	# Process the sky's radiance once: nothing in it moves fast enough to be
+	# worth re-convolving every frame for ambient/reflection purposes.
+	sky.process_mode = Sky.PROCESS_MODE_REALTIME
+	env.background_mode = Environment.BG_SKY
+	env.sky = sky
+	_sky_mat = sky_mat
 
 	# Ambient: very dim violet so dark areas don't go full black
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
@@ -7182,30 +7174,102 @@ func _setup_world_environment() -> void:
 	env.ambient_light_energy = 0.18
 
 	# Glow — punchy neon bloom; HDR threshold lowered so more surfaces contribute
+	# Glow. These values only started mattering once the WorldEnvironment fix
+	# below made this Environment the live one — until then the scene file's
+	# much punchier settings (intensity 2.0, bloom 0.05, hdr_scale 2.5) were
+	# what actually rendered, and swapping straight to the numbers here flattened
+	# the neon badly.
+	#
+	# Two separate things caused that, and only one was obvious:
+	#   • intensity was less than half the old value, and
+	#   • bloom was more than DOUBLE it. bloom lifts every pixel, not just the
+	#     bright ones, so raising it trades punchy neon for an even grey haze —
+	#     it makes the scene glowier and the neon weaker at the same time.
+	#
+	# So: intensity back most of the way, bloom back to the old low value, and
+	# the HDR threshold raised off 0.60 so dim surfaces stop contributing and
+	# the bloom belongs to the neon again. Still short of the original 2.0,
+	# which was over the top.
 	env.glow_enabled    = true
 	env.glow_normalized = true
-	env.glow_intensity  = 0.85
+	env.glow_intensity  = 1.35
 	env.glow_strength   = 1.10
-	env.glow_bloom      = 0.12
-	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SOFTLIGHT
-	env.glow_hdr_threshold  = 0.60
-	env.glow_hdr_scale      = 2.0
+	env.glow_bloom      = 0.05
+	# SCREEN, which is the middle ground between the two modes already tried.
+	#
+	# SOFTLIGHT deliberately restrains bloom on pixels that are already bright,
+	# so the most saturated neon got the LEAST halo — raising intensity under it
+	# just made the strips brighter with the same hard edge. ADDITIVE has no
+	# roll-off at all, so the same neon stacked straight past white.
+	#
+	# SCREEN is 1-(1-a)(1-b): it blooms bright sources properly like additive,
+	# but asymptotes at white instead of overshooting it, so it cannot produce
+	# the blown-out frame additive did.
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SCREEN
+	# Raised a notch off 0.70. This is the dial that tames electric zones, where
+	# a lot of mid-bright surfaces bloom at once and stack; lifting the bar keeps
+	# the brightest neon glowing while dropping the merely-lit stuff out of it.
+	env.glow_hdr_threshold  = 0.85
+	env.glow_hdr_scale      = 2.50
+
+	# The halo itself. Godot only enables blur levels 3 and 5 by default, which
+	# gives a tight glow that hugs the surface — the neon ends up bright but
+	# without much bleed around it. Turning on the wider levels is what actually
+	# produces a halo; intensity alone just makes the strip brighter, not glowier.
+	# Level 1 stays off: it is the tightest blur and only adds shimmer.
+	#
+	# set_glow_level is ZERO-indexed while the inspector labels these 1-7, so
+	# index 0 is level 1 and index 6 is level 7. Passing 7 is out of bounds.
+	# Kept, but at roughly half the previous weights. The wide levels are what
+	# give the neon a halo instead of a hard edge; opened up too far they smear
+	# the whole frame into fog.
+	env.set_glow_level(0, 0.0)    # level 1 - tightest, off
+	env.set_glow_level(1, 0.20)   # level 2
+	env.set_glow_level(2, 1.0)    # level 3 - on by default
+	env.set_glow_level(3, 0.38)   # level 4
+	env.set_glow_level(4, 1.0)    # level 5 - on by default
+	env.set_glow_level(5, 0.22)   # level 6 - widens the halo
+	env.set_glow_level(6, 0.0)    # level 7 - widest, off (this one smears)
 
 	# Subtle depth fog — keeps the far end hazy
 	env.fog_enabled        = true
 	env.fog_light_color    = Color(0.12, 0.04, 0.25, 1.0)
 	env.fog_light_energy   = 1.0
 	env.fog_density        = 0.008
+	# Hold fog off the sky itself — at full strength it washes the stars out and
+	# the background goes back to being one flat colour.
+	env.fog_sky_affect     = 0.20
 
-	# Quality-tier extras (SSR/SSAO/SSIL) — this Environment is the one that
-	# actually renders (this WorldEnvironment is added to the tree after the
-	# scene's own, so it supersedes it), so this is the correct place to
-	# apply Options > Display > Quality.
-	GraphicsQuality.apply_environment_overrides(env)
+	# Quality-tier extras: SSR / SSAO / SSIL / SDFGI / volumetric fog.
+	#
+	# Opt-in, and left off by default on purpose. These never reached the
+	# renderer before the WorldEnvironment fix below, so the game's whole
+	# performance profile was established without them; quietly switching them
+	# on costs ~35-40 % of the frame rate on ultra. Options > Display >
+	# Advanced Lighting turns them on.
+	if GameConfig.advanced_lighting:
+		GraphicsQuality.apply_environment_overrides(env)
 
+	# Attach to the WorldEnvironment the scene ALREADY has, rather than adding a
+	# second one.
+	#
+	# This whole function used to be dead code. The old version built its own
+	# WorldEnvironment and add_child()'d it, on the belief that a later node
+	# supersedes an earlier one — Godot does the opposite and keeps the FIRST
+	# WorldEnvironment it finds, which is the one in Section_BeatRunner3D.tscn.
+	# So none of the settings above ever reached the renderer, and neither did
+	# the quality tier's environment pass: on ultra the scene rendered with
+	# volumetric fog OFF while the tier asked for it on.
+	var we: WorldEnvironment = null
+	for c in get_children():
+		if c is WorldEnvironment:
+			we = c
+			break
+	if we == null:
+		we = WorldEnvironment.new()
+		add_child(we)
 	we.environment = env
 	_melody_env = env
-	add_child(we)
 
 
 # ── Floor grid lines ──────────────────────────────────────────────────────────
@@ -7886,6 +7950,32 @@ func _build_fx_pool() -> void:
 		int(GraphicsQuality.get_setting("world_fx_wisps", 5)),
 		bool(GraphicsQuality.get_setting("world_fx_spires", true)))
 
+	_build_laser_rig()
+
+
+## Beat-driven laser fixtures down both sides of the track. A fixed pool that
+## re-seeds itself ahead of the player (see LaserRig), so the cost is flat no
+## matter how long the song is.
+func _build_laser_rig() -> void:
+	# The player's own choice wins; LASER_COUNT_AUTO defers to the quality tier.
+	var count: int = GameConfig.laser_count
+	if count < 0:
+		count = int(GraphicsQuality.get_setting("laser_fixtures", 14))
+	count = clampi(count, 0, GameConfig.LASER_COUNT_MAX)
+	if count <= 0:
+		return
+	var detail: int = 2 if bool(GraphicsQuality.get_setting("world_fx_spires", true)) else 0
+	_laser_rig = LaserRig.new()
+	_laser_rig.name = "LaserRig"
+	add_child(_laser_rig)
+	_laser_rig.setup(
+		count,
+		_track_full_width() * 0.5,
+		_runner_avg_beat_s,
+		_path_world_pos,
+		_path_forward_at,
+		detail)
+
 
 ## Authored Blender halo ("halo") — spawned instead of the procedural ring when
 ## one exists. Scaled to the configured halo size, spun like the procedural
@@ -7970,7 +8060,7 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 
 	var t_s:        float = _song_time()
 	var init_col_a: Color = _current_halo_cycle_color(t_s)
-	var init_col_b: Color = GameConfig.halo_color_b if GameConfig.halo_dual_color else init_col_a
+	var init_col_b: Color = _current_halo_cycle_color_b(t_s) 		if GameConfig.halo_dual_color else init_col_a
 
 	# Pivot sits at track centre at the ring's path distance.
 	var ring_pos: Vector3 = _path_world_pos(ring_pd, 0.0, 1.0)
@@ -8631,8 +8721,11 @@ func _spawn_finish_lasers() -> void:
 	clear_label.offset_top    = -80;  clear_label.offset_bottom = 80
 	clear_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	clear_label.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
+	clear_label.add_theme_font_override("font", UiStyle.display(900, 10.0))
 	clear_label.add_theme_color_override("font_color", Color(1.00, 0.95, 0.30, 1.0))
-	clear_label.add_theme_font_size_override("font_size", 96)
+	clear_label.add_theme_font_size_override("font_size", 92)
+	clear_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
+	clear_label.add_theme_constant_override("outline_size", 10)
 	clear_label.scale   = Vector2(3.2, 3.2)
 	clear_label.modulate.a = 0.0
 	clear_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -9128,6 +9221,26 @@ func _current_halo_cycle_color(song_t: float) -> Color:
 	var seg: int = int(floor(u))
 	var t: float = _smooth01(u - float(seg))
 	return _random_halo_stop_color(seg).lerp(_random_halo_stop_color(seg + 1), t)
+
+## Colour B for dual-colour halos.
+##
+## Colour B used to be pinned to the static GameConfig.halo_color_b even with
+## the cycle running, so a dual-colour halo had one half drifting and one half
+## frozen. It now walks the SAME random stop stream as A, offset a couple of
+## stops along it — so both halves cycle, they stay in the same palette, and
+## they never land on the same colour at the same moment (which would collapse
+## the dual-colour look into a plain one).
+const _HALO_B_STOP_OFFSET: int = 2
+
+func _current_halo_cycle_color_b(song_t: float) -> Color:
+	if not color_cycle_enabled or not GameConfig.color_cycle_affects_halos:
+		return GameConfig.halo_color_b
+	var period: float = max(0.05, color_cycle_period_s)
+	var u: float = song_t / period
+	var seg: int = int(floor(u)) + _HALO_B_STOP_OFFSET
+	var t: float = _smooth01(u - floor(u))
+	return _random_halo_stop_color(seg).lerp(_random_halo_stop_color(seg + 1), t)
+
 
 func _spawn_track_decorations() -> void:
 	var tw:      float = _track_full_width()

@@ -457,7 +457,16 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 ## Alpha is preserved so the fade tweens keep working.
 func update_halo_colors(col_a: Color, col_b: Color) -> void:
 	if _halo_textured:
-		return   # stripe texture drives the colour; material tint stays neutral
+		# Dual-colour CIRCLE halos render from a shared stripe texture instead of
+		# a flat tint, and this used to bail out here — so once spawned, a live
+		# ring never recoloured at all. Only fresh spawns picked up the cycle,
+		# which reads as "colour B is frozen".
+		#
+		# Rebuilding needs no per-ring work: _stripe_texture is cached and
+		# quantised, and updates its Image IN PLACE on the one ImageTexture
+		# instance every live ring is already pointed at.
+		_stripe_texture(col_a, col_b)
+		return
 	for i in range(_halo_pivots.size()):
 		if not _halo_busy[i]:
 			continue
@@ -471,10 +480,17 @@ func update_halo_colors(col_a: Color, col_b: Color) -> void:
 ## 256x1 alternating-stripe texture for dual-colour circle halos. Rebuilt only
 ## when the primary colour has drifted a quantisation step — the old code built
 ## a fresh Image plus a fresh GPU texture on EVERY melody event.
+func _quant_key(c: Color) -> int:
+	return (int(c.r * _STRIPE_QUANT) << 12) \
+		 | (int(c.g * _STRIPE_QUANT) << 6) \
+		 |  int(c.b * _STRIPE_QUANT)
+
+
 func _stripe_texture(col_a: Color, col_b: Color) -> ImageTexture:
-	var key: int = (int(col_a.r * _STRIPE_QUANT) << 16) \
-				 | (int(col_a.g * _STRIPE_QUANT) << 8) \
-				 |  int(col_a.b * _STRIPE_QUANT)
+	# BOTH colours go in the key. Hashing col_a alone meant a drift in col_b
+	# alone hit the cache and got the stale stripe back, so half the ring stayed
+	# on whatever colour it happened to spawn with.
+	var key: int = (_quant_key(col_a) << 18) | _quant_key(col_b)
 	if _stripe_tex != null and key == _stripe_key:
 		return _stripe_tex
 

@@ -270,6 +270,34 @@ func _build_options_panel() -> Control:
 	quality_opt.item_selected.connect(func(idx: int) -> void: GraphicsQuality.set_tier(quality_ids[idx]))
 	quality_row.add_child(quality_opt)
 
+	# ── Lasers ────────────────────────────────────────────────────────────────
+	# The slider runs one notch below zero, and that notch is AUTO: it follows
+	# the quality tier, so a weak machine stays at the tier's count (0 on low)
+	# unless the player deliberately asks for more. 0 is fully off.
+	var laser_val := Label.new()
+	var laser_text := func(v: int) -> String:
+		if v < 0:
+			return "Auto (%d)" % int(GraphicsQuality.get_setting("laser_fixtures", 14))
+		return "Off" if v == 0 else str(v)
+	laser_val.text = laser_text.call(GameConfig.laser_count)
+	_opt_slider(vbox, "Trackside Lasers",
+		float(GameConfig.LASER_COUNT_AUTO), float(GameConfig.LASER_COUNT_MAX), 1.0,
+		float(GameConfig.laser_count), laser_val,
+		func(v: float) -> void:
+			GameConfig.laser_count = int(v)
+			laser_val.text = laser_text.call(int(v)),
+		s)
+
+	_opt_toggle(vbox, "Advanced Lighting", GameConfig.advanced_lighting,
+		func(on: bool) -> void: GameConfig.advanced_lighting = on, s)
+
+	var adv_note := Label.new()
+	adv_note.text = "Reflections, ambient occlusion and indirect light, following the quality tier. Costs roughly a third of the frame rate on Ultra."
+	adv_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	adv_note.add_theme_font_size_override("font_size", int(12 * s))
+	adv_note.add_theme_color_override("font_color", Color(0.5, 0.5, 0.62, 1.0))
+	vbox.add_child(adv_note)
+
 	var quality_note := Label.new()
 	quality_note.text = "Auto-picked from your hardware on first launch — change it here anytime."
 	quality_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART

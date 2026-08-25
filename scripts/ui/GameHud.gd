@@ -90,8 +90,10 @@ var _flow_cap:   Label     = null
 var _flow_value: Label     = null
 var _flow_bar:   ColorRect = null
 
-# Wall-jump callout
-var _wj_label: Label = null
+# Wall-jump banner + the transient centre-screen callouts
+var _wj_label:     Label      = null
+var _wj_card:      PlatePanel = null
+var _callout_card: PlatePanel = null
 
 # Song progress
 var _prog_bg:   ColorRect = null
@@ -107,6 +109,7 @@ var _lyric_font:   Font         = null
 var _lyric_size:   int          = 40
 var _lyric_row_w:  float        = 0.0    # running width of the row being filled
 var _lyric_last:   Label        = null   # most recently added word, for the karaoke dim
+var _lyric_line_id: int         = 0      # bumped per line; drops stale delayed words
 var _lyrics_slide: float        = 0.0
 
 # Shader materials whose `beat` uniform is written every frame.
@@ -441,12 +444,22 @@ func _build_flow() -> void:
 
 
 func _build_wall_jump() -> void:
-	_wj_label = UiStyle.label("WALL JUMP  ×2", UiStyle.display(900, 2.0), 30, UiStyle.GOLD, 7)
-	_wj_label.anchor_left = 0.0; _wj_label.anchor_right = 1.0
-	_wj_label.anchor_top  = 0.0; _wj_label.anchor_bottom = 0.0
+	# The bonus banner is a plate like everything else now, rather than a bare
+	# outlined Label floating over the track.
+	_wj_card = PlatePanel.create(int(14 * _s), UiStyle.GOLD, 16.0 * _s)
+	_wj_card.set_cuts(1.0, 0.0, 1.0, 0.0)
+	_wj_card.anchor_left = 0.5; _wj_card.anchor_right  = 0.5
+	_wj_card.anchor_top  = 0.0; _wj_card.anchor_bottom = 0.0
+	_wj_card.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_wj_card.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	_wj_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_wj_card.visible = false
+	_root.add_child(_wj_card)
+
+	_wj_label = UiStyle.label("WALL JUMP  ×2", UiStyle.display(900, 4.0), int(26 * _s), Color.WHITE)
 	_wj_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_wj_label.visible = false
-	_root.add_child(_wj_label)
+	_wj_label.self_modulate = UiStyle.GOLD
+	_wj_card.content.add_child(_wj_label)
 
 
 func _build_lyrics() -> void:
@@ -559,7 +572,8 @@ func _layout() -> void:
 	_set_rect(_flow_bar,   fx + 20.0 * s, fy + fh - 16.0 * s, fw - 40.0 * s, 8.0 * s)
 
 	# ── Callout ──────────────────────────────────────────────────────────────
-	_wj_label.offset_top = 112.0 * s; _wj_label.offset_bottom = 160.0 * s
+	# The banner sizes itself from its content, so only its anchor row moves.
+	_wj_card.offset_top = 118.0 * s
 
 	_layout_fonts()
 	_layout_lyrics()
@@ -998,11 +1012,61 @@ func combo_flash(col: Color, hold: float = 0.05, back: float = 0.14) -> void:
 
 
 func set_wall_jump(active: bool, alpha: float = 1.0) -> void:
-	if _wj_label == null:
+	if _wj_card == null:
 		return
-	_wj_label.visible = active
+	_wj_card.visible = active
 	if active:
-		_wj_label.modulate = Color(1.0, 1.0, 1.0, clampf(alpha, 0.0, 1.0))
+		_wj_card.modulate = Color(1.0, 1.0, 1.0, clampf(alpha, 0.0, 1.0))
+
+
+## A transient centre-screen banner: streak milestones, PERFECT FLOW, OVERDRIVE,
+## DROPPED. These were the last things in gameplay still drawn in Godot's default
+## font on a bare outline, which is exactly why they looked out of place next to
+## the rebuilt HUD.
+##
+## Only one is ever on screen: a new banner replaces the one in flight rather
+## than stacking on top of it.
+func show_callout(text: String, col: Color, hold: float = 0.70) -> void:
+	if _root == null:
+		return
+	if _callout_card != null and is_instance_valid(_callout_card):
+		_callout_card.queue_free()
+	var s: float = _s
+
+	var card := PlatePanel.create(int(18 * s), col, 20.0 * s)
+	card.set_cuts(1.0, 0.0, 1.0, 0.0)
+	card.anchor_left = 0.5; card.anchor_right  = 0.5
+	card.anchor_top  = 0.36; card.anchor_bottom = 0.36
+	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.modulate = Color(1, 1, 1, 0)
+	_root.add_child(card)
+	_callout_card = card
+
+	var lbl := UiStyle.label(text, UiStyle.display(900, 5.0), int(34 * s), Color.WHITE)
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.self_modulate = col
+	card.content.add_child(lbl)
+
+	# The plate's size comes from its content, so the punch pivot can only be set
+	# once layout has actually measured it.
+	card.resized.connect(func() -> void:
+		card.pivot_offset = card.size * 0.5)
+
+	card.scale = Vector2(0.82, 0.82)
+	var tw := create_tween()
+	tw.set_parallel(true)
+	tw.tween_property(card, "modulate", Color.WHITE, 0.10)
+	tw.tween_property(card, "scale", Vector2.ONE, 0.28) \
+		.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+	var out := create_tween()
+	out.tween_interval(0.10 + hold)
+	out.tween_property(card, "modulate:a", 0.0, 0.25)
+	out.parallel().tween_property(card, "scale", Vector2(1.06, 1.06), 0.25) \
+		.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
+	out.tween_callback(card.queue_free)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1102,10 +1166,20 @@ func lyrics_visible(v: bool) -> void:
 func lyrics_begin_line() -> void:
 	if _lyrics_rows == null:
 		return
+	# remove_child BEFORE queue_free. queue_free is deferred to the end of the
+	# frame, so a freed-but-still-parented row keeps answering get_child_count()
+	# — and lyrics_add_word, called later in this same frame, would parent the
+	# word to that doomed row and the word would silently never appear. That is
+	# the "skipped word" bug: it only shows on the first word or two of a line,
+	# whichever land in the same frame the line changed.
 	for row in _lyrics_rows.get_children():
+		_lyrics_rows.remove_child(row)
 		row.queue_free()
 	_lyric_row_w = 0.0
 	_lyric_last  = null
+	# Invalidate any staggered word still waiting on its delay timer from the
+	# line we just replaced, so it cannot land in this one.
+	_lyric_line_id += 1
 	_lyrics_root.modulate.a = 1.0
 	_lyrics_slide = 28.0
 	create_tween().tween_method(_apply_lyric_slide, 28.0, 0.0, 0.22) \
@@ -1129,8 +1203,13 @@ func lyrics_add_word(w: String, col: Color, delay: float = 0.0, wipe_s: float = 
 	if _lyrics_rows == null:
 		return
 	if delay > 0.0:
+		# Sung lines stagger their words in, so a word can still be waiting here
+		# when the next line starts. Checking is_instance_valid(_lyrics_rows) is
+		# not enough — that container lives for the whole song; it is the LINE
+		# that changed underneath us.
+		var line_id: int = _lyric_line_id
 		await get_tree().create_timer(delay).timeout
-		if not is_instance_valid(_lyrics_rows):
+		if not is_instance_valid(_lyrics_rows) or line_id != _lyric_line_id:
 			return
 
 	var s: float = _s
