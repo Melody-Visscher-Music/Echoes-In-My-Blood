@@ -1,8 +1,8 @@
-[gd_scene format=3 uid="uid://cvyyv6rju8455"]
+[gd_scene load_steps=2 format=3 uid="uid://cvyyv6rju8455"]
 
 [ext_resource type="Script" uid="uid://duiuhu0n87ofu" path="res://scripts/SongSelect.gd" id="1_bb2vf"]
 
-[node name="SongSelect" type="Control" unique_id=328776443]
+[node name="SongSelect" type="Control"]
 layout_mode = 3
 anchors_preset = 15
 anchor_right = 1.0
@@ -10,69 +10,3 @@ anchor_bottom = 1.0
 grow_horizontal = 2
 grow_vertical = 2
 script = ExtResource("1_bb2vf")
-
-[node name="BG" type="ColorRect" parent="." unique_id=448818750]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-grow_horizontal = 2
-grow_vertical = 2
-color = Color(0.05, 0.05, 0.08, 1)
-
-[node name="Layout" type="VBoxContainer" parent="." unique_id=1146195483]
-layout_mode = 1
-anchors_preset = 15
-anchor_right = 1.0
-anchor_bottom = 1.0
-offset_left = 120.0
-offset_top = 48.0
-offset_right = -120.0
-offset_bottom = -48.0
-theme_override_constants/separation = 18
-
-[node name="GameTitle" type="Label" parent="Layout" unique_id=1626228035]
-layout_mode = 2
-theme_override_colors/font_color = Color(1, 0.4, 0.7, 1)
-theme_override_font_sizes/font_size = 52
-text = "Echoes In My Blood!"
-horizontal_alignment = 1
-
-[node name="Subtitle" type="Label" parent="Layout" unique_id=682308903]
-layout_mode = 2
-theme_override_colors/font_color = Color(0.6, 0.6, 0.75, 1)
-theme_override_font_sizes/font_size = 18
-text = "select a song"
-horizontal_alignment = 1
-
-[node name="SongList" type="ItemList" parent="Layout" unique_id=1475543928]
-layout_mode = 2
-size_flags_vertical = 3
-theme_override_font_sizes/font_size = 17
-
-[node name="ModeRow" type="HBoxContainer" parent="Layout" unique_id=1468999255]
-layout_mode = 2
-theme_override_constants/separation = 14
-alignment = 1
-
-[node name="BtnTutorial" type="Button" parent="Layout/ModeRow" unique_id=1341134120]
-layout_mode = 2
-size_flags_horizontal = 3
-text = "TUTORIAL"
-
-[node name="BtnSeeded" type="Button" parent="Layout/ModeRow" unique_id=372962037]
-layout_mode = 2
-size_flags_horizontal = 3
-text = "SEEDED"
-
-[node name="BtnRandom" type="Button" parent="Layout/ModeRow" unique_id=2105182047]
-layout_mode = 2
-size_flags_horizontal = 3
-text = "RANDOM"
-
-[node name="Info" type="Label" parent="Layout" unique_id=1687602358]
-layout_mode = 2
-theme_override_colors/font_color = Color(0.52, 0.52, 0.65, 1)
-theme_override_font_sizes/font_size = 14
-text = "Loading beatmaps..."
-horizontal_alignment = 1

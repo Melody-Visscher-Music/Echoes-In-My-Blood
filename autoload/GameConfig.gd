@@ -392,4 +392,4 @@ func reset_defaults() -> void:
 	halo_dual_color     = true
 	halo_color_a        = Color(1.00, 0.45, 0.70, 1.0)
 	halo_color_b        = Color(0.45, 0.82, 1.0,  1.0)
-	Run.song_lives      = 3
+	Run.song_lives      = lives_per_song
