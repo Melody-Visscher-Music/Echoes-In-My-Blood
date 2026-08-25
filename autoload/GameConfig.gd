@@ -50,6 +50,12 @@ var halo_color_b:     Color  = Color(0.45, 0.82, 1.0,  1.0)  # secondary / dual 
 var _audio_offsets:         Dictionary = {}   # device_name -> float (ms)
 var _current_audio_device:  String     = ""   # last known device name
 var _device_poll_t:         float      = 0.0  # accumulator for 1-second polling
+## Offset for the CURRENT device, in seconds, kept in sync by _refresh_audio_offset_cache().
+## _song_time() in Section_BeatRunner3d calls get_audio_offset_s() several times a frame; it
+## used to go through AudioServer.get_output_device() plus a string-keyed dictionary lookup
+## every single time, for a value that can only change when the device itself changes — and
+## this file already polls for exactly that once a second.
+var _audio_offset_s_cache:  float      = 0.0
 
 const _PATH:        String = "user://gameconfig.cfg"
 const _AUDIO_PATH:  String = "user://audio_offsets.cfg"
@@ -64,13 +70,20 @@ func _process(delta: float) -> void:
 	var dev: String = AudioServer.get_output_device()
 	if dev != _current_audio_device:
 		_current_audio_device = dev
+		_refresh_audio_offset_cache()
 		emit_signal("audio_device_changed", dev)
+
+
+## Recomputes _audio_offset_s_cache from the current device. Call after anything that
+## can change either the active output device or the stored per-device offsets.
+func _refresh_audio_offset_cache() -> void:
+	_audio_offset_s_cache = float(_audio_offsets.get(AudioServer.get_output_device(), 0.0)) / 1000.0
 
 
 ## Returns the calibrated offset for the current output device, in seconds.
 ## Returned value is added directly to _song_time() in Section_BeatRunner3d.
 func get_audio_offset_s() -> float:
-	return _audio_offsets.get(AudioServer.get_output_device(), 0.0) / 1000.0
+	return _audio_offset_s_cache
 
 
 ## Returns the calibrated offset for the current device in milliseconds.
@@ -82,6 +95,7 @@ func get_audio_offset_ms() -> float:
 func set_audio_offset_for_current_device(ms: float) -> void:
 	var dev: String = AudioServer.get_output_device()
 	_audio_offsets[dev] = ms
+	_refresh_audio_offset_cache()
 	_save_audio_offsets()
 
 
@@ -101,6 +115,7 @@ func _load_audio_offsets() -> void:
 		return
 	for key in cfg.get_section_keys("offsets"):
 		_audio_offsets[key] = cfg.get_value("offsets", key, 0.0)
+	_refresh_audio_offset_cache()
 
 
 # ── Controls (rebindable, keyboard + gamepad) ──────────────────────────────────
@@ -315,6 +330,7 @@ func save() -> void:
 
 func load_from_disk() -> void:
 	_current_audio_device = AudioServer.get_output_device()   # baseline for change detection
+	_refresh_audio_offset_cache()
 	_load_audio_offsets()
 	_load_controls()
 	apply_all_control_bindings()

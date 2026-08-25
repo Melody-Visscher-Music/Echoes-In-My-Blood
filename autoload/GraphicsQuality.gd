@@ -10,6 +10,17 @@ extends Node
 ##   - directional + positional shadow atlas resolution
 ##   - fur shell count (so_fluffy density)
 ##
+## …and, since the CPU (not the GPU) is what actually caps this game's frame
+## rate, a matching set of CPU-side knobs consumed by Section_BeatRunner3d:
+##   - deco_update_divisor      how many frames between world-decoration passes
+##   - deco_window_ahead_m      how far ahead decorations are kept live at all
+##   - ambient_light_spacing_m  metres between overhead track spot lights
+##   - gem_spacing_m            metres between gem/arch/pad decoration clusters
+##   - fx_step_lights           per-footstep floor glow lights on/off
+## Without these, every tier from "low" to "max" ran the exact same per-frame
+## script workload and only the render resolution changed — which is why
+## dropping the quality setting used to do so little for a CPU-bound frame.
+##
 ## It does NOT touch Engine.max_fps except as a one-time suggestion the very
 ## first time a tier is auto-detected — the existing Max FPS dropdown in
 ## Options > Display is the source of truth for that after first launch.
@@ -30,6 +41,12 @@ const PRESETS: Dictionary = {
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_HARD,
 		"mesh_lod_threshold": 16.0,
 		"fur_scale": 0.45,
+		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
+		"deco_update_divisor": 4,
+		"deco_window_ahead_m": 140.0,
+		"ambient_light_spacing_m": 50.0,
+		"gem_spacing_m": 64.0,
+		"fx_step_lights": false,
 		"initial_max_fps": 60,
 	},
 	"medium": {
@@ -43,6 +60,12 @@ const PRESETS: Dictionary = {
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_LOW,
 		"mesh_lod_threshold": 12.0,
 		"fur_scale": 0.70,
+		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
+		"deco_update_divisor": 3,
+		"deco_window_ahead_m": 180.0,
+		"ambient_light_spacing_m": 35.0,
+		"gem_spacing_m": 48.0,
+		"fx_step_lights": true,
 		"initial_max_fps": 60,
 	},
 	"high": {
@@ -56,6 +79,12 @@ const PRESETS: Dictionary = {
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_MEDIUM,
 		"mesh_lod_threshold": 8.0,   # matches the project's original static default
 		"fur_scale": 1.0,
+		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
+		"deco_update_divisor": 2,
+		"deco_window_ahead_m": 220.0,
+		"ambient_light_spacing_m": 25.0,
+		"gem_spacing_m": 32.0,
+		"fx_step_lights": true,
 		"initial_max_fps": 120,
 	},
 	"ultra": {
@@ -75,6 +104,12 @@ const PRESETS: Dictionary = {
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_HIGH,
 		"mesh_lod_threshold": 4.0,
 		"fur_scale": 1.0,
+		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
+		"deco_update_divisor": 2,
+		"deco_window_ahead_m": 260.0,
+		"ambient_light_spacing_m": 25.0,
+		"gem_spacing_m": 32.0,
+		"fx_step_lights": true,
 		"initial_max_fps": 120,
 	},
 	"max": {
@@ -100,9 +135,22 @@ const PRESETS: Dictionary = {
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_ULTRA,
 		"mesh_lod_threshold": 1.0,
 		"fur_scale": 1.3,
+		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
+		"deco_update_divisor": 1,
+		"deco_window_ahead_m": 300.0,
+		"ambient_light_spacing_m": 20.0,
+		"gem_spacing_m": 32.0,
+		"fx_step_lights": true,
 		"initial_max_fps": 120,
 	},
 }
+
+## Convenience accessor for a preset key, with a fallback for older saved
+## configs / tiers that predate a newly added key.
+func get_setting(key: String, fallback: Variant) -> Variant:
+	var p: Dictionary = PRESETS.get(tier, {})
+	return p.get(key, fallback)
+
 
 var tier: String = "medium"
 var _ever_detected: bool = false

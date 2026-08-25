@@ -337,6 +337,25 @@ var mesh: GeometryInstance3D
 # the generated shell materials
 var shells: Array[Material] = []
 
+# Original shell index of each entry in lod_shells, so the physics passes can
+# keep using the correct 0..1 height factor while only touching the shells that
+# are actually in the active next_pass chain.
+var lod_shell_levels: PackedInt32Array = PackedInt32Array()
+
+# ── Physics fast path ─────────────────────────────────────────────────────────
+# Both spring passes used to call pow() once per shell per physics tick and then
+# write a shader parameter, on every fur node. With three fur nodes at 40 shells
+# that is ~480 pow() calls and ~240 set_shader_parameter() calls every tick, for
+# values that are a pure function of (shell index, stiffness). The weights are
+# cached here and rebuilt only when either input changes.
+var _weight_cache: PackedFloat32Array = PackedFloat32Array()
+var _weight_cache_shells: int   = -1
+var _weight_cache_stiff:  float = -1.0
+# Last values actually pushed to the shaders — lets a settled/near-static fur
+# skip the whole write loop instead of re-sending numbers that did not change.
+var _last_pushed_offset:   Vector3 = Vector3(INF, INF, INF)
+var _last_pushed_rotation: Vector3 = Vector3(INF, INF, INF)
+
 # shells for current LOD
 var lod_shells: Array[Material] = []
 
@@ -463,18 +482,25 @@ func apply_lod():
 		return
 
 	lod_shells = []
-	
+	lod_shell_levels = PackedInt32Array()
+	# Chain membership just changed, so shells entering it may hold stale physics
+	# offsets. Force the next physics pass to push a full update.
+	_last_pushed_offset   = Vector3(INF, INF, INF)
+	_last_pushed_rotation = Vector3(INF, INF, INF)
+
 	lod_shell_count = lod_minimum_shells + (1 - float(lod) / (number_of_shells-1)) * (number_of_shells - lod_minimum_shells)
 
 	var step = float(number_of_shells-1) / (lod_shell_count-1)
 
 	lod_shells.append(shells[0])
+	lod_shell_levels.append(0)
 
-	for i in range(lod_shell_count-1):		
+	for i in range(lod_shell_count-1):
 		var base = int(step * i)
 		var next = int(step * (i+1))
 		shells[base].next_pass = shells[next]
 		lod_shells.append(shells[next])
+		lod_shell_levels.append(next)
 
 # setup parameters for all shell materials
 func setup_materials():
@@ -553,6 +579,11 @@ func init_physics():
 		mat.set_shader_parameter("physics_pos_offset", Vector3.ZERO)
 		mat.set_shader_parameter("physics_rot_offset", Basis.IDENTITY)
 
+	# Every shell now holds the zero pose, so record that as the last push —
+	# the spring passes will skip until something actually moves.
+	_last_pushed_offset   = Vector3.ZERO
+	_last_pushed_rotation = Vector3.ZERO
+
 func _process(_delta):
 	# LOD
 	if lod_enabled:
@@ -616,19 +647,40 @@ func linear_spring_physics(delta: float):
 
 	spring_velocity = spring_velocity.limit_length( 200.0 * length )
 
-	# iterate through materials from 0 length to 1 and set physics params
-	var dh = 1.0 / (number_of_shells-1)
-	var h = dh
-
 	spring_offset = spring_offset.limit_length(length / st * stretch)
 
-	for i in range(number_of_shells):
-		var mat = shells[i]
-		var offset_at_height = st * spring_offset * pow(h * i, stiffness)
-		mat.set_shader_parameter("physics_pos_offset", -offset_at_height)
-		i+=1
-		
+	# Only push when the value actually moved. Epsilon is scaled to strand
+	# length so it stays imperceptible at any fur size.
+	var eps: float = maxf(length, 0.001) * 0.0005
+	if not spring_offset.is_equal_approx(_last_pushed_offset) \
+			and spring_offset.distance_squared_to(_last_pushed_offset) > eps * eps:
+		_rebuild_weight_cache()
+		# Walk only the shells in the active LOD chain — shells outside it are
+		# not in any next_pass chain, so nothing renders them and writing to
+		# them is pure waste. lod_shell_levels keeps the height factor correct.
+		var chain: Array[Material] = lod_shells if not lod_shells.is_empty() else shells
+		for k in range(chain.size()):
+			var level: int = lod_shell_levels[k] if k < lod_shell_levels.size() else k
+			var offset_at_height = st * spring_offset * _weight_cache[level]
+			chain[k].set_shader_parameter("physics_pos_offset", -offset_at_height)
+		_last_pushed_offset = spring_offset
+
 	previous_position = mesh.transform.origin
+
+
+## Rebuilds pow(i / (shells-1), stiffness) for every shell index. Cheap no-op
+## when neither the shell count nor stiffness has changed since last call.
+func _rebuild_weight_cache() -> void:
+	if _weight_cache_shells == number_of_shells and is_equal_approx(_weight_cache_stiff, stiffness) \
+			and _weight_cache.size() == number_of_shells:
+		return
+	_weight_cache = PackedFloat32Array()
+	_weight_cache.resize(number_of_shells)
+	var dh: float = 1.0 / float(maxi(1, number_of_shells - 1))
+	for i in range(number_of_shells):
+		_weight_cache[i] = pow(dh * float(i), stiffness)
+	_weight_cache_shells = number_of_shells
+	_weight_cache_stiff  = stiffness
 
 
 func short_angle(a):
@@ -661,16 +713,19 @@ func rotational_spring_physics(delta: float):
 	
 	spring_rotation += p
 	
-	# iterate through materials from 0 length to 1 and set physics params
-	var dh = 1.0 / (number_of_shells-1)
-	var h = dh	
-
 	spring_rotation = spring_rotation.limit_length(PI * length / 2.0)
 
-	for i in range(number_of_shells):
-		var mat = shells[i]
-		var rotation_at_height = rotational_physics_scale * spring_rotation * pow(h * i, stiffness)
-		mat.set_shader_parameter("physics_rot_offset", Basis.from_euler(rotation_at_height))
-		i+=1
-		
+	# Same skip-when-unchanged + LOD-chain-only treatment as the linear pass.
+	# Basis.from_euler() is the expensive part here, so not running it at all
+	# while the fur is settled is the whole point.
+	if not spring_rotation.is_equal_approx(_last_pushed_rotation) \
+			and spring_rotation.distance_squared_to(_last_pushed_rotation) > 1e-10:
+		_rebuild_weight_cache()
+		var chain: Array[Material] = lod_shells if not lod_shells.is_empty() else shells
+		for k in range(chain.size()):
+			var level: int = lod_shell_levels[k] if k < lod_shell_levels.size() else k
+			var rotation_at_height = rotational_physics_scale * spring_rotation * _weight_cache[level]
+			chain[k].set_shader_parameter("physics_rot_offset", Basis.from_euler(rotation_at_height))
+		_last_pushed_rotation = spring_rotation
+
 	previous_rotation = mesh.transform.basis.get_euler()

@@ -81,6 +81,7 @@ transform = Transform3D(-1, -4.4258636e-16, 8.742278e-08, 9.444632e-10, 0.999941
 transform = Transform3D(1, 0, 0, 0, 0.9531907, 0.3023699, 0, -0.3023699, 0.9531907, -5.077188e-07, -0.20196581, -5.8076277)
 attributes = SubResource("CameraAttr_player")
 fov = 62.0
+far = 500.0
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="Player" unique_id=2040175416]
 transform = Transform3D(0.9988403, -0.02938152, -0.038143054, 0.03534211, -0.09057507, 0.9952623, -0.03269714, -0.9954562, -0.08943182, 0, 0, 0)

@@ -126,6 +126,17 @@ const _HUD_HP_SEGMENTS:  int   = 1
 var _hud_hp_seg_w:       float          = 0.0   # pixel width of one segment
 var _hud_hp_seg_tracks:  Array[Panel]   = []
 var _hud_hp_seg_fills:   Array[Panel]   = []
+var _hud_hp_lightning:   Array[ColorRect] = []   # electric-arc overlay, one per fill segment
+var _hud_electric_shader_cache: Shader = null   # built once, shared by every bolt overlay
+# Live-mutated HUD styleboxes. The rainbow chrome recolours these EVERY frame;
+# building fresh StyleBoxFlat objects and re-running add_theme_stylebox_override
+# each time meant three allocations plus three theme-changed invalidations (and
+# the re-layout they drag along) per frame, forever. Installing them once and
+# then just writing the colour fields is visually identical — StyleBox emits
+# `changed`, which queues a redraw and nothing else.
+var _hud_card_sb:      StyleBoxFlat = null
+var _hud_hp_track_sbs: Array[StyleBoxFlat] = []
+var _hud_hp_fill_sbs:  Array[StyleBoxFlat] = []
 var _hud_flash:         ColorRect = null
 var _hud_wj_label:      Label     = null   # "WALL JUMP ×2!" flash label
 
@@ -217,16 +228,56 @@ var _world_rail_mats:  Array[StandardMaterial3D] = []
 var _world_gem_lights: Array[OmniLight3D]         = []
 var _world_arch_lights: Array[OmniLight3D]        = []
 var _world_pad_mats:   Array[StandardMaterial3D] = []
+
+# ── Decoration distance window ────────────────────────────────────────────────
+# Gem/arch lights and the spinning gem/crystal nodes are spread over the WHOLE
+# track (a 3-minute song is ~3.7 km), but fog (density 0.008) hides everything
+# past a few hundred metres. Updating all of them every frame was pure waste, so
+# each one records the path distance it lives at and the per-frame pass walks
+# only the slice near the player — the same monotonic-cursor pattern
+# _update_gate_visibility / _judge_passed_unhit_gates_by_position already use.
+# Arrays are filled in increasing path order by _spawn_track_decorations, which
+# is what makes the cursor + early break valid.
+# Ahead-distance and update rate come from GraphicsQuality so the lower tiers
+# actually do less CPU work, not just render at a smaller resolution. Resolved
+# once in _ready(); the defaults here match the "high" preset.
+var _deco_window_ahead_m: float = 220.0   # comfortably past the fog wall
+var _deco_update_divisor: int   = 2
+const _DECO_WINDOW_BEHIND_M: float = 60.0
+var _world_gem_light_pds:  PackedFloat32Array = PackedFloat32Array()
+var _world_arch_light_pds: PackedFloat32Array = PackedFloat32Array()
+var _gem_light_cursor:  int = 0
+var _arch_light_cursor: int = 0
+# Spinning decoration roots (gems + hanging crystals). Their looping tweens are
+# bound to these nodes, so flipping process_mode parks the tween as well.
+var _deco_spin_nodes: Array[Node3D]        = []
+var _deco_spin_pds:   PackedFloat32Array   = PackedFloat32Array()
+var _deco_spin_on:    Array[bool]          = []
+var _deco_spin_cursor: int = 0
+
 # Authored wall-jump kit + ledge emissives — beat-pulsed (full on beat, dim between).
 var _world_track_mats:   Array[StandardMaterial3D] = []
 var _world_track_base_e: Array[float]              = []   # each mat's authored base energy
 var _track_mat_seen:     Dictionary                = {}   # source-mat id → unique pulse mat (dedup)
+
+# ── Pooled one-shot FX lights ─────────────────────────────────────────────────
+# The footstep ripple fires ~6.4x/second and the beat pulse once per beat, and
+# both used to allocate a fresh OmniLight3D + Tween and queue_free it a fraction
+# of a second later. Node construction, add_child, queue_free and the matching
+# RenderingServer light instance create/destroy are some of the most expensive
+# things you can do per frame in Godot. These are built once and re-armed.
+var _fx_step_lights_on: bool = true            # quality tier may switch these off entirely
+var _fx_step_lights: Array[OmniLight3D] = []   # [0] = left foot, [1] = right foot
+var _fx_step_tweens: Array[Tween]       = [null, null]
+var _fx_beat_light:  OmniLight3D        = null
+var _fx_beat_tween:  Tween              = null
 
 # Melody visual system — env reference for fog colour pulses
 var _melody_env: Environment = null
 var _fx_tween_host: Node = null   # PROCESS_MODE_INHERIT — pauses with SceneTree
 # Live halo ring materials — recoloured every frame with the song's colour cycle.
 # _b holds secondary (dual-colour) materials; always empty when halo_dual_color = false.
+var _lyrics_scan_idx: int = 0   # monotonic cursor for _update_lyrics (see there)
 var _active_halo_mats:   Array[StandardMaterial3D] = []
 var _active_halo_mats_b: Array[StandardMaterial3D] = []
 # Z range of the wall-jump section — halos are suppressed inside this zone
@@ -477,6 +528,11 @@ func _ready() -> void:
 	_fx_tween_host = Node.new()
 	_fx_tween_host.name = "FxTweenHost"
 	add_child(_fx_tween_host)
+	# Pull the tier's CPU-cost knobs before anything spawns — decoration density
+	# is baked in at build time, so these have to be read before the spawners run.
+	_deco_update_divisor  = maxi(1, int(GraphicsQuality.get_setting("deco_update_divisor", 2)))
+	_deco_window_ahead_m  = float(GraphicsQuality.get_setting("deco_window_ahead_m", 220.0))
+	_fx_step_lights_on    = bool(GraphicsQuality.get_setting("fx_step_lights", true))
 	cycle_color_a        = GameConfig.level_color_a
 	cycle_color_b        = GameConfig.level_color_b
 	_floor_base_albedo   = GameConfig.floor_color
@@ -5257,7 +5313,10 @@ func _create_hud() -> void:
 	score_card.grow_horizontal = Control.GROW_DIRECTION_BEGIN
 	score_card.offset_left   = -(card_m + card_w); score_card.offset_right  = -card_m
 	score_card.offset_top    = card_m;             score_card.offset_bottom = card_m + card_h
-	score_card.add_theme_stylebox_override("panel", _hud_card_style(Color(0.55, 0.16, 0.85, 1.0)))
+	# Kept as _hud_card_sb so the per-frame rainbow recolour can mutate this
+	# instance in place rather than building and installing a new one each frame.
+	_hud_card_sb = _hud_card_style(Color(0.55, 0.16, 0.85, 1.0))
+	score_card.add_theme_stylebox_override("panel", _hud_card_sb)
 	score_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hud_score_group.add_child(score_card)
 	_hud_score_card = score_card   # border/glow repainted every frame — see _update_hud_rainbow
@@ -5341,7 +5400,9 @@ func _create_hud() -> void:
 	# smoothly (see _update_hud_hp_color). Health % is one continuous 0–1 value;
 	# a segment fills proportionally to how much of ITS third is covered.
 	_hud_hp_seg_w = _hud_hp_bar_w / float(_HUD_HP_SEGMENTS)
-	_hud_hp_seg_tracks.clear(); _hud_hp_seg_fills.clear()
+	_hud_hp_seg_tracks.clear(); _hud_hp_seg_fills.clear(); _hud_hp_lightning.clear()
+	# Drop the cached live styleboxes too — they belong to the panels being replaced.
+	_hud_hp_track_sbs.clear(); _hud_hp_fill_sbs.clear()
 
 	for i in range(_HUD_HP_SEGMENTS):
 		var seg_x: float = bx + float(i) * _hud_hp_seg_w
@@ -5353,8 +5414,10 @@ func _create_hud() -> void:
 		seg_track.anchor_top  = 0.0; seg_track.anchor_bottom = 0.0
 		seg_track.offset_left   = seg_x;    seg_track.offset_right  = seg_x + _hud_hp_seg_w
 		seg_track.offset_top    = bar_y;    seg_track.offset_bottom = bar_y + bar_h
-		seg_track.add_theme_stylebox_override("panel", _hud_pill_style_sides(
-			Color(0.05, 0.02, 0.09, 0.90), bar_h * 0.5, round_l, round_r, Color(1.00, 0.35, 0.65, 0.55)))
+		var seg_track_sb: StyleBoxFlat = _hud_pill_style_sides(
+			Color(0.05, 0.02, 0.09, 0.90), bar_h * 0.5, round_l, round_r, Color(1.00, 0.35, 0.65, 0.55))
+		seg_track.add_theme_stylebox_override("panel", seg_track_sb)
+		_hud_hp_track_sbs.append(seg_track_sb)
 		seg_track.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		seg_track.pivot_offset = Vector2(_hud_hp_seg_w * 0.5, bar_h * 0.5)   # for the heal punch-scale
 		_hud_hp_group.add_child(seg_track)
@@ -5365,11 +5428,33 @@ func _create_hud() -> void:
 		seg_fill.anchor_top  = 0.0; seg_fill.anchor_bottom = 1.0
 		seg_fill.offset_left  = 0.0
 		seg_fill.offset_right = _hud_hp_seg_w * clampf(_health_pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
-		seg_fill.add_theme_stylebox_override("panel",
-			_hud_pill_style_sides(Color(0.35, 1.00, 0.55, 1.0), bar_h * 0.5, round_l, round_r))
+		var seg_fill_sb: StyleBoxFlat = _hud_pill_style_sides(
+			Color(0.35, 1.00, 0.55, 1.0), bar_h * 0.5, round_l, round_r)
+		seg_fill.add_theme_stylebox_override("panel", seg_fill_sb)
+		_hud_hp_fill_sbs.append(seg_fill_sb)
 		seg_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		seg_track.add_child(seg_fill)
 		_hud_hp_seg_fills.append(seg_fill)
+
+		# Electric-arc overlay — anchored full-rect of the fill, so it
+		# automatically tracks the fill's current (animated) width and
+		# stays clipped to the pill shape via its own shader SDF. Purely
+		# decorative flair inside the filler; see _hud_electric_shader().
+		var seg_bolt := ColorRect.new()
+		seg_bolt.anchor_left = 0.0; seg_bolt.anchor_right  = 1.0
+		seg_bolt.anchor_top  = 0.0; seg_bolt.anchor_bottom = 1.0
+		seg_bolt.offset_left = 0.0; seg_bolt.offset_right  = 0.0
+		seg_bolt.offset_top  = 0.0; seg_bolt.offset_bottom = 0.0
+		seg_bolt.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		seg_bolt.color = Color(1, 1, 1, 1)   # unused — shader drives all visible color
+		var bolt_mat := ShaderMaterial.new()
+		bolt_mat.shader = _hud_electric_shader()
+		bolt_mat.set_shader_parameter("radius", bar_h * 0.5)
+		bolt_mat.set_shader_parameter("rect_size", Vector2(_hud_hp_seg_w, bar_h))
+		bolt_mat.set_shader_parameter("seed", float(i) * 11.0)
+		seg_bolt.material = bolt_mat
+		seg_fill.add_child(seg_bolt)
+		_hud_hp_lightning.append(seg_bolt)
 
 	# Percentage text (right of bar)
 	_hud_hp_pct_label = Label.new()
@@ -5500,10 +5585,21 @@ func _create_hud() -> void:
 func _update_lyrics(t_s: float) -> void:
 	if _lyrics_hud == null or _lyrics.is_empty():
 		return
+	# Monotonic cursor instead of a full rescan. This used to walk EVERY lyric
+	# line every frame (and deliberately kept the last match rather than
+	# breaking), so a song with a hundred lines paid a hundred dictionary
+	# lookups per frame for a value that changes a few times a minute. Song
+	# time only moves forward, so lines that have fully expired never need
+	# looking at again. Same "last overlapping line wins" result.
+	while _lyrics_scan_idx + 1 < _lyrics.size() 			and t_s >= float(_lyrics[_lyrics_scan_idx]["t_end"]) + _LYRICS_HOLD_S:
+		_lyrics_scan_idx += 1
+
 	var idx: int = -1
-	for i in range(_lyrics.size()):
+	for i in range(_lyrics_scan_idx, _lyrics.size()):
 		var e: Dictionary = _lyrics[i]
-		if t_s >= float(e["t_start"]) - 0.05 and t_s < float(e["t_end"]) + _LYRICS_HOLD_S:
+		if t_s < float(e["t_start"]) - 0.05:
+			break   # lines are time-sorted — nothing later can be active yet
+		if t_s < float(e["t_end"]) + _LYRICS_HOLD_S:
 			idx = i
 	if idx != _lyrics_active_idx:
 		_lyrics_active_idx = idx
@@ -5591,6 +5687,7 @@ func _lyrics_pop_word(w: String, color_idx: int, delay: float = 0.0) -> void:
 func _parse_lyrics(d: Dictionary) -> void:
 	_lyrics.clear()
 	_lyrics_active_idx = -1
+	_lyrics_scan_idx   = 0
 	var raw: Variant = d.get("lyrics", [])
 	if not (raw is Array):
 		return
@@ -6679,9 +6776,18 @@ func _hud_hp_apply_display(pct: float) -> void:
 		_hud_hp_pct_label.text = "%d%%" % int(round(pct * 100.0))
 	for i in range(_hud_hp_seg_fills.size()):
 		var frac: float = clampf(pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
+		var fill_w: float = _hud_hp_seg_w * frac
 		var seg_fill: Panel = _hud_hp_seg_fills[i]
 		if seg_fill != null:
-			seg_fill.offset_right = _hud_hp_seg_w * frac
+			seg_fill.offset_right = fill_w
+		# Keep the electric-arc overlay's shader in sync with the fill's
+		# CURRENT (animated) width, so its rounded-pill clipping never lags
+		# a frame behind or squishes against the wrong size.
+		if i < _hud_hp_lightning.size() and _hud_hp_lightning[i] != null:
+			var bolt_mat: ShaderMaterial = _hud_hp_lightning[i].material as ShaderMaterial
+			if bolt_mat != null:
+				bolt_mat.set_shader_parameter("rect_size", Vector2(maxf(0.01, fill_w), _hud_hp_bar_h))
+				bolt_mat.set_shader_parameter("hp_pct", pct)
 
 
 ## Below this HP the bar gently pulses to make sure a distracted player notices —
@@ -6717,7 +6823,12 @@ func _update_hud_rainbow(delta: float) -> void:
 
 	if _hud_score_card != null:
 		var c_border: Color = Color.from_hsv(fmod(_hud_rainbow_hue, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
-		_hud_score_card.add_theme_stylebox_override("panel", _hud_card_style(c_border))
+		if _hud_card_sb == null:
+			_hud_card_sb = _hud_card_style(c_border)
+			_hud_score_card.add_theme_stylebox_override("panel", _hud_card_sb)
+		else:
+			_hud_card_sb.border_color = c_border
+			_hud_card_sb.shadow_color = Color(c_border.r, c_border.g, c_border.b, 0.35)
 	if _hud_score_cap != null:
 		var c_cap: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.08, 1.0), _HUD_RAINBOW_SAT * 0.8, 1.0)
 		_hud_score_cap.add_theme_color_override("font_color", Color(c_cap.r, c_cap.g, c_cap.b, 0.80))
@@ -6745,13 +6856,23 @@ func _update_hud_hp_color() -> void:
 
 		var seg_track: Panel = _hud_hp_seg_tracks[i]
 		if seg_track != null:
-			seg_track.add_theme_stylebox_override("panel", _hud_pill_style_sides(
-				Color(0.05, 0.02, 0.09, 0.90), _hud_hp_bar_h * 0.5, round_l, round_r, c))
+			if i >= _hud_hp_track_sbs.size():
+				var t_sb: StyleBoxFlat = _hud_pill_style_sides(
+					Color(0.05, 0.02, 0.09, 0.90), _hud_hp_bar_h * 0.5, round_l, round_r, c)
+				_hud_hp_track_sbs.append(t_sb)
+				seg_track.add_theme_stylebox_override("panel", t_sb)
+			else:
+				_hud_hp_track_sbs[i].border_color = c
 
 		var seg_fill: Panel = _hud_hp_seg_fills[i] if i < _hud_hp_seg_fills.size() else null
 		if seg_fill != null:
-			seg_fill.add_theme_stylebox_override("panel",
-				_hud_pill_style_sides(c, _hud_hp_bar_h * 0.5, round_l, round_r))
+			if i >= _hud_hp_fill_sbs.size():
+				var f_sb: StyleBoxFlat = _hud_pill_style_sides(
+					c, _hud_hp_bar_h * 0.5, round_l, round_r)
+				_hud_hp_fill_sbs.append(f_sb)
+				seg_fill.add_theme_stylebox_override("panel", f_sb)
+			else:
+				_hud_hp_fill_sbs[i].bg_color = c
 
 	if _hud_hp_pct_label != null:
 		_hud_hp_pct_label.add_theme_color_override("font_color", c.lightened(0.35))
@@ -6806,6 +6927,87 @@ func _hud_pill_style_sides(fill_col: Color, radius: float, round_left: bool, rou
 		sf.border_width_left = 1; sf.border_width_right  = 1
 		sf.border_width_top  = 1; sf.border_width_bottom = 1
 	return sf
+
+
+## Lazily builds (and caches) the shader that draws the flickering electric
+## arcs inside the HP bar filler. A few thin jagged bolts crackle sideways at
+## random intervals, clipped to the fill's own rounded-pill shape via an SDF
+## so they never bleed square corners past the bar's rounded ends.
+func _hud_electric_shader() -> Shader:
+	if _hud_electric_shader_cache != null:
+		return _hud_electric_shader_cache
+	var sh := Shader.new()
+	sh.code = """
+shader_type canvas_item;
+
+uniform float radius = 9.5;
+uniform vec2  rect_size = vec2(216.0, 19.0);
+uniform float seed = 0.0;
+uniform float hp_pct = 1.0;   // drives activity — calm/sparse near death, frantic near full
+
+float sdf_rounded_box(vec2 p, vec2 half_size, float r) {
+	vec2 q = abs(p) - half_size + r;
+	return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+
+float hash1(float n) {
+	return fract(sin(n) * 43758.5453123);
+}
+
+void fragment() {
+	vec2 px = (UV - 0.5) * rect_size;
+	float d = sdf_rounded_box(px, rect_size * 0.5, min(radius, min(rect_size.x, rect_size.y) * 0.5));
+	if (d > 0.0) {
+		discard;
+	}
+
+	vec3  col   = vec3(0.0);
+	float alpha = 0.0;
+
+	// A SINGLE bolt, centered on the bar's mid-height, running left to
+	// right. Activity reacts to HP: near death it's a rare, dim, slow,
+	// nearly-straight ember; near full it's fast, bright, and jagged —
+	// genuinely looks alive vs. barely hanging on.
+	float hp    = clamp(hp_pct, 0.0, 1.0);
+	float speed = mix(1.5, 9.0, hp);          // sluggish -> frantic
+	float t     = TIME * speed;
+
+	// Flicker gate — the bolt only strikes during short random bursts.
+	// Threshold scales with HP: rare embers when low, near-constant arcing
+	// when full.
+	float flick_thresh = mix(0.93, 0.55, hp);
+	float flick = step(flick_thresh, fract(sin(floor(t) * 12.9898 + seed) * 43758.5453));
+
+	if (flick > 0.5) {
+		// Jagged path centered on UV.y = 0.5 (middle of the bar), wobbled by
+		// THREE overlapping sine waves at rising frequency/falling weight —
+		// a hand-drawn zigzag instead of one smooth curve, like a real
+		// lightning fork. Wobble amplitude grows with HP — calmer and
+		// straighter when weak, wild when strong.
+		float wob_amp = mix(0.05, 0.20, hp);
+		float wob = sin(UV.x * 14.0 + t * 3.0 + seed)       * wob_amp
+				  + sin(UV.x * 33.0 - t * 5.0 + seed * 2.0) * wob_amp * 0.55
+				  + sin(UV.x * 71.0 + t * 8.0 + seed * 3.0) * wob_amp * 0.25;
+		float ly   = clamp(0.5 + wob, 0.0, 1.0);
+		float dist = abs(UV.y - ly);
+
+		// Two-layer bolt — a thick bright core plus a wider soft glow halo —
+		// reads as an actual lightning bolt instead of a flat thin line.
+		float core = smoothstep(0.11, 0.0, dist);
+		float glow = smoothstep(0.24, 0.0, dist) * 0.5;
+
+		float bright  = mix(0.35, 1.0, hp);   // dimmer ember when low HP
+		vec3  boltcol = vec3(0.85, 0.94, 1.0);
+		col   += boltcol * (core + glow) * bright;
+		alpha += (core + glow) * bright;
+	}
+
+	alpha = clamp(alpha, 0.0, 0.9);
+	COLOR = vec4(col, alpha);
+}
+"""
+	_hud_electric_shader_cache = sh
+	return sh
 
 
 func _hud_flash_color(col: Color, duration: float) -> void:
@@ -8456,17 +8658,21 @@ func _pulse_floor_beat(t_s: float) -> void:
 		tw.tween_property(_floor_material, "emission_energy_multiplier", 0.02, lerpf(0.25, 0.14, vit))
 		tw.tween_property(_floor_material, "emission", Color(0.0, 0.0, 0.0, 1.0), 0.14)
 
-	# Beat light burst at player — range and energy scale with vitality
+	# Beat light burst at player — range and energy scale with vitality.
+	# One pooled light, re-armed each beat (see _fx_beat_light).
 	if player != null:
-		var beat_light := OmniLight3D.new()
-		beat_light.light_color  = pulse_color
-		beat_light.light_energy = lerpf(0.3, 2.2, vit)
-		beat_light.omni_range   = lerpf(6.0, 16.0, vit)
-		beat_light.position     = player.global_position + Vector3(0.0, 2.2, 0.0)
-		world_fx_root.add_child(beat_light)
-		var ltw := create_tween()
-		ltw.tween_property(beat_light, "light_energy", 0.0, lerpf(0.18, 0.32, vit))
-		ltw.tween_callback(beat_light.queue_free)
+		if _fx_beat_light == null or not is_instance_valid(_fx_beat_light):
+			_fx_beat_light = OmniLight3D.new()
+			_fx_beat_light.light_energy = 0.0
+			world_fx_root.add_child(_fx_beat_light)
+		_fx_beat_light.light_color  = pulse_color
+		_fx_beat_light.light_energy = lerpf(0.3, 2.2, vit)
+		_fx_beat_light.omni_range   = lerpf(6.0, 16.0, vit)
+		_fx_beat_light.position     = player.global_position + Vector3(0.0, 2.2, 0.0)
+		if _fx_beat_tween != null and _fx_beat_tween.is_valid():
+			_fx_beat_tween.kill()
+		_fx_beat_tween = create_tween()
+		_fx_beat_tween.tween_property(_fx_beat_light, "light_energy", 0.0, lerpf(0.18, 0.32, vit))
 
 	# Kick city / electric pulse — zone-aware: only drive the theme active at this beat
 	if _is_electric_at(t_s):
@@ -8630,6 +8836,8 @@ func _update_speed_streaks() -> void:
 # ── Footstep floor ripple ─────────────────────────────────────────────────────
 
 func _check_footstep_ripple(delta: float) -> void:
+	if not _fx_step_lights_on:
+		return   # disabled on the lowest quality tier
 	if player == null or not player.is_on_floor() or player.slide_timer > 0.0:
 		_foot_prev_sin = 0.0   # reset so first step after landing is clean
 		return
@@ -8642,26 +8850,45 @@ func _check_footstep_ripple(delta: float) -> void:
 	if _foot_prev_sin > 0.15 and s <= 0.0:
 		_emit_footstep_ripple(
 			player.global_position + Vector3(0.28, 0.05, 0.0),
-			Color(0.60, 0.08, 0.92))   # right foot — purple (_COL_EYE_R)
+			Color(0.60, 0.08, 0.92), 1)   # right foot — purple (_COL_EYE_R)
 	elif _foot_prev_sin < -0.15 and s >= 0.0:
 		_emit_footstep_ripple(
 			player.global_position + Vector3(-0.28, 0.05, 0.0),
-			Color(0.10, 0.55, 1.00))   # left foot  — blue  (_COL_EYE_L)
+			Color(0.10, 0.55, 1.00), 0)   # left foot  — blue  (_COL_EYE_L)
 	_foot_prev_sin = s
 
 
-func _emit_footstep_ripple(pos: Vector3, col: Color) -> void:
+## slot: 0 = left foot, 1 = right foot. Each foot owns one persistent light that
+## is simply re-armed on every strike, so a three-minute song reuses two nodes
+## instead of churning through roughly a thousand.
+func _emit_footstep_ripple(pos: Vector3, col: Color, slot: int) -> void:
 	# Small glow pulse at floor level — energy scales slightly with vitality
 	var energy: float = lerpf(0.6, 1.4, _world_vitality)
-	var fl := OmniLight3D.new()
+
+	while _fx_step_lights.size() <= slot:
+		var nl := OmniLight3D.new()
+		nl.omni_range = 3.0
+		nl.light_energy = 0.0
+		# Fogged out long before this; no reason to cluster it at distance.
+		nl.distance_fade_enabled = true
+		nl.distance_fade_begin   = 90.0
+		nl.distance_fade_length  = 30.0
+		world_fx_root.add_child(nl)
+		_fx_step_lights.append(nl)
+
+	var fl: OmniLight3D = _fx_step_lights[slot]
+	if not is_instance_valid(fl):
+		return
 	fl.light_color  = col
 	fl.light_energy = energy
-	fl.omni_range   = 3.0
 	fl.position     = pos
-	world_fx_root.add_child(fl)
+
+	var prev: Tween = _fx_step_tweens[slot]
+	if prev != null and prev.is_valid():
+		prev.kill()
 	var tw := create_tween()
 	tw.tween_property(fl, "light_energy", 0.0, 0.18)
-	tw.tween_callback(fl.queue_free)
+	_fx_step_tweens[slot] = tw
 
 
 func _update_gate_visibility() -> void:
@@ -9491,6 +9718,47 @@ func _spawn_track_decorations() -> void:
 	# perpendicular to the player at 90° corners.
 	const CORNER_MARGIN: float = 10.0
 
+	# ── Shared strip/rail resources ──────────────────────────────────────────
+	# Every strip in a given row is the SAME colour and gets the SAME
+	# emission energy every frame, and every rail likewise — so there is no
+	# reason for each one to own a private BoxMesh + StandardMaterial3D.
+	# Arc corners are subdivided into 32 sub-segments of ~1 m each, so the
+	# old per-segment allocation produced thousands of unique meshes and
+	# materials, and _update_color_cycle then had to walk every single one of
+	# them twice a frame. Sharing collapses those loops to three writes and
+	# lets the renderer batch the instances.
+	#
+	# Length is folded into scale.z against a unit-length (1 m) mesh — the
+	# same trick _spawn_floor_grid already uses — so geometry is identical.
+	var strip_row_mats: Array[StandardMaterial3D] = []
+	var strip_row_meshes: Array[BoxMesh] = []
+	for row in [0, 1]:
+		var row_col: Color = gem_colors[(row * 2) % gem_colors.size()]
+		var s_mesh := BoxMesh.new()
+		s_mesh.size = Vector3(strip_thick, strip_h, 1.0)
+		strip_row_meshes.append(s_mesh)
+		var s_mat := StandardMaterial3D.new()
+		s_mat.albedo_color                = row_col
+		s_mat.metallic                    = 0.05
+		s_mat.roughness                   = 0.68
+		s_mat.emission_enabled            = true
+		s_mat.emission                    = row_col
+		s_mat.emission_energy_multiplier  = 0.22
+		strip_row_mats.append(s_mat)
+		_world_strip_mats.append(s_mat)
+
+	var rail_col: Color = Color(0.96, 0.0, 0.016, 1.0)
+	var rail_mesh := BoxMesh.new()
+	rail_mesh.size = Vector3(0.06, 0.06, 1.0)
+	var rail_shared_mat := StandardMaterial3D.new()
+	rail_shared_mat.albedo_color               = rail_col
+	rail_shared_mat.metallic                   = 0.05
+	rail_shared_mat.roughness                  = 0.68
+	rail_shared_mat.emission_enabled           = true
+	rail_shared_mat.emission                   = rail_col
+	rail_shared_mat.emission_energy_multiplier = 0.8
+	_world_rail_mats.append(rail_shared_mat)
+
 	for seg_var in _track_segs:
 		var seg: TrackSeg = seg_var as TrackSeg
 		var seg_clip_end: float = minf(seg.path_end(), end_path)
@@ -9510,26 +9778,21 @@ func _spawn_track_decorations() -> void:
 		for side in [-1, 1]:
 			for row in [0, 1]:   # low strip (~0.3 m) and high strip (~2.5 m)
 				var sy: float = 0.30 + float(row) * 2.2
-				var strip: MeshInstance3D = _make_box_mesh(
-					Vector3(strip_thick, strip_h, clip_len),
-					gem_colors[(row * 2) % gem_colors.size()])
+				var strip := MeshInstance3D.new()
+				strip.mesh              = strip_row_meshes[row]
+				strip.material_override = strip_row_mats[row]
 				strip.position = strip_ctr + seg.right * (float(side) * strip_cx) + Vector3(0.0, sy, 0.0)
 				strip.rotation_degrees.y = seg_y_rot
-				var smat: StandardMaterial3D = strip.material_override as StandardMaterial3D
-				if smat != null:
-					smat.emission_energy_multiplier = 0.22
-					_world_strip_mats.append(smat)
+				strip.scale.z = clip_len
 				world_fx_root.add_child(strip)
 
 		for side in [-1, 1]:
-			var rail: MeshInstance3D = _make_box_mesh(
-				Vector3(0.06, 0.06, clip_len), Color(0.96, 0.0, 0.016, 1.0))
+			var rail := MeshInstance3D.new()
+			rail.mesh              = rail_mesh
+			rail.material_override = rail_shared_mat
 			rail.position = strip_ctr + seg.right * (float(side) * rail_cx) + Vector3(0.0, rail_y, 0.0)
 			rail.rotation_degrees.y = seg_y_rot
-			var rmat: StandardMaterial3D = rail.material_override as StandardMaterial3D
-			if rmat != null:
-				rmat.emission_energy_multiplier = 0.8
-				_world_rail_mats.append(rmat)
+			rail.scale.z = clip_len
 			world_fx_root.add_child(rail)
 
 	# ── 3. Gem + arch loop ────────────────────────────────────────────────────
@@ -9541,8 +9804,13 @@ func _spawn_track_decorations() -> void:
 	var pad_entry:     Dictionary = (_piece_lib.first_of("pad")         if _piece_lib != null else {})
 	var hpillar_entry: Dictionary = (_piece_lib.first_of("haze_pillar") if _piece_lib != null else {})
 
-	var gem_spacing:  float = 32.0
-	var arch_spacing: float = 64.0
+	# Decoration density is a quality setting: every gem cluster costs two nodes,
+	# a looping spin tween and (per pair) an OmniLight3D, and every arch costs
+	# another light, so halving the density on "low" halves all of that.
+	# arch_spacing stays exactly 2x gem_spacing — the "is this a new arch slot"
+	# test below relies on that ratio being a whole number.
+	var gem_spacing:  float = maxf(8.0, float(GraphicsQuality.get_setting("gem_spacing_m", 32.0)))
+	var arch_spacing: float = gem_spacing * 2.0
 	var z:   float = gem_spacing
 	var gem_i: int = 0
 
@@ -9568,9 +9836,22 @@ func _spawn_track_decorations() -> void:
 			# Authored gems with their own animation spin themselves —
 			# the procedural whole-gem spin would double up on top of it.
 			if not bool(gem_entry.get("animated", false)):
-				var spin := create_tween().set_loops()
+				# Bound to gem_root, NOT to self: a tween bound to a node stops
+				# being stepped while that node's process_mode is DISABLED, which
+				# is what lets the distance window in _update_color_cycle actually
+				# park these. Bound to self they ran forever, all ~190 of them,
+				# rotating gems kilometres behind the player every frame.
+				var spin := gem_root.create_tween().set_loops()
 				spin.tween_property(gem_root, "rotation_degrees:y", 360.0,
 					2.8 + float(gem_i % 3) * 0.5).from(0.0)
+				# Start parked: the distance window in _update_color_cycle is what
+				# switches spinning on as the player approaches. Without this, every
+				# gem on the track would spin from level start until the cursor
+				# finally swept past it.
+				gem_root.process_mode = Node.PROCESS_MODE_DISABLED
+				_deco_spin_nodes.append(gem_root)
+				_deco_spin_pds.append(z)
+				_deco_spin_on.append(false)
 
 			# One shared light per pair of gems (placed at centre, not per gem)
 			if side == 1:
@@ -9579,8 +9860,14 @@ func _spawn_track_decorations() -> void:
 				glight.light_energy = 0.35
 				glight.omni_range   = 6.0
 				glight.position     = _path_world_pos(z, 0.0, gem_root.position.y + 0.2)
+				# Fade the light out well before the fog wall so the renderer can
+				# drop it entirely instead of clustering ~120 of them per frame.
+				glight.distance_fade_enabled = true
+				glight.distance_fade_begin   = 140.0
+				glight.distance_fade_length  = 40.0
 				world_fx_root.add_child(glight)
 				_world_gem_lights.append(glight)
+				_world_gem_light_pds.append(z)
 
 		# Overhead arch every arch_spacing metres
 		if int(z / arch_spacing) > int((z - gem_spacing) / arch_spacing):
@@ -9598,8 +9885,12 @@ func _spawn_track_decorations() -> void:
 				if not bool(darch_entry.get("animated", false)):
 					var da_crystal: Node3D = da_inst.find_child("Crystal*", true, false) as Node3D
 					if da_crystal != null:
-						var da_spin := create_tween().set_loops()
+						var da_spin := da_crystal.create_tween().set_loops()
 						da_spin.tween_property(da_crystal, "rotation_degrees:y", 360.0, 3.6).from(0.0)
+						da_crystal.process_mode = Node.PROCESS_MODE_DISABLED
+						_deco_spin_nodes.append(da_crystal)
+						_deco_spin_pds.append(z)
+						_deco_spin_on.append(false)
 			else:
 				for side in [-1, 1]:
 					var post: MeshInstance3D = _make_box_mesh(Vector3(0.10, 4.2, 0.10), arch_col)
@@ -9629,8 +9920,12 @@ func _spawn_track_decorations() -> void:
 					col.lightened(0.30))
 				crystal.rotation_degrees = Vector3(0.0, 0.0, 45.0)
 				crystal_root.add_child(crystal)
-				var cspin := create_tween().set_loops()
+				var cspin := crystal_root.create_tween().set_loops()
 				cspin.tween_property(crystal_root, "rotation_degrees:y", 360.0, 3.6).from(0.0)
+				crystal_root.process_mode = Node.PROCESS_MODE_DISABLED
+				_deco_spin_nodes.append(crystal_root)
+				_deco_spin_pds.append(z)
+				_deco_spin_on.append(false)
 
 			# Arch point light
 			var alight := OmniLight3D.new()
@@ -9638,8 +9933,12 @@ func _spawn_track_decorations() -> void:
 			alight.light_energy = 0.60
 			alight.omni_range   = 8.0
 			alight.position     = _path_world_pos(z, 0.0, 4.0)
+			alight.distance_fade_enabled = true
+			alight.distance_fade_begin   = 160.0
+			alight.distance_fade_length  = 40.0
 			world_fx_root.add_child(alight)
 			_world_arch_lights.append(alight)
+			_world_arch_light_pds.append(z)
 
 		# ── 4. Periodic floor pulse pads (every 4 gems, alternating sides) ──
 		if gem_i % 4 == 0:
@@ -9697,7 +9996,8 @@ func _spawn_track_decorations() -> void:
 
 	# ── 6. Ambient overhead track lights — always-on baseline illumination ────
 	# Spaced every 25 m so the track is never purely dark between beat flashes.
-	var ambient_spacing: float = 25.0
+	var ambient_spacing: float = maxf(8.0,
+		float(GraphicsQuality.get_setting("ambient_light_spacing_m", 25.0)))
 	var al_pd: float = ambient_spacing
 	while al_pd < end_path - 10.0:
 		var al := SpotLight3D.new()
@@ -9708,6 +10008,12 @@ func _spawn_track_decorations() -> void:
 		al.spot_attenuation = 0.8
 		al.position         = _path_world_pos(al_pd, 0.0, 7.0)
 		al.rotation_degrees = Vector3(90.0, 0.0, 0.0)   # point straight down
+		# ~150 of these exist on a full-length track and spot lights are the
+		# priciest kind in the clustered renderer. Fog hides anything past a
+		# few hundred metres anyway, so let the renderer drop the far ones.
+		al.distance_fade_enabled = true
+		al.distance_fade_begin   = 150.0
+		al.distance_fade_length  = 40.0
 		world_fx_root.add_child(al)
 		al_pd += ambient_spacing
 
@@ -9896,8 +10202,9 @@ func _update_color_cycle(song_t: float) -> void:
 		if tmat != null:
 			tmat.emission_energy_multiplier = _world_track_base_e[ti] * track_pulse
 
-	# ── Decoration LOD — only update world dressing every other frame ─────────
-	_lod_frame = (_lod_frame + 1) % 2
+	# ── Decoration LOD — update world dressing every Nth frame ───────────────
+	# N comes from the quality tier (1 on "max", 4 on "low").
+	_lod_frame = (_lod_frame + 1) % _deco_update_divisor
 	if _lod_frame != 0:
 		return
 
@@ -9919,19 +10226,65 @@ func _update_color_cycle(song_t: float) -> void:
 			continue
 		rmat.emission_energy_multiplier = lerpf(rmat.emission_energy_multiplier, rail_e, 0.20)
 
+	# ── Decoration distance window ───────────────────────────────────────────
+	# Everything below is spread across the entire track but only visible for a
+	# couple of hundred metres (fog). Walk the slice around the player instead
+	# of the whole array — see the _DECO_WINDOW_* comment block up top.
+	var deco_pd:   float = _player_path_dist
+	var deco_lo:   float = deco_pd - _DECO_WINDOW_BEHIND_M
+	var deco_hi:   float = deco_pd + _deco_window_ahead_m
+
 	# ── Gem lights ───────────────────────────────────────────────────────────
 	var gem_e: float = lerpf(0.08, 0.45, vit) + beat_boost * 0.60
 	var gem_r: float = lerpf(3.0, 7.0, vit) + beat_boost * 3.0
-	for glight: OmniLight3D in _world_gem_lights:
+	while _gem_light_cursor < _world_gem_light_pds.size() \
+			and _world_gem_light_pds[_gem_light_cursor] < deco_lo:
+		_gem_light_cursor += 1
+	for gi in range(_gem_light_cursor, _world_gem_lights.size()):
+		if gi >= _world_gem_light_pds.size():
+			break
+		if _world_gem_light_pds[gi] > deco_hi:
+			break
+		var glight: OmniLight3D = _world_gem_lights[gi]
 		if glight == null:
 			continue
 		glight.light_color  = glight.light_color.lerp(live_col, 0.04)
 		glight.light_energy = lerpf(glight.light_energy, gem_e, 0.15)
 		glight.omni_range   = lerpf(glight.omni_range, gem_r, 0.15)
 
+	# ── Spinning gems / hanging crystals ─────────────────────────────────────
+	# Park the looping spin tweens outside the window. The tweens are bound to
+	# these nodes, so PROCESS_MODE_DISABLED stops them being stepped at all.
+	while _deco_spin_cursor < _deco_spin_pds.size() \
+			and _deco_spin_pds[_deco_spin_cursor] < deco_lo:
+		var off_node: Node3D = _deco_spin_nodes[_deco_spin_cursor]
+		if off_node != null and is_instance_valid(off_node) and _deco_spin_on[_deco_spin_cursor]:
+			off_node.process_mode = Node.PROCESS_MODE_DISABLED
+			_deco_spin_on[_deco_spin_cursor] = false
+		_deco_spin_cursor += 1
+	for si in range(_deco_spin_cursor, _deco_spin_nodes.size()):
+		if si >= _deco_spin_pds.size():
+			break
+		var in_win: bool = _deco_spin_pds[si] <= deco_hi
+		var spin_node: Node3D = _deco_spin_nodes[si]
+		if spin_node != null and is_instance_valid(spin_node) and _deco_spin_on[si] != in_win:
+			spin_node.process_mode = Node.PROCESS_MODE_INHERIT if in_win \
+				else Node.PROCESS_MODE_DISABLED
+			_deco_spin_on[si] = in_win
+		if not in_win:
+			break
+
 	# ── Arch lights ──────────────────────────────────────────────────────────
 	var arch_e: float = lerpf(0.12, 0.80, vit) + beat_boost * 0.80
-	for alight: OmniLight3D in _world_arch_lights:
+	while _arch_light_cursor < _world_arch_light_pds.size() \
+			and _world_arch_light_pds[_arch_light_cursor] < deco_lo:
+		_arch_light_cursor += 1
+	for ai in range(_arch_light_cursor, _world_arch_lights.size()):
+		if ai >= _world_arch_light_pds.size():
+			break
+		if _world_arch_light_pds[ai] > deco_hi:
+			break
+		var alight: OmniLight3D = _world_arch_lights[ai]
 		if alight == null:
 			continue
 		alight.light_color  = alight.light_color.lerp(live_col, 0.04)
