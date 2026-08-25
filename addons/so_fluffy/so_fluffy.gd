@@ -584,10 +584,20 @@ func init_physics():
 	_last_pushed_offset   = Vector3.ZERO
 	_last_pushed_rotation = Vector3.ZERO
 
+## LOD only has to track how far the camera is from the fur, which changes far
+## more slowly than the render rate. Recomputing the mesh AABB, transforming two
+## of its corners to world space and taking a distance every single frame, for
+## each fur node, was work whose answer barely moved between frames.
+var _lod_frame_skip: int = 0
+const _LOD_EVERY_N_FRAMES: int = 4
+
 func _process(_delta):
 	# LOD
 	if lod_enabled:
 		if mesh == null:
+			return
+		_lod_frame_skip = (_lod_frame_skip + 1) % _LOD_EVERY_N_FRAMES
+		if _lod_frame_skip != 0:
 			return
 		# calculate distance from transform origin to camera		
 		var camera: Camera3D = get_viewport().get_camera_3d()
@@ -697,8 +707,12 @@ func rotational_spring_physics(delta: float):
 	# calculate compound rotational forces acting on the shells, as a Vector3 of Euler angles
 	var f = Vector3.ZERO
 	
-	# calculate rotation from previous position
-	var dp: Vector3 = mesh.transform.basis.get_euler() - previous_rotation # rotation from previous rotation
+	# calculate rotation from previous position.
+	# Basis.get_euler() is trig-heavy and this used to call it twice per tick — once
+	# here and once again at the bottom to store previous_rotation — for the exact
+	# same basis. Sample it once.
+	var cur_euler: Vector3 = mesh.transform.basis.get_euler()
+	var dp: Vector3 = cur_euler - previous_rotation # rotation from previous rotation
 	
 	dp = Vector3(short_angle(dp.x), short_angle(dp.y), short_angle(dp.z))
 
@@ -728,4 +742,4 @@ func rotational_spring_physics(delta: float):
 			chain[k].set_shader_parameter("physics_rot_offset", Basis.from_euler(rotation_at_height))
 		_last_pushed_rotation = spring_rotation
 
-	previous_rotation = mesh.transform.basis.get_euler()
+	previous_rotation = cur_euler

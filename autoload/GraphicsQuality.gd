@@ -12,11 +12,21 @@ extends Node
 ##
 ## …and, since the CPU (not the GPU) is what actually caps this game's frame
 ## rate, a matching set of CPU-side knobs consumed by Section_BeatRunner3d:
-##   - deco_update_divisor      how many frames between world-decoration passes
+##   - deco_update_hz           how many times a SECOND the world-decoration pass
+##                              runs. Replaces the old deco_update_divisor frame
+##                              counter, which meant "max" (divisor 1) ran the
+##                              whole pass 120x a second purely because the
+##                              render rate happened to be 120 fps. A wall-clock
+##                              rate also makes the decoration lerps converge at
+##                              the same speed on every machine.
 ##   - deco_window_ahead_m      how far ahead decorations are kept live at all
 ##   - ambient_light_spacing_m  metres between overhead track spot lights
 ##   - gem_spacing_m            metres between gem/arch/pad decoration clusters
 ##   - fx_step_lights           per-footstep floor glow lights on/off
+##   - world_fx_wisps           melody wisps spawned per track side, per event
+##   - world_fx_spires          melody light spires on/off
+##   - city_buildings_per_side  skyline density
+##   - fur_physics              so_fluffy spring simulation on/off
 ## Without these, every tier from "low" to "max" ran the exact same per-frame
 ## script workload and only the render resolution changed — which is why
 ## dropping the quality setting used to do so little for a CPU-bound frame.
@@ -42,8 +52,12 @@ const PRESETS: Dictionary = {
 		"mesh_lod_threshold": 16.0,
 		"fur_scale": 0.45,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
-		"deco_update_divisor": 4,
 		"deco_window_ahead_m": 140.0,
+		"deco_update_hz": 15,
+		"world_fx_wisps": 1,
+		"world_fx_spires": false,
+		"city_buildings_per_side": 8,
+		"fur_physics": false,
 		"ambient_light_spacing_m": 50.0,
 		"gem_spacing_m": 64.0,
 		"fx_step_lights": false,
@@ -61,8 +75,12 @@ const PRESETS: Dictionary = {
 		"mesh_lod_threshold": 12.0,
 		"fur_scale": 0.70,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
-		"deco_update_divisor": 3,
 		"deco_window_ahead_m": 180.0,
+		"deco_update_hz": 20,
+		"world_fx_wisps": 2,
+		"world_fx_spires": true,
+		"city_buildings_per_side": 12,
+		"fur_physics": false,
 		"ambient_light_spacing_m": 35.0,
 		"gem_spacing_m": 48.0,
 		"fx_step_lights": true,
@@ -80,8 +98,12 @@ const PRESETS: Dictionary = {
 		"mesh_lod_threshold": 8.0,   # matches the project's original static default
 		"fur_scale": 1.0,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
-		"deco_update_divisor": 2,
 		"deco_window_ahead_m": 220.0,
+		"deco_update_hz": 30,
+		"world_fx_wisps": 4,
+		"world_fx_spires": true,
+		"city_buildings_per_side": 18,
+		"fur_physics": true,
 		"ambient_light_spacing_m": 25.0,
 		"gem_spacing_m": 32.0,
 		"fx_step_lights": true,
@@ -105,8 +127,12 @@ const PRESETS: Dictionary = {
 		"mesh_lod_threshold": 4.0,
 		"fur_scale": 1.0,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
-		"deco_update_divisor": 2,
 		"deco_window_ahead_m": 260.0,
+		"deco_update_hz": 30,
+		"world_fx_wisps": 5,
+		"world_fx_spires": true,
+		"city_buildings_per_side": 18,
+		"fur_physics": true,
 		"ambient_light_spacing_m": 25.0,
 		"gem_spacing_m": 32.0,
 		"fx_step_lights": true,
@@ -136,8 +162,12 @@ const PRESETS: Dictionary = {
 		"mesh_lod_threshold": 1.0,
 		"fur_scale": 1.3,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
-		"deco_update_divisor": 1,
 		"deco_window_ahead_m": 300.0,
+		"deco_update_hz": 60,
+		"world_fx_wisps": 5,
+		"world_fx_spires": true,
+		"city_buildings_per_side": 18,
+		"fur_physics": true,
 		"ambient_light_spacing_m": 20.0,
 		"gem_spacing_m": 32.0,
 		"fx_step_lights": true,

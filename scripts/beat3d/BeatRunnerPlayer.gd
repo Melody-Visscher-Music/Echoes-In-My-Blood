@@ -904,6 +904,11 @@ func _attach_so_fluffy(model: Node3D) -> void:
 
 	# ── Apply shape / physics to ALL nodes via _set_fur_all ────────────────
 	_set_fur_all(&"number_of_shells",         GraphicsQuality.scale_fur_shells(fur_shells))
+	# Spring physics pushes a shader parameter to EVERY shell of every fur node on
+	# each physics tick whenever the fur is in motion. The lower tiers trade that
+	# for static fur, which still reads as fur — it just does not sway.
+	if not bool(GraphicsQuality.get_setting("fur_physics", true)):
+		_set_fur_all(&"physics_enabled", false)
 	_set_fur_all(&"length",                   fur_length)
 	_set_fur_all(&"density",                  fur_density)
 	_set_fur_all(&"scruffiness",              fur_scruffiness)
