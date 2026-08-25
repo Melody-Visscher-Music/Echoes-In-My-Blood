@@ -75,6 +75,13 @@ var gate_judged: Array[bool] = []
 var gate_success: Array[bool] = []
 var gate_world_zs: Array[float] = []
 var gate_culled: Array[bool] = []   # permanently hidden — _update_gate_visibility must never re-show these
+# Per-gate values that never change after build, pulled out of runner_plan so the
+# three per-frame gate loops (_update_gate_visibility, the miss check, and the
+# gate colour-cycle pass) stop doing a String-keyed Dictionary lookup — and, in
+# the visibility loop, a full linear _is_electric_at() zone scan — per gate per
+# frame for something fixed the moment the level was built.
+var gate_actions:     PackedStringArray = PackedStringArray()
+var gate_is_electric: Array[bool]       = []
 
 var _judge_index: int = 0
 var _vis_start_idx: int = 0   # lower-bound cursor for visibility loop
@@ -196,6 +203,12 @@ var _gate_cycle_mats: Array[Array] = []
 # cheaper than one material per strip.  One roof light per building.
 var _city_bldg_mats:   Array[StandardMaterial3D] = []
 var _city_bldg_lights: Array[OmniLight3D]         = []
+# Path distance of each roof light, sorted, so the beat pulse can walk only the
+# slice near the player instead of writing light_energy on all of them every
+# tick. (The window materials are shared per palette colour, so those stay a
+# handful of writes and need no window.)
+var _city_bldg_light_pds: PackedFloat32Array = PackedFloat32Array()
+var _city_light_cursor:   int                = 0
 var _city_pulse_t:     float = 0.0   # 0-1, set to 1 on each beat, decays in _process
 var _electric_zones:   Array[Dictionary] = []  # [{start_t, end_t}] seconds; empty = all city
 
@@ -203,7 +216,23 @@ var _electric_zones:   Array[Dictionary] = []  # [{start_t, end_t}] seconds; emp
 @warning_ignore("unused_private_class_variable")
 var _elec_obs_mats:   Array[StandardMaterial3D] = []   # obstacle arc meshes — pulse hard
 var _elec_env_mats:   Array[StandardMaterial3D] = []   # pylon tip glows — pulse subtly
-var _elec_arc_lights: Array[OmniLight3D]        = []   # shared lights from both
+# Arc spark lights, one per electric gate arc. There are ~500 of these on a
+# fully electric chart and the pulse used to write light_energy on every single
+# one every tick, including the hundreds sitting kilometres away behind the fog.
+# They are created in gate order (see _build_gate_visual -> _make_elec_arc), so
+# recording the owning gate index gives a non-decreasing key that can be windowed
+# against gate_world_zs with the same monotonic cursor _update_gate_visibility
+# already uses — no extra path-distance bookkeeping needed.
+var _elec_arc_lights:   Array[OmniLight3D] = []
+var _elec_arc_gate_idx: PackedInt32Array   = PackedInt32Array()
+var _elec_arc_cursor:   int                = 0
+## Set by _build_gate_visual so _make_elec_arc knows which gate it is decorating.
+var _elec_build_gate_idx: int = -1
+# Pylon ambient lights are spawned separately, in increasing path order, so they
+# get their own array + path distances rather than being mixed into the above.
+var _elec_pylon_lights: Array[OmniLight3D]  = []
+var _elec_pylon_pds:    PackedFloat32Array  = PackedFloat32Array()
+var _elec_pylon_cursor: int                 = 0
 var _elec_pulse_t:    float = 0.0   # 0-1, set to 1 on each beat, decays in _process
 var _elec_flicker_t:  float = 0.0   # cooldown between ambient flickers in electric zones
 # Shared mesh resources — all arc segments + pylon parts reuse these so the
@@ -219,7 +248,29 @@ var _pylon_beam_mat:   StandardMaterial3D = null
 
 # ── World vitality — hit = more alive, miss = less alive ─────────────────────
 var _world_vitality:   float = 0.5   # 0.0 (dead) → 1.0 (fully alive)
-var _lod_frame:        int   = 0     # toggles each frame — decorations update every other frame
+# ── Visual-rate scheduler ─────────────────────────────────────────────────────
+# Colour cycling, world-decoration energy, the city/electric beat flash and the
+# HUD rainbow are all slow drifts, not per-frame motion. They used to run once
+# per RENDERED frame, so with max_fps = 120 the "max" tier did all of it 120
+# times a second purely because the render rate happened to be 120 — and the old
+# _lod_frame counter could only divide that by whole frames. Driving them from a
+# wall-clock accumulator instead means the rate is a real quality setting
+# (GraphicsQuality "deco_update_hz": 15 on low … 60 on max) and, because the
+# smoothing factors below are rate-corrected through _smooth_k(), the world
+# converges at exactly the same speed no matter what the frame rate is doing.
+# One accumulator PER PASS, deliberately not one shared tick. A single shared
+# tick cut the total work but bunched all four passes onto the same frame, which
+# measured as a lower median and a HIGHER 95th percentile - trading steady cost
+# for periodic spikes, which is exactly the wrong trade in a rhythm game. Each
+# pass gets its own phase (staggered a quarter-interval apart in _ready) so the
+# work stays spread across frames as well as reduced.
+const _TICK_RAINBOW: int = 0
+const _TICK_PULSE:   int = 1
+const _TICK_CYCLE:   int = 2
+const _TICK_HALO:    int = 3
+const _TICK_COUNT:   int = 4
+var _tick_accum:    PackedFloat32Array = PackedFloat32Array([0.0, 0.0, 0.0, 0.0])
+var _deco_interval: float = 1.0 / 30.0
 var _beat_phase:       float = 0.0   # 0-1, snaps to 1 on each beat, decays in _process
 
 # Refs to reactive world decoration elements (populated by _spawn_track_decorations)
@@ -242,7 +293,6 @@ var _world_pad_mats:   Array[StandardMaterial3D] = []
 # actually do less CPU work, not just render at a smaller resolution. Resolved
 # once in _ready(); the defaults here match the "high" preset.
 var _deco_window_ahead_m: float = 220.0   # comfortably past the fog wall
-var _deco_update_divisor: int   = 2
 const _DECO_WINDOW_BEHIND_M: float = 60.0
 var _world_gem_light_pds:  PackedFloat32Array = PackedFloat32Array()
 var _world_arch_light_pds: PackedFloat32Array = PackedFloat32Array()
@@ -257,7 +307,7 @@ var _deco_spin_cursor: int = 0
 
 # Authored wall-jump kit + ledge emissives — beat-pulsed (full on beat, dim between).
 var _world_track_mats:   Array[StandardMaterial3D] = []
-var _world_track_base_e: Array[float]              = []   # each mat's authored base energy
+var _world_track_base_e: PackedFloat32Array        = PackedFloat32Array()   # each mat's authored base energy
 var _track_mat_seen:     Dictionary                = {}   # source-mat id → unique pulse mat (dedup)
 
 # ── Pooled one-shot FX lights ─────────────────────────────────────────────────
@@ -275,11 +325,11 @@ var _fx_beat_tween:  Tween              = null
 # Melody visual system — env reference for fog colour pulses
 var _melody_env: Environment = null
 var _fx_tween_host: Node = null   # PROCESS_MODE_INHERIT — pauses with SceneTree
-# Live halo ring materials — recoloured every frame with the song's colour cycle.
-# _b holds secondary (dual-colour) materials; always empty when halo_dual_color = false.
 var _lyrics_scan_idx: int = 0   # monotonic cursor for _update_lyrics (see there)
-var _active_halo_mats:   Array[StandardMaterial3D] = []
-var _active_halo_mats_b: Array[StandardMaterial3D] = []
+# Pooled world FX — halo rings, melody spires and wisps. Every one of these used
+# to be a fresh Node3D + mesh resource + material + tween per melody event (~4 a
+# second), then queue_freed a fraction of a second later. See WorldFxPool.gd.
+var _fx_pool: WorldFxPool = null
 # Z range of the wall-jump section — halos are suppressed inside this zone
 var _wj_zone_start_z:    float = -INF
 var _wj_zone_end_z:      float = -INF
@@ -324,10 +374,19 @@ var _floor_cutoff_dist: float          = INF    # floor not spawned past this (w
 var _turn_junction_pds: Array[float]   = []   # arc start
 var _turn_arc_ends:     Array[float]   = []   # arc end
 var _turn_is_right:     Array[bool]    = []   # true = right turn; used by banking + camera lean
+# Monotonic cursor into the arc lists for _update_camera_fx - _player_path_dist
+# only ever increases within a run, so arcs already behind the player never need
+# looking at again. Same pattern as _gem_light_cursor / _judge_index.
+var _arc_fx_cursor:     int            = 0
 
 # ── HUD progress ─────────────────────────────────────────────────────────────
 var _hud_progress_fill: ColorRect = null
 var _song_total_duration: float   = 0.0
+# Viewport size, cached and refreshed from the viewport's own size_changed
+# signal. _update_hud_progress, _update_lyrics and _hud_s() each used to call
+# get_viewport().get_visible_rect() every frame for a value that changes only
+# when the window is resized.
+var _vp_size: Vector2 = Vector2(1920, 1080)
 
 # ── SFX ──────────────────────────────────────────────────────────────────────
 var _sfx_miss: AudioStreamPlayer = null
@@ -525,12 +584,20 @@ func _ready() -> void:
 
 	# Apply user settings before any world/material setup
 	_pick_random_lyric_font()
+	_refresh_vp_size()
+	var _vp: Viewport = get_viewport()
+	if _vp != null and not _vp.size_changed.is_connected(_refresh_vp_size):
+		_vp.size_changed.connect(_refresh_vp_size)
 	_fx_tween_host = Node.new()
 	_fx_tween_host.name = "FxTweenHost"
 	add_child(_fx_tween_host)
+	_build_fx_pool()
 	# Pull the tier's CPU-cost knobs before anything spawns — decoration density
 	# is baked in at build time, so these have to be read before the spawners run.
-	_deco_update_divisor  = maxi(1, int(GraphicsQuality.get_setting("deco_update_divisor", 2)))
+	_deco_interval        = 1.0 / maxf(1.0, float(GraphicsQuality.get_setting("deco_update_hz", 30)))
+	# Phase-stagger so the four visual passes fire on different frames.
+	for _ti in range(_TICK_COUNT):
+		_tick_accum[_ti] = _deco_interval * (float(_ti) / float(_TICK_COUNT))
 	_deco_window_ahead_m  = float(GraphicsQuality.get_setting("deco_window_ahead_m", 220.0))
 	_fx_step_lights_on    = bool(GraphicsQuality.get_setting("fx_step_lights", true))
 	cycle_color_a        = GameConfig.level_color_a
@@ -670,8 +737,12 @@ func _loading_step(text: String, frac: float) -> void:
 
 func _process(delta: float) -> void:
 	# HUD "echoes" rainbow chrome — always animating, independent of countdown/pause/song
-	# state, so the colour drift never visibly stutters or freezes.
-	_update_hud_rainbow(delta)
+	# state, so the colour drift never visibly stutters or freezes. The hue moves
+	# 0.055 per second, i.e. one full loop every ~18 s, so stepping it a few dozen
+	# times a second instead of 120 is not something an eye can resolve.
+	var dt_rainbow: float = _visual_tick(_TICK_RAINBOW, delta)
+	if dt_rainbow > 0.0:
+		_update_hud_rainbow(dt_rainbow)
 
 	# ── Countdown phase — wait for engine to settle before starting music ────
 	# (runs even if stream is null so the countdown can still fire and unblock input)
@@ -682,9 +753,17 @@ func _process(delta: float) -> void:
 	if music.stream == null:
 		return
 
+	# Song clock, sampled ONCE per frame. _update_electric_pulse used to call
+	# _song_time() itself, which means a second music.get_playback_position() +
+	# AudioServer.get_time_since_last_mix() round trip every frame, including while
+	# paused, for a value this function already has.
+	var t_s: float = _song_time()
+
 	# City / electric pulse decay runs even when paused so lights don't freeze mid-flash
-	_update_city_pulse(delta)
-	_update_electric_pulse(delta)
+	var dt_pulse: float = _visual_tick(_TICK_PULSE, delta)
+	if dt_pulse > 0.0:
+		_update_city_pulse(dt_pulse)
+		_update_electric_pulse(dt_pulse, t_s)
 
 	# Decay wall-jump bonus timer (runs through pause so the label fades naturally)
 	if _wj_mult_timer > 0.0:
@@ -703,7 +782,6 @@ func _process(delta: float) -> void:
 	if _paused:
 		return
 
-	var t_s: float = _song_time()
 	player.set_song_time(t_s)
 
 	# Charge OVERDRIVE window countdown (gameplay time — not while paused).
@@ -715,9 +793,12 @@ func _process(delta: float) -> void:
 	# Song progress bar
 	_update_hud_progress(t_s)
 
-	# slow palette drift
-	if has_method("_update_color_cycle"):
-		_update_color_cycle(t_s)
+	# slow palette drift. (Was guarded by has_method("_update_color_cycle") — a
+	# String-to-StringName conversion plus a method-table lookup every frame, for a
+	# function defined a few hundred lines below in this same file.)
+	var dt_cycle: float = _visual_tick(_TICK_CYCLE, delta)
+	if dt_cycle > 0.0:
+		_update_color_cycle(t_s, dt_cycle)
 
 	# ── Path tracking — keep path dist + player direction in sync each frame ────
 	# Walk forward/backward from last frame's segment by physical projection.
@@ -778,21 +859,11 @@ func _process(delta: float) -> void:
 	# rather than sharing _current_cycle_color with gates/floor/rail/world — sharing
 	# one function meant every cycle-affected thing showed the identical color at
 	# the identical instant, which read as the halo's color "spilling" onto gates.
-	var _halo_col_a: Color = _current_halo_cycle_color(t_s)
-	if not _active_halo_mats.is_empty():
-		for hmat in _active_halo_mats:
-			if is_instance_valid(hmat):
-				var a: float = hmat.albedo_color.a
-				hmat.albedo_color = Color(_halo_col_a.r, _halo_col_a.g, _halo_col_a.b, a)
-				hmat.emission     = _halo_col_a
-	if not _active_halo_mats_b.is_empty():
+	if _visual_tick(_TICK_HALO, delta) > 0.0 and _fx_pool != null:
+		var _halo_col_a: Color = _current_halo_cycle_color(t_s)
 		# B colour: if dual_color use GameConfig.halo_color_b, else follow A
 		var _halo_col_b: Color = GameConfig.halo_color_b if GameConfig.halo_dual_color else _halo_col_a
-		for hmat in _active_halo_mats_b:
-			if is_instance_valid(hmat):
-				var a: float = hmat.albedo_color.a
-				hmat.albedo_color = Color(_halo_col_b.r, _halo_col_b.g, _halo_col_b.b, a)
-				hmat.emission     = _halo_col_b
+		_fx_pool.update_halo_colors(_halo_col_a, _halo_col_b)
 
 	# only show gates a few beats ahead instead of the whole song at once
 	_update_gate_visibility()
@@ -2979,6 +3050,8 @@ func _build_all_gate_visuals() -> void:
 	gate_success.clear()
 	gate_world_zs.clear()
 	gate_culled.clear()
+	gate_actions.clear()
+	gate_is_electric.clear()
 	_gate_animated.clear()
 	_gate_cycle_mats.clear()
 
@@ -2998,11 +3071,16 @@ func _build_all_gate_visuals() -> void:
 		gate_world_zs.append(gate.global_position.z)
 		_gate_animated.append(false)
 		_gate_cycle_mats.append(_collect_cycle_mats(gate))
+		gate_actions.append(String(entry.get("action", "")))
+		gate_is_electric.append(_is_electric_at(float(entry.get("t", 0.0))))
 
 	# WJ geometry is now spawned path-aware in _spawn_wj_geometry_on_path() after
 	# _build_track_path(), so _spawn_section_geometry() is no longer called here.
 
 func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
+	# Lets _make_elec_arc tag each arc spark light with its owning gate, so
+	# _update_electric_pulse can window them. Cleared again after the build.
+	_elec_build_gate_idx = gate_index
 	var root: Node3D = Node3D.new()
 	var t_s: float     = float(entry.get("t", 0.0))
 	var action: String = String(entry.get("action", "jump"))
@@ -3040,6 +3118,7 @@ func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
 				"wall_left", "wall_right": _vis_wall_gate(vis_root, action, tint)
 
 	_add_gate_judge_area(root, gate_index, action, post_lane)
+	_elec_build_gate_idx = -1
 	return root
 
 
@@ -3546,6 +3625,7 @@ func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 	spark.add_child(sl)
 	# Register in pulse array so the beat flash also hits the traveling light.
 	_elec_arc_lights.append(sl)
+	_elec_arc_gate_idx.append(_elec_build_gate_idx)
 
 	var stw := parent.create_tween().set_loops()
 	stw.tween_property(spark, "position:x", to_x,   0.20).set_trans(Tween.TRANS_LINEAR)
@@ -3844,8 +3924,13 @@ func _spawn_electric_environment() -> void:
 					p_alight.omni_range   = 9.0
 					p_alight.position     = _path_world_pos(bz,
 						float(side) * (pylon_dist - p_reach), p_h - 1.5)
+					# Range 9 m, and fog hides the pylon long before this matters.
+					p_alight.distance_fade_enabled = true
+					p_alight.distance_fade_begin   = 140.0
+					p_alight.distance_fade_length  = 40.0
 					world_fx_root.add_child(p_alight)
-					_elec_arc_lights.append(p_alight)
+					_elec_pylon_lights.append(p_alight)
+					_elec_pylon_pds.append(bz)
 			continue
 
 		for side in [-1, 1]:
@@ -3900,16 +3985,21 @@ func _spawn_electric_environment() -> void:
 				alight.light_energy = 0.8
 				alight.omni_range   = 9.0
 				alight.position     = _path_world_pos(bz, tip_lat, pylon_h - 1.5)
+				# Range 9 m, and fog hides the pylon long before this matters.
+				alight.distance_fade_enabled = true
+				alight.distance_fade_begin   = 140.0
+				alight.distance_fade_length  = 40.0
 				world_fx_root.add_child(alight)
-				_elec_arc_lights.append(alight)
+				_elec_pylon_lights.append(alight)
+				_elec_pylon_pds.append(bz)
 
 
 # ── Electric pulse decay ──────────────────────────────────────────────────────
 # Mirrors _update_city_pulse; drives obstacle arcs hard and env tips subtly.
-func _update_electric_pulse(delta: float) -> void:
+func _update_electric_pulse(delta: float, t_s: float) -> void:
 	# Ambient danger flicker — small random spikes between beats in electric zones
 	_elec_flicker_t = maxf(0.0, _elec_flicker_t - delta)
-	if _elec_pulse_t < 0.05 and _elec_flicker_t <= 0.0 and _is_electric_at(_song_time()):
+	if _elec_pulse_t < 0.05 and _elec_flicker_t <= 0.0 and _is_electric_at(t_s):
 		_elec_flicker_t = randf_range(0.15, 0.55)
 		_elec_pulse_t   = randf_range(0.06, 0.20)
 
@@ -3929,12 +4019,44 @@ func _update_electric_pulse(delta: float) -> void:
 	for mat in _elec_env_mats:
 		mat.emission_energy_multiplier = env_e
 
-	# Shared point lights
+	# Shared point lights. Every one of these gets the SAME energy, so the only
+	# thing that matters is not writing it to lights the player cannot possibly
+	# see. Both lists are walked with a monotonic cursor + early break, exactly
+	# like _world_gem_lights in _update_color_cycle.
 	var lp_peak: float = lerpf(0.4, 2.5, vit)
 	var lp_base: float = lerpf(0.1, 0.5, vit)
 	var lt_e:    float = lerpf(lp_base, lp_peak, _elec_pulse_t)
-	for lt in _elec_arc_lights:
-		lt.light_energy = lt_e
+
+	var pd:  float = _player_path_dist
+	var lo:  float = pd - _DECO_WINDOW_BEHIND_M
+	var hi:  float = pd + _deco_window_ahead_m
+
+	# Gate arc sparks — keyed by the owning gate's path distance.
+	while _elec_arc_cursor < _elec_arc_gate_idx.size():
+		var gi0: int = _elec_arc_gate_idx[_elec_arc_cursor]
+		if gi0 >= 0 and gi0 < gate_world_zs.size() and gate_world_zs[gi0] < lo:
+			_elec_arc_cursor += 1
+		else:
+			break
+	for i in range(_elec_arc_cursor, _elec_arc_lights.size()):
+		if i >= _elec_arc_gate_idx.size():
+			break
+		var gi: int = _elec_arc_gate_idx[i]
+		if gi >= 0 and gi < gate_world_zs.size():
+			if gate_world_zs[gi] > hi:
+				break
+		var lt: OmniLight3D = _elec_arc_lights[i]
+		if lt != null and is_instance_valid(lt):
+			lt.light_energy = lt_e
+
+	# Pylon ambient lights — already in increasing path order.
+	while _elec_pylon_cursor < _elec_pylon_pds.size() \
+			and _elec_pylon_pds[_elec_pylon_cursor] < lo:
+		_elec_pylon_cursor += 1
+	for i in range(_elec_pylon_cursor, _elec_pylon_lights.size()):
+		if i >= _elec_pylon_pds.size() or _elec_pylon_pds[i] > hi:
+			break
+		_elec_pylon_lights[i].light_energy = lt_e
 
 
 # ── Electric zone helpers ──────────────────────────────────────────────────────
@@ -5108,7 +5230,7 @@ func _judge_passed_unhit_gates_by_position() -> void:
 			break
 
 		var entry: Dictionary    = runner_plan[i]
-		var action: String       = String(entry.get("action", ""))
+		var action: String       = gate_actions[i]
 		var safe_lane: int       = int(entry.get("post_lane", 1))
 
 		# ── Wall jump: land-based scoring ────────────────────────────────────
@@ -5338,7 +5460,10 @@ func _create_hud() -> void:
 	_hud_score_cap = Label.new()
 	_hud_score_cap.text = "SCORE"
 	_hud_score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_score_cap.add_theme_color_override("font_color", Color(0.74, 0.52, 1.00, 0.75))
+	# White base: the rainbow cycle drives the visible colour through
+	# self_modulate every frame (see _update_hud_rainbow), which multiplies.
+	_hud_score_cap.add_theme_color_override("font_color", Color.WHITE)
+	_hud_score_cap.self_modulate = Color(0.74, 0.52, 1.00, 0.75)
 	_hud_score_cap.add_theme_font_size_override("font_size", int(11 * s))
 	_hud_score_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	score_vbox.add_child(_hud_score_cap)
@@ -5346,7 +5471,8 @@ func _create_hud() -> void:
 	_hud_score_label = Label.new()
 	_hud_score_label.text = "0"
 	_hud_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_score_label.add_theme_color_override("font_color", Color(1.00, 0.55, 0.86, 1.0))
+	_hud_score_label.add_theme_color_override("font_color", Color.WHITE)
+	_hud_score_label.self_modulate = Color(1.00, 0.55, 0.86, 1.0)
 	_hud_score_label.add_theme_font_size_override("font_size", int(33 * s))
 	_hud_score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_hud_score_label.pivot_offset = Vector2(card_w * 0.5, 14 * s)   # punch-scale grows from centre
@@ -5465,7 +5591,8 @@ func _create_hud() -> void:
 	_hud_hp_pct_label.offset_top    = bar_y - 2 * s
 	_hud_hp_pct_label.offset_bottom = bar_y + bar_h
 	_hud_hp_pct_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_hud_hp_pct_label.add_theme_color_override("font_color", Color(0.90, 0.90, 0.95, 0.75))
+	_hud_hp_pct_label.add_theme_color_override("font_color", Color.WHITE)
+	_hud_hp_pct_label.self_modulate = Color(0.90, 0.90, 0.95, 0.75)
 	_hud_hp_pct_label.add_theme_font_size_override("font_size", int(13 * s))
 	_hud_hp_pct_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
 	_hud_hp_pct_label.add_theme_constant_override("outline_size", int(3 * s))
@@ -5628,10 +5755,9 @@ func _update_lyrics(t_s: float) -> void:
 			_lyrics_pop_word(word_list[wi], wi, wi * 0.07)
 		_lyrics_revealed = max(1, word_list.size())
 	# Fixed position: bottom 20 % of screen, centred horizontally.
-	var vp := get_viewport().get_visible_rect().size
 	_lyrics_hud.position = Vector2(
-		vp.x * 0.5 - _lyrics_hud.size.x * 0.5,
-		vp.y * 0.80 + _lyrics_slide_off
+		_vp_size.x * 0.5 - _lyrics_hud.size.x * 0.5,
+		_vp_size.y * 0.80 + _lyrics_slide_off
 	)
 	# Fade out as the line hold ends.
 	var fade_end: float = float(cur["t_end"]) + _LYRICS_HOLD_S
@@ -6829,12 +6955,19 @@ func _update_hud_rainbow(delta: float) -> void:
 		else:
 			_hud_card_sb.border_color = c_border
 			_hud_card_sb.shadow_color = Color(c_border.r, c_border.g, c_border.b, 0.35)
+	# self_modulate, NOT add_theme_color_override. An override fires
+	# NOTIFICATION_THEME_CHANGED, which throws away the Label's shaped-text buffer
+	# AND calls update_minimum_size() - dirtying the enclosing VBox/MarginContainer
+	# and queueing a layout sort. Doing that three times a frame forever meant
+	# re-shaping text at the render rate. self_modulate is a plain CanvasItem
+	# property: one RenderingServer call, no re-shape, no re-sort. The base
+	# font_color is white (set in _create_hud) so the product is identical, and it
+	# still stacks correctly with the score-flash tween, which drives modulate.
 	if _hud_score_cap != null:
 		var c_cap: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.08, 1.0), _HUD_RAINBOW_SAT * 0.8, 1.0)
-		_hud_score_cap.add_theme_color_override("font_color", Color(c_cap.r, c_cap.g, c_cap.b, 0.80))
+		_hud_score_cap.self_modulate = Color(c_cap.r, c_cap.g, c_cap.b, 0.80)
 	if _hud_score_label != null:
-		var c_num: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.14, 1.0), _HUD_RAINBOW_SAT * 0.55, 1.0)
-		_hud_score_label.add_theme_color_override("font_color", c_num)
+		_hud_score_label.self_modulate = Color.from_hsv(fmod(_hud_rainbow_hue + 0.14, 1.0), _HUD_RAINBOW_SAT * 0.55, 1.0)
 
 	_update_hud_hp_color()
 
@@ -6875,15 +7008,23 @@ func _update_hud_hp_color() -> void:
 				_hud_hp_fill_sbs[i].bg_color = c
 
 	if _hud_hp_pct_label != null:
-		_hud_hp_pct_label.add_theme_color_override("font_color", c.lightened(0.35))
+		# Same reasoning as _update_hud_rainbow: self_modulate, not a theme override.
+		# The black text outline stays black (black times anything is black) and
+		# keeps its alpha, because this colour is fully opaque.
+		_hud_hp_pct_label.self_modulate = c.lightened(0.35)
 
 
 ## Viewport-relative scale for the persistent gameplay HUD, matched to the same
 ## 1920×1080 reference and clamp style HowToPlay's cards use, kept slightly
 ## tighter so the HUD never grows large enough to crowd the play lanes.
 func _hud_s() -> float:
-	var vp := get_viewport().get_visible_rect().size if get_viewport() else Vector2(1920, 1080)
-	return clampf(minf(vp.x / 1920.0, vp.y / 1080.0), 0.75, 1.3)
+	return clampf(minf(_vp_size.x / 1920.0, _vp_size.y / 1080.0), 0.75, 1.3)
+
+
+func _refresh_vp_size() -> void:
+	var vp: Viewport = get_viewport()
+	if vp != null:
+		_vp_size = vp.get_visible_rect().size
 
 
 ## Rounded card stylebox with a soft built-in glow (StyleBoxFlat's own shadow),
@@ -7595,9 +7736,14 @@ func _update_camera_fx(delta: float) -> void:
 	const ARC_LEAN_MAX_DEG: float = 5.0
 	var arc_lean_target: float = 0.0
 	var arc_bank_raw:    float = 0.0
-	for i in range(_turn_junction_pds.size()):
+	while _arc_fx_cursor < _turn_arc_ends.size() \
+			and _player_path_dist >= _turn_arc_ends[_arc_fx_cursor]:
+		_arc_fx_cursor += 1
+	for i in range(_arc_fx_cursor, _turn_junction_pds.size()):
 		var arc_s: float = _turn_junction_pds[i]
 		var arc_e: float = _turn_arc_ends[i]
+		if _player_path_dist < arc_s:
+			break   # arcs are in increasing path order - none later can be active
 		if _player_path_dist >= arc_s and _player_path_dist < arc_e:
 			var t: float         = (_player_path_dist - arc_s) / (arc_e - arc_s)
 			var lean_sign: float = 1.0 if _turn_is_right[i] else -1.0
@@ -7724,7 +7870,10 @@ func _spawn_floor_grid() -> void:
 # song length.  All window strips on a building share one material — pulsing
 # costs O(building_count) per beat, not O(strip_count).
 func _spawn_city_buildings() -> void:
-	const MAX_BLDGS_PER_SIDE: int = 18   # 36 total — cheap enough for smooth play
+	# Skyline density is a quality-tier knob (was a hard-coded 18). Each building
+	# costs a body mesh, an occluder, a window MultiMesh and a roof light.
+	var max_bldgs_per_side: int = maxi(2,
+		int(GraphicsQuality.get_setting("city_buildings_per_side", 18)))
 	var end_z: float = _song_end_z()
 	var tw:    float = _track_full_width()
 
@@ -7752,14 +7901,33 @@ func _spawn_city_buildings() -> void:
 	# procedural templates. "Windows" emissives pulse with the city beat.
 	var bldg_entries: Array = (_piece_lib.of_type("building") if _piece_lib != null else [])
 
+	# One window material PER PALETTE COLOUR, not per building. Every building
+	# picks its colour out of win_palette, and the beat pulse writes the exact same
+	# emission energy to all of them, so ~56 identical-behaving materials collapse
+	# to 6 with pixel-identical output — and _update_city_pulse's material loop
+	# collapses with them.
+	var win_mats: Array[StandardMaterial3D] = []
+	for pc: Color in win_palette:
+		var wm := StandardMaterial3D.new()
+		wm.albedo_color               = pc.darkened(0.30)
+		wm.emission_enabled           = true
+		wm.emission                   = pc
+		wm.emission_energy_multiplier = 0.8
+		win_mats.append(wm)
+		_city_bldg_mats.append(wm)
+
+	# (path distance, light) pairs, sorted at the end — the loops below run
+	# side-major then row-major, so bz is not globally increasing as it goes.
+	var city_light_pairs: Array = []
+
 	var bldg_i: int = 0
 
 	for side in [-1, 1]:
 		for ri in dist_rows.size():
 			var dist: float = dist_rows[ri]
-			# Spread MAX_BLDGS_PER_SIDE buildings evenly across the track length
-			var step: float = end_z / float(MAX_BLDGS_PER_SIDE)
-			for bi in MAX_BLDGS_PER_SIDE:
+			# Spread max_bldgs_per_side buildings evenly across the track length
+			var step: float = end_z / float(max_bldgs_per_side)
+			for bi in max_bldgs_per_side:
 				var bz:   float = step * 0.4 + float(bi) * step + float(ri) * step * 0.5
 				if _z_is_electric(bz):
 					bldg_i += 1
@@ -7784,8 +7952,13 @@ func _spawn_city_buildings() -> void:
 					b_rlight.light_energy = 0.5
 					b_rlight.omni_range   = 10.0
 					b_rlight.position     = _path_world_pos(bz, float(side) * dist, b_h + 0.8)
+					# Range 10 m and well past the fog wall for most of the song — let
+					# the renderer drop it, like the gem / arch / ambient lights already do.
+					b_rlight.distance_fade_enabled = true
+					b_rlight.distance_fade_begin   = 140.0
+					b_rlight.distance_fade_length  = 40.0
 					world_fx_root.add_child(b_rlight)
-					_city_bldg_lights.append(b_rlight)
+					city_light_pairs.append([bz, b_rlight])
 
 					bldg_i += 1
 					continue
@@ -7836,13 +8009,9 @@ func _spawn_city_buildings() -> void:
 				# completely untouched, it just now recolors a
 				# MultiMeshInstance3D's material_override instead of N
 				# individual MeshInstance3Ds.
-				var win_col: Color = win_palette[(bldg_i + ri * 3) % win_palette.size()]
-				var win_mat := StandardMaterial3D.new()
-				win_mat.albedo_color               = win_col.darkened(0.30)
-				win_mat.emission_enabled           = true
-				win_mat.emission                   = win_col
-				win_mat.emission_energy_multiplier = 0.8
-				_city_bldg_mats.append(win_mat)
+				var win_idx: int   = (bldg_i + ri * 3) % win_palette.size()
+				var win_col: Color = win_palette[win_idx]
+				var win_mat: StandardMaterial3D = win_mats[win_idx]
 
 				var strip_h:  float = 0.14
 				var strip_gap: float = 2.2
@@ -7876,10 +8045,23 @@ func _spawn_city_buildings() -> void:
 				rlight.light_energy = 0.5
 				rlight.omni_range   = 10.0
 				rlight.position     = _path_world_pos(bz, blat, bh + 0.8)
+				# Range 10 m and well past the fog wall for most of the song — let the
+				# renderer drop it, like the gem / arch / ambient lights already do.
+				rlight.distance_fade_enabled = true
+				rlight.distance_fade_begin   = 140.0
+				rlight.distance_fade_length  = 40.0
 				world_fx_root.add_child(rlight)
-				_city_bldg_lights.append(rlight)
+				city_light_pairs.append([bz, rlight])
 
 				bldg_i += 1
+
+	# Sort the roof lights by path distance so _update_city_pulse can window them.
+	city_light_pairs.sort_custom(func(a: Array, b: Array) -> bool: return a[0] < b[0])
+	_city_bldg_lights.clear()
+	_city_bldg_light_pds = PackedFloat32Array()
+	for pair: Array in city_light_pairs:
+		_city_bldg_light_pds.append(pair[0])
+		_city_bldg_lights.append(pair[1])
 
 
 # ── City pulse decay (called every frame, O(building_count)) ─────────────────
@@ -7897,10 +8079,24 @@ func _update_city_pulse(delta: float) -> void:
 	var energy:  float = lerpf(lerpf(0.1, 0.6, vit), peak_e, _city_pulse_t)
 	var light_e: float = lerpf(lerpf(0.0, 0.3, vit), peak_l, _city_pulse_t)
 
+	# Six shared palette materials rather than one per building (see
+	# _spawn_city_buildings), so this loop is a handful of writes.
 	for mat in _city_bldg_mats:
 		mat.emission_energy_multiplier = energy
-	for rlight in _city_bldg_lights:
-		rlight.light_energy = light_e
+
+	# Roof lights are per building and every one gets the SAME energy, so walk
+	# only the slice near the player — same monotonic cursor + early break as
+	# _world_gem_lights in _update_color_cycle.
+	var pd: float = _player_path_dist
+	var lo: float = pd - _DECO_WINDOW_BEHIND_M
+	var hi: float = pd + _deco_window_ahead_m
+	while _city_light_cursor < _city_bldg_light_pds.size() \
+			and _city_bldg_light_pds[_city_light_cursor] < lo:
+		_city_light_cursor += 1
+	for i in range(_city_light_cursor, _city_bldg_lights.size()):
+		if i >= _city_bldg_light_pds.size() or _city_bldg_light_pds[i] > hi:
+			break
+		_city_bldg_lights[i].light_energy = light_e
 
 
 # ── Song progress bar update ──────────────────────────────────────────────────
@@ -7913,14 +8109,15 @@ func _update_hud_progress(t_s: float) -> void:
 		_song_total_duration = _song_end_z() / player.forward_speed
 
 	var pct: float = clamp(t_s / _song_total_duration, 0.0, 1.0)
-	var vp_w: float = float(get_viewport().get_visible_rect().size.x)
+	var vp_w: float = _vp_size.x
 	_hud_progress_fill.offset_right = vp_w * pct
 
-	# Move the glow cap to the leading edge
-	var cap: Control = _hud_progress_fill.get_parent().get_node_or_null("ProgCap") as Control
-	if cap != null:
-		cap.offset_left  = vp_w * pct - 2.0
-		cap.offset_right = vp_w * pct + 4.0
+	# Move the glow cap to the leading edge. (This used to re-resolve the node by
+	# name through get_parent().get_node_or_null("ProgCap") every single frame,
+	# for a node _create_hud already stored in _hud_prog_cap.)
+	if _hud_prog_cap != null:
+		_hud_prog_cap.offset_left  = vp_w * pct - 2.0
+		_hud_prog_cap.offset_right = vp_w * pct + 4.0
 
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
@@ -8245,27 +8442,22 @@ func _get_shape_points(shape_id: String, radius: float) -> Array:
 	return pts
 
 
-## Builds a Node3D tracing a closed outline through pts.
-## tube_r controls how thick each segment is (box cross-section = tube_r * 2).
-## All segments share mat so colour/alpha updates affect them all.
-func _build_shape_node(pts: Array, mat: StandardMaterial3D, tube_r: float = 0.18) -> Node3D:
-	var root := Node3D.new()
-	var n: int = pts.size()
-	for i in n:
-		var a: Vector2 = pts[i]
-		var b: Vector2 = pts[(i + 1) % n]
-		var seg := MeshInstance3D.new()
-		var bm  := BoxMesh.new()
-		var length: float = a.distance_to(b)
-		var side: float   = tube_r * 2.0
-		bm.size               = Vector3(side, length, side)
-		seg.mesh              = bm
-		seg.material_override = mat
-		var mid: Vector2 = (a + b) * 0.5
-		seg.position     = Vector3(mid.x, mid.y, 0.0)
-		seg.rotation.z   = atan2(b.y - a.y, b.x - a.x) - PI * 0.5
-		root.add_child(seg)
-	return root
+## Builds the pooled world-FX system. Halo shape and radius come from GameConfig
+## and cannot change mid-run, so the ring geometry is baked into the pool here
+## instead of being rebuilt on every melody event. Wisp count per side and
+## whether spires run at all are quality-tier knobs — see GraphicsQuality.PRESETS.
+func _build_fx_pool() -> void:
+	var shape_id: String = GameConfig.halo_shape
+	var radius:   float  = GameConfig.halo_size
+	var tube_r:   float  = clampf(radius * 0.1, 0.1, 0.1)
+	# Circles are a TorusMesh built inside the pool; every other shape is an
+	# outline traced through these points.
+	var shape_pts: Array = [] if shape_id == "circle" else _get_shape_points(shape_id, radius)
+	_fx_pool = WorldFxPool.new()
+	_fx_pool.setup(world_fx_root, _fx_tween_host, shape_pts, radius, tube_r,
+		GameConfig.halo_dual_color,
+		int(GraphicsQuality.get_setting("world_fx_wisps", 5)),
+		bool(GraphicsQuality.get_setting("world_fx_spires", true)))
 
 
 ## Authored Blender halo ("halo") — spawned instead of the procedural ring when
@@ -8337,153 +8529,45 @@ func _spawn_authored_halo(note_dur: float) -> bool:
 
 
 func _spawn_halo_ring(note_dur: float = 0.0) -> void:
-	if player == null:
+	if player == null or _fx_pool == null:
 		return
 	if _spawn_authored_halo(note_dur):
 		return
 
-	var t_s:      float = _song_time()
-	@warning_ignore("unused_variable")
-	var vit:      float = _world_vitality
-	var init_col_a: Color = _current_halo_cycle_color(t_s)
-	var init_col_b: Color = GameConfig.halo_color_b   if GameConfig.halo_dual_color           else init_col_a
-
-	var ahead: float     = player.forward_speed * 0.55
-	var ring_pd: float   = _player_path_dist + ahead   # path distance of the ring
+	var ahead:   float = player.forward_speed * 0.55
+	var ring_pd: float = _player_path_dist + ahead   # path distance of the ring
 
 	# Suppress halos inside the wall-jump section
 	if ring_pd >= _wj_zone_start_z and ring_pd <= _wj_zone_end_z:
 		return
 
-	# ── Material A (primary — every odd segment, or everything when mono) ──
-	# Unshaded + additive: these are pure glow rings, not lit geometry, so
-	# skipping the PBR lighting model (SSAO/SSR/shadow lookups per fragment)
-	# is free quality-neutral perf, and additive blend is cheaper to composite
-	# than alpha-over for potentially hundreds of overlapping transparent
-	# rings in a dense hold tunnel — it also doesn't need correct back-to-
-	# front sort order to look right, unlike alpha blending. transparency
-	# stays TRANSPARENCY_ALPHA (required to land in the transparent pass at
-	# all); albedo alpha is still what the existing fade tweens drive.
-	var rmat := StandardMaterial3D.new()
-	rmat.albedo_color               = Color(init_col_a.r, init_col_a.g, init_col_a.b, 0.0)
-	rmat.emission_enabled           = true
-	rmat.emission                   = init_col_a
-	rmat.emission_energy_multiplier = 4.0
-	rmat.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
-	rmat.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
-	rmat.blend_mode                 = BaseMaterial3D.BLEND_MODE_ADD
+	var t_s:        float = _song_time()
+	var init_col_a: Color = _current_halo_cycle_color(t_s)
+	var init_col_b: Color = GameConfig.halo_color_b if GameConfig.halo_dual_color else init_col_a
 
-	# ── Material B (secondary — every even segment; only used if dual_color) ──
-	var rmat_b: StandardMaterial3D = null
-	if GameConfig.halo_dual_color:
-		rmat_b = StandardMaterial3D.new()
-		rmat_b.albedo_color               = Color(init_col_b.r, init_col_b.g, init_col_b.b, 0.0)
-		rmat_b.emission_enabled           = true
-		rmat_b.emission                   = init_col_b
-		rmat_b.emission_energy_multiplier = 4.0
-		rmat_b.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
-		rmat_b.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
-		rmat_b.blend_mode                 = BaseMaterial3D.BLEND_MODE_ADD
+	# Pivot sits at track centre at the ring's path distance.
+	var ring_pos: Vector3 = _path_world_pos(ring_pd, 0.0, 1.0)
 
-	# Pivot sits at track centre at ring path dist; shape nodes are children
-	var pivot := Node3D.new()
-	pivot.position = _path_world_pos(ring_pd, 0.0, 1.0)
-	pivot.rotation_degrees.y = _path_y_rot_at(ring_pd)
-	world_fx_root.add_child(pivot)
-
-	# Build halo — shape and radius driven by GameConfig
-	var radius:   float  = GameConfig.halo_size
-	var tube_r:   float  = clampf(radius * 0.1, 0.1, 0.1)
-	var shape_id: String = GameConfig.halo_shape
-
-	# Whether this halo uses a baked texture for dual colour (circle only).
-	# Texture-based halos are excluded from per-frame recolouring — only alpha is tweened.
-	var _texture_dual_circle: bool = false
-
-	if shape_id == "circle":
-		# Dual-colour: bake alternating stripes of col A and col B into the torus UV —
-		# no second ring is generated; the texture lives on the original geometry.
-		if GameConfig.halo_dual_color:
-			_texture_dual_circle = true
-			var stripe_img := Image.create(256, 1, false, Image.FORMAT_RGBA8)
-			for x in 256:
-				var sc: Color = init_col_a if int(float(x) / 256.0 * 12.0) % 2 == 0 else init_col_b
-				stripe_img.set_pixel(x, 0, sc)
-			var stripe_tex := ImageTexture.create_from_image(stripe_img)
-			rmat.albedo_texture   = stripe_tex
-			rmat.emission_texture = stripe_tex
-			rmat.emission         = Color(1.0, 1.0, 1.0, 0.0)   # texture drives colour; transparent = no tint
-			rmat.albedo_color     = Color(1.0, 1.0, 1.0, 0.0)
-			rmat_b = null   # texture carries both colours; no separate B material needed
-		var ring := MeshInstance3D.new()
-		var tmesh := TorusMesh.new()
-		tmesh.inner_radius     = radius - tube_r
-		tmesh.outer_radius     = radius + tube_r
-		tmesh.rings            = 12
-		tmesh.ring_segments    = 48
-		ring.mesh              = tmesh
-		ring.rotation_degrees  = Vector3(90.0, 0.0, 0.0)
-		ring.material_override = rmat
-		pivot.add_child(ring)
-	else:
-		var pts: Array = _get_shape_points(shape_id, radius)
-		if rmat_b == null:
-			# Mono — one shape, one material
-			var shape_node: Node3D = _build_shape_node(pts, rmat, tube_r)
-			pivot.add_child(shape_node)
-		else:
-			# Dual — alternating A/B colours across a single ring's segments (no extra geometry)
-			var outer_node: Node3D = _build_shape_node_alternating(pts, rmat, rmat_b, tube_r)
-			pivot.add_child(outer_node)
-
-	if not _texture_dual_circle:
-		_active_halo_mats.append(rmat)
-	if rmat_b != null:
-		_active_halo_mats_b.append(rmat_b)
-
-	# Fade in quickly
-	var rtw_in := _fx_tween_host.create_tween()
-	rtw_in.tween_property(rmat, "albedo_color:a", 0.80, 0.15)
-	if rmat_b != null:
-		var rtw_in_b := _fx_tween_host.create_tween()
-		rtw_in_b.tween_property(rmat_b, "albedo_color:a", 0.70, 0.15)
-
-	# Stay visible until camera clears it, then fade out.
-	# For hold notes (note_dur > 0), add the hold duration so the halo persists
-	# for the full length of the note before fading.
+	# Stay visible until the camera clears the ring, then fade out. For hold notes
+	# (note_dur > 0) add the hold duration so the halo persists for the full note.
 	var cam_behind: float = 4.0
 	if _camera != null:
 		# Approximate camera-to-ring distance along the path direction
-		var to_cam: Vector3 = pivot.position - _camera.global_position
+		var to_cam: Vector3 = ring_pos - _camera.global_position
 		cam_behind = maxf(to_cam.dot(_path_forward_at(ring_pd)), 2.0)
 	var time_to_cam_pass: float = ((ahead + cam_behind) / maxf(player.forward_speed, 1.0)) + 0.10
 	time_to_cam_pass += maxf(0.0, note_dur)   # sustain for the full note length
 
 	var spin_speed: float = randf_range(0.4, 1.2)
 	var spin_dir:   float = 1.0 if randf() > 0.5 else -1.0
-	var spin_tween := _fx_tween_host.create_tween()
-	spin_tween.tween_property(pivot, "rotation_degrees:z",
-		360.0 * spin_dir * spin_speed, time_to_cam_pass + 5.00)
+	# Counter-rotating inner spin for the B ring (visual candy) — hold notes only.
+	var inner_deg: float = (-120.0 * spin_dir) if note_dur > 0.2 else 0.0
+	var inner_s:   float = (note_dur * 0.5)    if note_dur > 0.2 else 0.0
 
-	# If it's a hold note, spawn a counter-rotating inner spin for the B ring (visual candy)
-	if rmat_b != null and note_dur > 0.2:
-		var inner_tween := _fx_tween_host.create_tween()
-		inner_tween.tween_property(pivot, "rotation_degrees:y",
-			-120.0 * spin_dir, note_dur * 0.5)
-
-	var rtw_out := _fx_tween_host.create_tween()
-	rtw_out.tween_interval(time_to_cam_pass)
-	rtw_out.tween_property(rmat, "albedo_color:a", 0.0, 0.18)
-	rtw_out.parallel().tween_property(rmat, "emission_energy_multiplier", 0.0, 0.18)
-	if rmat_b != null:
-		rtw_out.parallel().tween_property(rmat_b, "albedo_color:a", 0.0, 0.22)
-		rtw_out.parallel().tween_property(rmat_b, "emission_energy_multiplier", 0.0, 0.22)
-	rtw_out.tween_callback(func() -> void:
-		_active_halo_mats.erase(rmat)
-		if rmat_b != null:
-			_active_halo_mats_b.erase(rmat_b)
-		pivot.queue_free()
-	)
+	_fx_pool.spawn_halo(ring_pos, _path_y_rot_at(ring_pd),
+		init_col_a, init_col_b, time_to_cam_pass,
+		360.0 * spin_dir * spin_speed, time_to_cam_pass + 5.00,
+		inner_deg, inner_s)
 
 
 ## Spawns a tunnel of halo rings that builds gradually over the hold duration.
@@ -8494,8 +8578,12 @@ func _spawn_hold_tunnel(note_dur: float) -> void:
 		_spawn_halo_ring(note_dur)
 		return
 
-	# One ring roughly every 0.40 s, capped at 8 total.
-	var ring_count: int = mini(1880, maxi(2, int(note_dur / 0.005) + 1))
+	# NOTE: the 0.005 s spacing and 1880 cap below do NOT match the "every 0.40 s,
+	# capped at 8" the comment used to claim — a 2 s hold asks for 401 rings. No
+	# shipped chart reaches it (every beatmap in data/ tops out at dur = 0.10, so
+	# note_dur > 0.25 never fires), but if one ever does, the halo pool caps the
+	# burst at its slot count instead of spawning hundreds of rings.
+	var ring_count: int = mini(WorldFxPool.HALO_SLOTS, maxi(2, int(note_dur / 0.005) + 1))
 	var interval: float = note_dur / float(ring_count)
 
 	# First ring fires immediately.
@@ -8511,29 +8599,6 @@ func _spawn_hold_tunnel(note_dur: float) -> void:
 		tw.tween_callback(func() -> void: _spawn_halo_ring(0.0))
 
 
-## Builds a shape node where alternating segments use mat_odd / mat_even.
-## Used for dual-colour halos — creates a striped neon pattern.
-func _build_shape_node_alternating(pts: Array, mat_odd: StandardMaterial3D,
-		mat_even: StandardMaterial3D, tube_r: float = 0.18) -> Node3D:
-	var root := Node3D.new()
-	var n: int = pts.size()
-	for i in n:
-		var a: Vector2 = pts[i]
-		var b: Vector2 = pts[(i + 1) % n]
-		var seg := MeshInstance3D.new()
-		var bm  := BoxMesh.new()
-		var length: float = a.distance_to(b)
-		var side:   float = tube_r * 2.0
-		bm.size               = Vector3(side, length, side)
-		seg.mesh              = bm
-		seg.material_override = mat_odd if (i % 2 == 0) else mat_even
-		var mid: Vector2 = (a + b) * 0.5
-		seg.position     = Vector3(mid.x, mid.y, 0.0)
-		seg.rotation.z   = atan2(b.y - a.y, b.x - a.x) - PI * 0.5
-		root.add_child(seg)
-	return root
-
-
 func _pulse_world(pass_id: String, note_dur: float = 0.0) -> void:
 	if player == null:
 		return
@@ -8544,79 +8609,46 @@ func _pulse_world(pass_id: String, note_dur: float = 0.0) -> void:
 			_spawn_hold_tunnel(note_dur)
 		else:
 			_spawn_halo_ring(note_dur)
+	if _fx_pool == null:
+		return
 	var vit: float        = _world_vitality
 	var spire_pd_ahead: float = randf_range(0.0, 5.0)
 	var spire_pd: float      = _player_path_dist + spire_pd_ahead
 
-	# ── 1. Rising light spires (both sides) ──────────────────────────────────
+	# ── 1. Rising light spires (both sides) ──────────────────────────
 	# Tall thin columns erupt on both sides of the track, shoot upward,
 	# bloom with light, then dissolve — like ghost pillars rising together.
+	# Both sides get the same colour and energy, so these are hoisted out of the
+	# loop; the pool owns the node, mesh and material for each one.
+	var spire_e: float = lerpf(2.5, 6.0, vit)
+	var bloom_e: float = lerpf(1.8, 4.0, vit)
 	for spire_lat: float in [-7.2, 7.2]:
-		var spire: MeshInstance3D = MeshInstance3D.new()
-		var smesh := BoxMesh.new()
-		smesh.size    = Vector3(0.10, 5.5, 0.10)
-		spire.mesh    = smesh
-		var smat      := StandardMaterial3D.new()
-		smat.albedo_color              = Color(pulse_color.r, pulse_color.g, pulse_color.b, 0.90)
-		smat.emission_enabled          = true
-		smat.emission                  = pulse_color
-		smat.emission_energy_multiplier = lerpf(2.5, 6.0, vit)
-		smat.transparency              = BaseMaterial3D.TRANSPARENCY_ALPHA
-		spire.material_override        = smat
-		spire.position                 = _path_world_pos(spire_pd, spire_lat, -0.8)
-		world_fx_root.add_child(spire)
-		var stw := create_tween()
-		stw.parallel().tween_property(spire, "position:y", 3.2, 0.22)
-		stw.parallel().tween_property(smat, "emission_energy_multiplier", 0.0, 0.75)
-		stw.parallel().tween_property(smat, "albedo_color:a", 0.0, 0.70)
-		stw.tween_callback(spire.queue_free)
+		_fx_pool.spawn_spire(_path_world_pos(spire_pd, spire_lat, -0.8), pulse_color, spire_e)
 		# Light bloom at spire peak
-		var spl := OmniLight3D.new()
-		spl.light_color  = pulse_color
-		spl.light_energy = lerpf(1.8, 4.0, vit)
-		spl.omni_range   = 11.0
-		spl.position     = _path_world_pos(spire_pd, spire_lat, 3.0)
-		world_fx_root.add_child(spl)
-		var spltw := create_tween()
-		spltw.tween_property(spl, "light_energy", 0.0, 0.80)
-		spltw.tween_callback(spl.queue_free)
+		_fx_pool.spawn_fx_light(_path_world_pos(spire_pd, spire_lat, 3.0),
+			pulse_color, bloom_e, 0.80)
 
-	# ── 3. Floating wisps ─────────────────────────────────────────────────────
+	# ── 3. Floating wisps ─────────────────────────────────────
 	# Small glowing orbs drift upward from both track edges like fireflies
 	# stirred by the melody — gives the air a living, musical feel.
-	var wsp_count: int = 5
+	# Count per side is a quality-tier knob (WorldFxPool.wisps_per_side); the
+	# randomised radius now rides on scale over one shared unit sphere instead of
+	# generating a fresh SphereMesh per orb.
+	var wsp_count: int = _fx_pool.wisps_per_side
+	var wisp_e:    float = lerpf(3.0, 7.0, vit)
 	for side in [-4.6, 4.6]:
 		for i in range(wsp_count):
-			var wsp: MeshInstance3D = MeshInstance3D.new()
-			var wsm                 := SphereMesh.new()
-			wsm.radius          = 0.05 + randf() * 0.07
-			wsm.height          = wsm.radius * 2.0
-			wsm.radial_segments = 6
-			wsm.rings           = 3
-			wsp.mesh            = wsm
-			var wmat            := StandardMaterial3D.new()
-			var wc: Color        = pulse_color.lightened(randf() * 0.35)
-			wmat.albedo_color              = Color(wc.r, wc.g, wc.b, 0.92)
-			wmat.emission_enabled          = true
-			wmat.emission                  = wc
-			wmat.emission_energy_multiplier = lerpf(3.0, 7.0, vit)
-			wmat.transparency              = BaseMaterial3D.TRANSPARENCY_ALPHA
-			wsp.material_override          = wmat
-			var z_off: float  = float(i) * 2.0 - 3.0
-			var x_off: float  = side + randf_range(-0.9, 0.9)
-			wsp.position      = _path_world_pos(_player_path_dist + z_off, x_off, 0.2 + randf() * 0.6)
-			world_fx_root.add_child(wsp)
+			var wsp_r: float   = 0.05 + randf() * 0.07
+			var wc: Color      = pulse_color.lightened(randf() * 0.35)
+			var z_off: float   = float(i) * 2.0 - 3.0
+			var x_off: float   = side + randf_range(-0.9, 0.9)
+			var wsp_pos: Vector3 = _path_world_pos(_player_path_dist + z_off, x_off, 0.2 + randf() * 0.6)
 			var dur: float     = 0.55 + randf() * 0.40
 			var rise: float    = 2.0 + randf() * 2.0
 			var drift_x: float = x_off + randf_range(-0.8, 0.8)
-			var wtw := create_tween()
-			wtw.parallel().tween_property(wsp, "position:y", wsp.position.y + rise, dur)
-			wtw.parallel().tween_property(wsp, "position:x", drift_x, dur)
-			wtw.parallel().tween_property(wmat, "emission_energy_multiplier", 0.0, dur * 0.90)
-			wtw.parallel().tween_property(wmat, "albedo_color:a", 0.0, dur * 0.88)
-			wtw.tween_callback(wsp.queue_free)
+			_fx_pool.spawn_wisp(wsp_pos, wsp_r, wc, wisp_e, rise, drift_x, dur)
 
-	# ── 4. Fog colour pulse ───────────────────────────────────────────────────
+	# ── 4. Fog colour pulse ───────────────────────────────────
 	# The world's atmospheric fog briefly absorbs the melody's colour —
 	# a full-scene tint that feels cinematic without cluttering the track.
 	if _melody_env != null:
@@ -8644,8 +8676,8 @@ func _pulse_floor_beat(t_s: float) -> void:
 
 	var vit: float = _world_vitality
 	var pulse_color: Color = Color(1.0, 1.0, 1.0, 1.0)
-	if GameConfig.color_cycle_affects_floor and has_method("_current_cycle_color"):
-		pulse_color = call("_current_cycle_color", t_s)
+	if GameConfig.color_cycle_affects_floor:
+		pulse_color = _current_cycle_color(t_s)
 	pulse_color = pulse_color.lightened(0.10)
 
 	# Floor emission pulse — peak height and decay speed scale with vitality
@@ -8932,7 +8964,7 @@ func _update_gate_visibility() -> void:
 			_gate_animated[i] = true
 			var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
 			if vis != null:
-				var gate_action: String = String(runner_plan[i].get("action", ""))
+				var gate_action: String = gate_actions[i]
 				var atw := create_tween()
 				atw.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_BACK)
 				match gate_action:
@@ -8951,8 +8983,7 @@ func _update_gate_visibility() -> void:
 
 		# Electric zones: pause/resume arc tweens with gate visibility so they
 		# don't burn CPU on gates hundreds of metres from the player.
-		var gate_t_s: float = float(runner_plan[i].get("t", 0.0))
-		if _is_electric_at(gate_t_s):
+		if gate_is_electric[i]:
 			var ev := gate.get_node_or_null("VisRoot") as Node3D
 			if ev != null:
 				ev.process_mode = Node.PROCESS_MODE_INHERIT if should_show \
@@ -9637,6 +9668,49 @@ func _prepare_floor_material() -> void:
 
 	floor_mesh.set_surface_override_material(0, _floor_material)
 
+## Reference rate for _smooth_k. The decoration pass used to step once per
+## RENDERED frame, so on the "max" tier (deco divisor 1) with the project's
+## 120 fps cap every `lerpf(current, target, k)` below ran 120 times a second.
+## Normalising to that rate is what makes the new scheduler preserve the look
+## on max exactly; the lower tiers, which used to converge 2-4x slower purely
+## because their frame divisor was bigger, now match it instead.
+const _SMOOTH_REF_HZ: float = 120.0
+
+## Frame-rate-independent smoothing factor.
+##
+## The decoration pass is full of raw `lerpf(current, target, k)` calls whose k
+## silently assumed "once per frame". That was already wrong before this change
+## — the same scene converged twice as fast at 120 fps as at 60, and slower
+## again on every tier below max — and it would be wrong in a new way now that
+## the pass runs at a tier-chosen rate. This converts the authored per-step k
+## into the equivalent factor for an arbitrary dt, so the world settles at the
+## same wall-clock speed on every machine, every tier and every frame rate.
+func _smooth_k(k: float, dt: float) -> float:
+	return 1.0 - pow(1.0 - k, dt * _SMOOTH_REF_HZ)
+
+
+## Returns the accumulated wall time for `slot` when its visual tick is due this
+## frame, otherwise 0.0. Slots that sit behind an early return (the colour cycle
+## does not run while paused, for instance) simply stop accumulating, so they
+## resume with the right dt rather than a backlog.
+func _visual_tick(slot: int, delta: float) -> float:
+	var acc: float = _tick_accum[slot] + delta
+	if acc < _deco_interval:
+		_tick_accum[slot] = acc
+		return 0.0
+	# Carry the overshoot forward rather than zeroing it. Zeroing threw away
+	# the remainder, so all four accumulators converged to the same phase
+	# within a few cycles and put every pass back on a single frame - exactly
+	# the bunching the stagger exists to prevent. It measured as a bimodal
+	# 95th-percentile process time: fine on runs where they stayed apart,
+	# nearly double on runs where they collapsed together.
+	var rem: float = fmod(acc, _deco_interval)
+	var dt:  float = acc - rem
+	_tick_accum[slot] = rem
+	# A loading hitch must not hand the smoothing a multi-second dt.
+	return minf(dt, 0.25)
+
+
 func _smooth01(x: float) -> float:
 	var y: float = clampf(x, 0.0, 1.0)
 	return y * y * (3.0 - 2.0 * y)
@@ -10030,6 +10104,13 @@ func _spawn_track_decorations() -> void:
 		var lp_glow_col: Color      = Color(1.0, 0.85, 0.5)
 		var lp_pd:       float      = lp_spacing
 		var lp_i:        int        = 0
+		var lp_lamp_mat := StandardMaterial3D.new()
+		lp_lamp_mat.albedo_color               = lp_glow_col
+		lp_lamp_mat.emission_enabled           = true
+		lp_lamp_mat.emission                   = lp_glow_col
+		lp_lamp_mat.emission_energy_multiplier = 8.0
+		_world_track_mats.append(lp_lamp_mat)   # beat-pulse the lamps like the kit/ledges
+		_world_track_base_e.append(8.0)
 		while lp_pd < end_path - 5.0:
 			var lp_anchor := Node3D.new()
 			lp_anchor.position           = _path_world_pos(lp_pd)
@@ -10047,20 +10128,23 @@ func _spawn_track_decorations() -> void:
 				var lamp_mi: MeshInstance3D = c as MeshInstance3D
 				if lamp_mi == null or String(c.name).to_lower().find("lamp") == -1:
 					continue
-				var lamp_mat := StandardMaterial3D.new()
-				lamp_mat.albedo_color               = lp_glow_col
-				lamp_mat.emission_enabled           = true
-				lamp_mat.emission                   = lp_glow_col
-				lamp_mat.emission_energy_multiplier = 8.0
-				lamp_mi.material_override = lamp_mat
-				_world_track_mats.append(lamp_mat)   # beat-pulse the lamp like the kit/ledges
-				_world_track_base_e.append(maxf(0.05, lamp_mat.emission_energy_multiplier))
+				# ONE shared material for every lamp head. The colour and the base
+				# energy are constants, and the beat pulse writes the same value to all
+				# of them, so a per-post material only ever added entries to the
+				# _world_track_mats loop that runs on every visual tick — ~185 of them
+				# on a full-length track, all doing the identical write.
+				lamp_mi.material_override = lp_lamp_mat
 
 				var lp_light := OmniLight3D.new()
 				lp_light.light_color  = lp_glow_col
 				lp_light.light_energy = 3.5
 				lp_light.omni_range   = 11.0
 				lp_light.position     = Vector3(0.0, lp_height * 0.9, 0.0)
+				# One post every 20 m means ~185 of these on a full track. Range is
+				# 11 m and fog hides them long before that, so fade like the rest.
+				lp_light.distance_fade_enabled = true
+				lp_light.distance_fade_begin   = 140.0
+				lp_light.distance_fade_length  = 40.0
 				lp_inst.add_child(lp_light)
 				break
 
@@ -10093,7 +10177,11 @@ func _collect_cycle_mats(node: Node3D) -> Array[StandardMaterial3D]:
 	return out
 
 
-func _update_color_cycle(song_t: float) -> void:
+## dt is the accumulated wall time since the last visual-rate tick (see the
+## scheduler at the top of _process), NOT the frame delta. Every convergence
+## factor below is rate-corrected through _smooth_k() so the world settles at
+## the same speed whatever the tier or the frame rate.
+func _update_color_cycle(song_t: float, dt: float) -> void:
 	# NOTE: no early-return on color_cycle_enabled here — when the toggle is
 	# off, _current_cycle_color() already returns a single static color (the
 	# player's Options pick), and everything below still needs to run once to
@@ -10119,6 +10207,16 @@ func _update_color_cycle(song_t: float) -> void:
 	# Squared beat for a snappier flash that fades fast
 	var beat_boost: float = beat * beat
 
+	# Rate-corrected smoothing factors, resolved once per tick instead of at every
+	# call site. Names carry the original per-step constant.
+	var k04:   float = _smooth_k(0.04, dt)
+	var k05:   float = _smooth_k(0.05, dt)
+	var k06:   float = _smooth_k(0.06, dt)
+	var k15:   float = _smooth_k(0.15, dt)
+	var k18:   float = _smooth_k(0.18, dt)
+	var k20:   float = _smooth_k(0.20, dt)
+	var kgate: float = _smooth_k(color_cycle_gate_blend, dt)
+
 	# Vitality-tinted cycle color — desaturate toward dead_tint at low vitality
 	var live_col: Color = cycle_col.lerp(dead_tint, (1.0 - vit) * 0.70)
 
@@ -10131,9 +10229,9 @@ func _update_color_cycle(song_t: float) -> void:
 		# Velocity eases back toward gentle baseline between beats
 		var v_target: float = lerpf(0.4, 2.2, vit)
 		_spark_ambient_mat.initial_velocity_min = lerpf(
-			_spark_ambient_mat.initial_velocity_min, v_target * 0.25, 0.06)
+			_spark_ambient_mat.initial_velocity_min, v_target * 0.25, k06)
 		_spark_ambient_mat.initial_velocity_max = lerpf(
-			_spark_ambient_mat.initial_velocity_max, v_target, 0.06)
+			_spark_ambient_mat.initial_velocity_max, v_target, k06)
 
 	# ── Gates ────────────────────────────────────────────────────────────────
 	if GameConfig.color_cycle_affects_gates:
@@ -10162,9 +10260,9 @@ func _update_color_cycle(song_t: float) -> void:
 					# excluded via the no_cycle mesh tag in
 					# _collect_cycle_mats, so this never bleeds onto parts
 					# that are meant to stay a fixed dark neutral.
-					mat.albedo_color = mat.albedo_color.lerp(live_col, color_cycle_gate_blend)
+					mat.albedo_color = mat.albedo_color.lerp(live_col, kgate)
 					if mat.emission_enabled:
-						mat.emission = mat.emission.lerp(live_col, color_cycle_gate_blend)
+						mat.emission = mat.emission.lerp(live_col, kgate)
 
 	# ── Grind rail ───────────────────────────────────────────────────────────
 	if GameConfig.color_cycle_affects_rail and color_cycle_enabled:
@@ -10175,8 +10273,8 @@ func _update_color_cycle(song_t: float) -> void:
 			# strong emission to begin with), so unlike gates, tint both
 			# albedo AND emission together here — otherwise the surface and
 			# its own glow would drift out of sync and look like a bug.
-			rmat.albedo_color = rmat.albedo_color.lerp(live_col, color_cycle_gate_blend)
-			rmat.emission     = rmat.emission.lerp(live_col, color_cycle_gate_blend)
+			rmat.albedo_color = rmat.albedo_color.lerp(live_col, kgate)
+			rmat.emission     = rmat.emission.lerp(live_col, kgate)
 
 	# ── Floor ────────────────────────────────────────────────────────────────
 	if _floor_material != null:
@@ -10185,10 +10283,10 @@ func _update_color_cycle(song_t: float) -> void:
 			floor_target = _floor_base_albedo.lerp(live_col, color_cycle_floor_blend)
 		else:
 			floor_target = _floor_base_albedo
-		_floor_material.albedo_color = _floor_material.albedo_color.lerp(floor_target, 0.06)
+		_floor_material.albedo_color = _floor_material.albedo_color.lerp(floor_target, k06)
 		var floor_e: float = lerpf(0.0, 0.65, vit) + beat_boost * 0.30
 		_floor_material.emission_energy_multiplier = lerpf(
-			_floor_material.emission_energy_multiplier, floor_e, 0.18)
+			_floor_material.emission_energy_multiplier, floor_e, k18)
 
 	# ── Authored WJ kit + ledges: beat-reactive emission ─────────────────────
 	# Full (authored energy) on the beat, smoothly dimming toward _TRACK_EMIT_DIM between
@@ -10202,12 +10300,10 @@ func _update_color_cycle(song_t: float) -> void:
 		if tmat != null:
 			tmat.emission_energy_multiplier = _world_track_base_e[ti] * track_pulse
 
-	# ── Decoration LOD — update world dressing every Nth frame ───────────────
-	# N comes from the quality tier (1 on "max", 4 on "low").
-	_lod_frame = (_lod_frame + 1) % _deco_update_divisor
-	if _lod_frame != 0:
-		return
-
+	# The old "update world dressing every Nth FRAME" gate lived here. The whole
+	# function is now behind the wall-clock scheduler in _process, so a second
+	# frame-counted tier on top of it would just make the rate depend on the frame
+	# rate again. Tier density is expressed as deco_update_hz instead.
 	if not GameConfig.color_cycle_affects_world:
 		return   # world deco colour-cycle disabled — keep existing tints
 
@@ -10216,15 +10312,15 @@ func _update_color_cycle(song_t: float) -> void:
 	for smat: StandardMaterial3D in _world_strip_mats:
 		if smat == null:
 			continue
-		smat.emission = smat.emission.lerp(live_col, 0.05)
-		smat.emission_energy_multiplier = lerpf(smat.emission_energy_multiplier, strip_e, 0.15)
+		smat.emission = smat.emission.lerp(live_col, k05)
+		smat.emission_energy_multiplier = lerpf(smat.emission_energy_multiplier, strip_e, k15)
 
 	# ── Floor-edge rails ─────────────────────────────────────────────────────
 	var rail_e: float = lerpf(0.30, 1.4, vit) + beat_boost * 1.0
 	for rmat: StandardMaterial3D in _world_rail_mats:
 		if rmat == null:
 			continue
-		rmat.emission_energy_multiplier = lerpf(rmat.emission_energy_multiplier, rail_e, 0.20)
+		rmat.emission_energy_multiplier = lerpf(rmat.emission_energy_multiplier, rail_e, k20)
 
 	# ── Decoration distance window ───────────────────────────────────────────
 	# Everything below is spread across the entire track but only visible for a
@@ -10248,9 +10344,9 @@ func _update_color_cycle(song_t: float) -> void:
 		var glight: OmniLight3D = _world_gem_lights[gi]
 		if glight == null:
 			continue
-		glight.light_color  = glight.light_color.lerp(live_col, 0.04)
-		glight.light_energy = lerpf(glight.light_energy, gem_e, 0.15)
-		glight.omni_range   = lerpf(glight.omni_range, gem_r, 0.15)
+		glight.light_color  = glight.light_color.lerp(live_col, k04)
+		glight.light_energy = lerpf(glight.light_energy, gem_e, k15)
+		glight.omni_range   = lerpf(glight.omni_range, gem_r, k15)
 
 	# ── Spinning gems / hanging crystals ─────────────────────────────────────
 	# Park the looping spin tweens outside the window. The tweens are bound to
@@ -10287,16 +10383,16 @@ func _update_color_cycle(song_t: float) -> void:
 		var alight: OmniLight3D = _world_arch_lights[ai]
 		if alight == null:
 			continue
-		alight.light_color  = alight.light_color.lerp(live_col, 0.04)
-		alight.light_energy = lerpf(alight.light_energy, arch_e, 0.15)
+		alight.light_color  = alight.light_color.lerp(live_col, k04)
+		alight.light_energy = lerpf(alight.light_energy, arch_e, k15)
 
 	# ── Floor pulse pads ─────────────────────────────────────────────────────────────────────────
 	var pad_e: float = lerpf(0.0, 0.50, vit) + beat_boost * 0.40
 	for pmat: StandardMaterial3D in _world_pad_mats:
 		if pmat == null:
 			continue
-		pmat.emission       = pmat.emission.lerp(live_col, 0.06)
-		pmat.emission_energy_multiplier = lerpf(pmat.emission_energy_multiplier, pad_e, 0.15)
+		pmat.emission       = pmat.emission.lerp(live_col, k06)
+		pmat.emission_energy_multiplier = lerpf(pmat.emission_energy_multiplier, pad_e, k15)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
