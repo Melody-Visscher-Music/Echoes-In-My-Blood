@@ -152,7 +152,7 @@ func _enter_idle() -> void:
 		_body.text = "Tap in sync with what you HEAR — not what you see.\nWorks best with headphones on and eyes closed."
 
 	_hint.text    = "[ENTER]  Calibrate     [R]  Reset to 0     [ESC]  Close"
-	_circle.color = Color(0.06, 0.02, 0.16, 1.0)
+	_set_circle_color(Color(0.35, 0.20, 0.70, 1.0))
 
 
 func _enter_running() -> void:
@@ -219,7 +219,7 @@ func _process(delta: float) -> void:
 
 	# Pulse circle
 	var br: float = 0.12 + _pulse * 0.70
-	_circle.color = Color(br * 0.35, br * 0.10, br, 1.0)
+	_set_circle_color(Color(br * 0.55, br * 0.35, br, 1.0))
 	var sz: float = 140.0 + _pulse * 120.0
 	_circle.custom_minimum_size = Vector2(sz, sz)
 
@@ -369,7 +369,7 @@ func _build_click() -> void:
 # ── UI ────────────────────────────────────────────────────────────────────────
 func _build_ui() -> void:
 	var bg := ColorRect.new()
-	bg.color = Color(0.0, 0.0, 0.05, 0.92)
+	bg.color = Color(0.015, 0.008, 0.045, 0.94)
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	bg.mouse_filter = Control.MOUSE_FILTER_STOP
 	add_child(bg)
@@ -378,20 +378,26 @@ func _build_ui() -> void:
 	centre.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	add_child(centre)
 
-	var col := VBoxContainer.new()
-	col.add_theme_constant_override("separation", 14)
-	col.alignment = BoxContainer.ALIGNMENT_CENTER
-	centre.add_child(col)
+	# This opens over the paused game, so it sits directly next to the pause
+	# plate and has to be built from the same chassis.
+	var card := PlatePanel.create(34, UiStyle.CYAN, 26.0)
+	card.custom_minimum_size = Vector2(720, 0)
+	centre.add_child(card)
 
-	_title = _lbl("", 40, Color(1.0, 0.80, 1.0))
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", 12)
+	col.alignment = BoxContainer.ALIGNMENT_CENTER
+	card.content.add_child(col)
+
+	_title = _lbl("", 30, Color(1.0, 0.80, 1.0), UiStyle.caption(7.0))
 	_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_title)
 
-	_dev_lbl = _lbl("", 14, Color(0.50, 0.50, 0.62))
+	_dev_lbl = _lbl("", 12, Color(0.55, 0.50, 0.68), UiStyle.caption(2.0))
 	_dev_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_dev_lbl)
 
-	_saved_lbl = _lbl("", 16, Color(0.72, 0.72, 0.88))
+	_saved_lbl = _lbl("", 15, UiStyle.CYAN, UiStyle.display(700))
 	_saved_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_saved_lbl)
 
@@ -404,29 +410,55 @@ func _build_ui() -> void:
 	var cw := CenterContainer.new()
 	cw.custom_minimum_size = Vector2(0, 250)
 	col.add_child(cw)
+	# A diamond rather than a plain square: all four corners chamfered by more
+	# than half the size collapses the plate SDF into one.
 	_circle = ColorRect.new()
-	_circle.custom_minimum_size = Vector2(140, 140)
+	_circle.custom_minimum_size = Vector2(150, 150)
+	var cm := ShaderMaterial.new()
+	cm.shader = load("res://shaders/hud_plate.gdshader") as Shader
+	cm.set_shader_parameter("cut_size", 999.0)
+	cm.set_shader_parameter("cut_tl", 1.0); cm.set_shader_parameter("cut_tr", 1.0)
+	cm.set_shader_parameter("cut_br", 1.0); cm.set_shader_parameter("cut_bl", 1.0)
+	cm.set_shader_parameter("grid_amount", 0.0)
+	cm.set_shader_parameter("scan_amount", 0.0)
+	cm.set_shader_parameter("glow_px", 26.0)
+	cm.set_shader_parameter("edge_px", 2.4)
+	_circle.material = cm
+	_circle.resized.connect(func() -> void:
+		cm.set_shader_parameter("rect_size", _circle.size))
 	cw.add_child(_circle)
 
 	# Measurement labels (visible only during RUNNING phase)
-	_count_lbl = _lbl("", 28, Color(0.70, 1.00, 0.75))
+	_count_lbl = _lbl("", 30, Color(0.55, 1.00, 0.70), UiStyle.display(800))
 	_count_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_count_lbl)
 	_measure_nodes.append(_count_lbl)
 
-	_tap_lbl = _lbl("", 18, Color(1.00, 0.90, 0.50))
+	_tap_lbl = _lbl("", 17, UiStyle.GOLD, UiStyle.display(700))
 	_tap_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_tap_lbl)
 	_measure_nodes.append(_tap_lbl)
 
-	_avg_lbl = _lbl("", 18, Color(0.55, 1.00, 0.70))
+	_avg_lbl = _lbl("", 17, Color(0.55, 1.00, 0.70), UiStyle.display(700))
 	_avg_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_avg_lbl)
 	_measure_nodes.append(_avg_lbl)
 
-	_hint = _lbl("", 13, Color(0.45, 0.45, 0.55))
+	_hint = _lbl("", 11, Color(0.55, 0.50, 0.68), UiStyle.caption(2.0))
 	_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_hint)
+
+
+## The pulse used to drive ColorRect.color, which the plate shader ignores — it
+## paints every pixel itself. Route it to the edge colour instead.
+func _set_circle_color(c: Color) -> void:
+	if _circle == null:
+		return
+	var m := _circle.material as ShaderMaterial
+	if m != null:
+		m.set_shader_parameter("edge_color", c)
+		m.set_shader_parameter("edge_color2", c.lightened(0.25))
+		m.set_shader_parameter("fill_color", Color(c.r * 0.18, c.g * 0.12, c.b * 0.30, 0.85))
 
 
 func _set_measure_visible(v: bool) -> void:
@@ -447,9 +479,9 @@ func _is_press(event: InputEvent) -> bool:
 	return false
 
 
-func _lbl(text: String, size: int, col: Color) -> Label:
-	var l := Label.new()
-	l.text = text
-	l.add_theme_font_size_override("font_size", size)
-	l.add_theme_color_override("font_color", col)
-	return l
+## `font` picks the face: tracked caps for headings and hints, Orbitron for the
+## millisecond readouts, body for prose.
+func _lbl(text: String, size: int, col: Color, font: Font = null) -> Label:
+	if font == null:
+		font = UiStyle.body()
+	return UiStyle.label(text, font, size, col)

@@ -22,7 +22,7 @@ extends Control
 # Bump this whenever new piece types/materials are added that should be
 # rewarmed — a bumped version forces every player to redo this once more,
 # even if their quality tier hasn't changed.
-const WARMUP_VERSION: int = 1
+const WARMUP_VERSION: int = 3
 
 const _PATH: String = "user://shader_warmup.cfg"
 
@@ -32,6 +32,25 @@ const _PATH: String = "user://shader_warmup.cfg"
 const _PIECES_PER_FRAME: int = 2
 const _SPACING: float        = 6.0
 const _PER_ROW: int          = 10
+
+# Canvas-item shaders behind the gameplay HUD — see _warm_ui_shaders(). The 3D
+# stage below never touches these, so without warming them here they compile on
+# the first frame of the first level, which is exactly the wrong moment.
+const _UI_SHADERS: Array[String] = [
+	"res://shaders/hud_plate.gdshader",
+	"res://shaders/hud_bar.gdshader",
+	"res://shaders/hud_text.gdshader",
+	"res://shaders/hud_lyric.gdshader",
+]
+
+# Spatial shaders behind the gates, rails and effects. Same reasoning as above,
+# but these need a mesh rather than a rect — see _warm_ui_shaders().
+const _WORLD_SHADERS: Array[String] = [
+	"res://shaders/world/neon_tube.gdshader",
+	"res://shaders/world/neon_panel.gdshader",
+	"res://shaders/world/energy_orb.gdshader",
+	"res://shaders/world/fx_ring.gdshader",
+]
 
 var _bar:    ProgressBar
 var _status: Label
@@ -57,47 +76,54 @@ func _goto_main() -> void:
 
 func _build_ui() -> void:
 	var bg := ColorRect.new()
-	bg.color = Color(0.05, 0.02, 0.09, 1.0)
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	bg.color = UiStyle.INK_DEEP
 	add_child(bg)
 
-	var center := CenterContainer.new()
-	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	add_child(center)
+	var centre := CenterContainer.new()
+	centre.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	add_child(centre)
+
+	# First screen on a cold launch, so it is worth looking like the game.
+	var card := PlatePanel.create(34, UiStyle.VIOLET, 26.0)
+	card.custom_minimum_size = Vector2(620, 0)
+	centre.add_child(card)
 
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", 14)
-	vb.custom_minimum_size = Vector2(480, 0)
-	center.add_child(vb)
+	card.content.add_child(vb)
 
-	var title := Label.new()
-	title.text = "Optimizing for your system…"
+	var title: Label = UiStyle.label("PREPARING", UiStyle.caption(8.0), 26, Color.WHITE)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.add_theme_font_size_override("font_size", 26)
-	title.add_theme_color_override("font_color", Color(1.00, 0.45, 0.72, 1.0))
+	title.self_modulate = UiStyle.signature_color(0.1)
 	vb.add_child(title)
+
+	_status = UiStyle.label("Scanning assets…", UiStyle.body(), 14, Color(0.78, 0.72, 0.95))
+	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(_status)
 
 	_bar = ProgressBar.new()
 	_bar.min_value = 0.0
 	_bar.max_value = 1.0
 	_bar.value     = 0.0
 	_bar.show_percentage = false
-	_bar.custom_minimum_size = Vector2(0, 18)
+	_bar.custom_minimum_size = Vector2(0, 16)
+	var track := StyleBoxFlat.new()
+	track.bg_color = Color(0.05, 0.02, 0.10, 0.9)
+	track.corner_radius_top_left = 3; track.corner_radius_top_right = 3
+	track.corner_radius_bottom_left = 3; track.corner_radius_bottom_right = 3
+	_bar.add_theme_stylebox_override("background", track)
+	var fill := StyleBoxFlat.new()
+	fill.bg_color = UiStyle.PINK
+	fill.corner_radius_top_left = 3; fill.corner_radius_top_right = 3
+	fill.corner_radius_bottom_left = 3; fill.corner_radius_bottom_right = 3
+	_bar.add_theme_stylebox_override("fill", fill)
 	vb.add_child(_bar)
 
-	_status = Label.new()
-	_status.text = "Preparing…"
-	_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_status.add_theme_font_size_override("font_size", 14)
-	_status.add_theme_color_override("font_color", Color(0.80, 0.70, 1.00, 0.85))
-	vb.add_child(_status)
-
-	var sub := Label.new()
-	sub.text = "One-time setup — this won't run again unless graphics settings change."
+	var sub: Label = UiStyle.label(
+		"ONE-TIME SETUP  \u00b7  KEEPS THE FIRST LEVEL SMOOTH",
+		UiStyle.caption(2.5), 10, Color(0.55, 0.50, 0.70))
 	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	sub.add_theme_font_size_override("font_size", 12)
-	sub.add_theme_color_override("font_color", Color(0.55, 0.55, 0.65, 0.85))
 	vb.add_child(sub)
 
 
@@ -182,6 +208,8 @@ func _run_warmup(key: String) -> void:
 
 	lib.clear()
 
+	await _warm_ui_shaders()
+
 	# A few extra frames with everything now staged, so the renderer has
 	# time to actually submit draw calls for all of it and the driver has
 	# time to finish compiling before we tear the stage down.
@@ -189,6 +217,52 @@ func _run_warmup(key: String) -> void:
 		await get_tree().process_frame
 
 	_finish(key)
+
+
+## Stages one nearly-transparent rect per HUD shader for a couple of frames.
+## The rects still get submitted as draw calls, which is what makes the driver
+## compile each permutation — but at 0.4 % alpha behind the warm-up UI, nothing
+## of them is visible.
+func _warm_ui_shaders() -> void:
+	var cl := CanvasLayer.new()
+	cl.layer = -100
+	add_child(cl)
+	for path in _UI_SHADERS:
+		var sh: Shader = load(path) as Shader
+		if sh == null:
+			continue
+		var r := ColorRect.new()
+		r.color        = Color.WHITE
+		r.size         = Vector2(64, 64)
+		r.modulate     = Color(1.0, 1.0, 1.0, 0.004)
+		r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var m := ShaderMaterial.new()
+		m.shader = sh
+		r.material = m
+		cl.add_child(r)
+	# Spatial shaders need real geometry in the 3D stage, not a CanvasLayer rect.
+	# Tucked behind the camera's near plane and tiny, so they cost a pipeline
+	# compile and nothing else.
+	var world_root := Node3D.new()
+	world_root.position = Vector3(0.0, -400.0, 0.0)
+	_stage.add_child(world_root)
+	for wpath in _WORLD_SHADERS:
+		var wsh: Shader = load(wpath) as Shader
+		if wsh == null:
+			continue
+		var mi := MeshInstance3D.new()
+		var bm := BoxMesh.new()
+		bm.size = Vector3(0.2, 0.2, 0.2)
+		mi.mesh = bm
+		var wm := ShaderMaterial.new()
+		wm.shader = wsh
+		mi.material_override = wm
+		world_root.add_child(mi)
+
+	await get_tree().process_frame
+	await get_tree().process_frame
+	cl.queue_free()
+	world_root.queue_free()
 
 
 func _finish(key: String) -> void:

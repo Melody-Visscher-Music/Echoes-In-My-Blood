@@ -16,8 +16,10 @@
 ##   - Meshes are shared unit primitives (a 1 m cube and a 1 m sphere) and the
 ##     per-instance size lives in scale, which is geometrically identical to
 ##     baking it into a fresh BoxMesh / SphereMesh.
-##   - Each pooled node owns ONE StandardMaterial3D for its whole life; arming it
-##     writes colour / energy fields instead of constructing a new material.
+##   - Each pooled node owns ONE ShaderMaterial for its whole life; arming it
+##     writes uniforms instead of constructing a new material. Because uniforms
+##     are not properties, the fade tweens go through _tw_param rather than
+##     tween_property.
 ##   - Halo ring geometry is built once per slot from GameConfig's halo shape and
 ##     size, which cannot change mid-run.
 ##   - The dual-colour halo stripe texture (a 256x1 Image built pixel-by-pixel in
@@ -55,7 +57,7 @@ var _halo_torus:  TorusMesh  = null   # built once from GameConfig.halo_size
 
 # ── Spires ────────────────────────────────────────────────────────────────────
 var _spire_nodes: Array[MeshInstance3D]      = []
-var _spire_mats:  Array[StandardMaterial3D]  = []
+var _spire_mats:  Array[ShaderMaterial]  = []
 var _spire_tws:   Array[Tween]               = []
 var _spire_busy:  Array[bool]                = []
 var _spire_cur:   int = 0
@@ -68,15 +70,15 @@ var _light_cur:   int = 0
 
 # ── Wisps ─────────────────────────────────────────────────────────────────────
 var _wisp_nodes: Array[MeshInstance3D]     = []
-var _wisp_mats:  Array[StandardMaterial3D] = []
+var _wisp_mats:  Array[ShaderMaterial] = []
 var _wisp_tws:   Array[Tween]              = []
 var _wisp_busy:  Array[bool]               = []
 var _wisp_cur:   int = 0
 
 # ── Halo rings ────────────────────────────────────────────────────────────────
 var _halo_pivots: Array[Node3D]              = []
-var _halo_mats_a: Array[StandardMaterial3D]  = []
-var _halo_mats_b: Array[StandardMaterial3D]  = []   # entries may be null (mono)
+var _halo_mats_a: Array[ShaderMaterial]  = []
+var _halo_mats_b: Array[ShaderMaterial]  = []   # entries may be null (mono)
 var _halo_tws:    Array[Tween]               = []   # fade-in / fade-out chain
 var _halo_spins:  Array[Tween]               = []   # pivot spin
 var _halo_busy:   Array[bool]                = []
@@ -124,13 +126,32 @@ func setup(fx_root: Node3D, tween_host: Node, shape_pts: Array,
 	_build_halos(shape_pts, halo_radius, halo_tube_r, dual_color)
 
 
-## Shared material factory — every pooled FX material is built the same way and
-## then only ever has its colour fields rewritten.
-func _fx_material() -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.emission_enabled = true
-	m.transparency     = BaseMaterial3D.TRANSPARENCY_ALPHA
+## Shared material factories. Every pooled FX material is built once here and
+## then only ever has its uniforms rewritten.
+##
+## These are ShaderMaterials now, which is why the fade tweens below go through
+## _tw_param instead of tween_property: a uniform is not a property, so
+## tween_property("albedo_color:a") has nothing to bind to.
+func _fx_beam_material() -> ShaderMaterial:
+	# Spires are light columns, so fx_ring's additive, unshaded, depth-write-free
+	# pass is exactly right — same reasoning the old StandardMaterial3D used
+	# SHADING_MODE_UNSHADED + BLEND_MODE_ADD.
+	var m: ShaderMaterial = NeonMat.ring(Color.WHITE, 4.0)
+	m.set_shader_parameter("band_amount", 0.0)   # no travelling band on a column
 	return m
+
+
+func _fx_orb_material() -> ShaderMaterial:
+	return NeonMat.orb(Color.WHITE, 4.0)
+
+
+## Tweens a shader uniform. The material is a Resource, so capturing it in the
+## lambda is safe — unlike capturing a node, which the pool may recycle.
+func _tw_param(tw: Tween, mat: ShaderMaterial, pname: String,
+		from_v: float, to_v: float, dur: float, parallel: bool = true) -> void:
+	var t: Tween = tw.parallel() if parallel else tw
+	t.tween_method(func(v: float) -> void:
+		mat.set_shader_parameter(pname, v), from_v, to_v, dur)
 
 
 ## Returns the next slot index, force-releasing it first if it is still in
@@ -155,7 +176,7 @@ func _new_tween() -> Tween:
 
 func _build_spires() -> void:
 	for i in range(SPIRE_SLOTS):
-		var mat: StandardMaterial3D = _fx_material()
+		var mat: ShaderMaterial = _fx_beam_material()
 		var mi := MeshInstance3D.new()
 		mi.mesh              = _unit_box
 		mi.scale             = Vector3(0.10, 5.5, 0.10)   # was BoxMesh.size
@@ -176,10 +197,10 @@ func spawn_spire(pos: Vector3, col: Color, energy: float) -> void:
 	var i: int = _next_slot(_spire_busy, _spire_cur, _spire_tws)
 	_spire_cur = i + 1
 
-	var mat: StandardMaterial3D = _spire_mats[i]
-	mat.albedo_color               = Color(col.r, col.g, col.b, 0.90)
-	mat.emission                   = col
-	mat.emission_energy_multiplier = energy
+	var mat: ShaderMaterial = _spire_mats[i]
+	NeonMat.set_tint(mat, col)
+	NeonMat.set_energy(mat, energy)
+	mat.set_shader_parameter("alpha", 0.90)
 
 	var mi: MeshInstance3D = _spire_nodes[i]
 	mi.position = pos
@@ -188,8 +209,8 @@ func spawn_spire(pos: Vector3, col: Color, energy: float) -> void:
 
 	var tw: Tween = _new_tween()
 	tw.parallel().tween_property(mi,  "position:y", 3.2, 0.22)
-	tw.parallel().tween_property(mat, "emission_energy_multiplier", 0.0, 0.75)
-	tw.parallel().tween_property(mat, "albedo_color:a", 0.0, 0.70)
+	_tw_param(tw, mat, "energy", energy, 0.0, 0.75)
+	_tw_param(tw, mat, "alpha",  0.90,   0.0, 0.70)
 	tw.tween_callback(func() -> void:
 		mi.visible = false
 		_spire_busy[i] = false
@@ -241,7 +262,7 @@ func spawn_fx_light(pos: Vector3, col: Color, energy: float, fade_s: float) -> v
 
 func _build_wisps() -> void:
 	for i in range(WISP_SLOTS):
-		var mat: StandardMaterial3D = _fx_material()
+		var mat: ShaderMaterial = _fx_orb_material()
 		var mi := MeshInstance3D.new()
 		mi.mesh              = _unit_sphere
 		mi.material_override = mat
@@ -263,10 +284,10 @@ func spawn_wisp(pos: Vector3, radius: float, col: Color, energy: float,
 	var i: int = _next_slot(_wisp_busy, _wisp_cur, _wisp_tws)
 	_wisp_cur = i + 1
 
-	var mat: StandardMaterial3D = _wisp_mats[i]
-	mat.albedo_color               = Color(col.r, col.g, col.b, 0.92)
-	mat.emission                   = col
-	mat.emission_energy_multiplier = energy
+	var mat: ShaderMaterial = _wisp_mats[i]
+	NeonMat.set_tint(mat, col)
+	NeonMat.set_energy(mat, energy)
+	mat.set_shader_parameter("alpha", 0.92)
 
 	var mi: MeshInstance3D = _wisp_nodes[i]
 	mi.position = pos
@@ -277,8 +298,8 @@ func spawn_wisp(pos: Vector3, radius: float, col: Color, energy: float,
 	var tw: Tween = _new_tween()
 	tw.parallel().tween_property(mi,  "position:y", pos.y + rise, dur)
 	tw.parallel().tween_property(mi,  "position:x", drift_x, dur)
-	tw.parallel().tween_property(mat, "emission_energy_multiplier", 0.0, dur * 0.90)
-	tw.parallel().tween_property(mat, "albedo_color:a", 0.0, dur * 0.88)
+	_tw_param(tw, mat, "energy", energy, 0.0, dur * 0.90)
+	_tw_param(tw, mat, "alpha",  0.92,   0.0, dur * 0.88)
 	tw.tween_callback(func() -> void:
 		mi.visible = false
 		_wisp_busy[i] = false
@@ -307,8 +328,8 @@ func _build_halos(shape_pts: Array, radius: float, tube_r: float, dual_color: bo
 		pivot.visible = false
 		_fx_root.add_child(pivot)
 
-		var mat_a: StandardMaterial3D = _halo_material()
-		var mat_b: StandardMaterial3D = null
+		var mat_a: ShaderMaterial = _halo_material()
+		var mat_b: ShaderMaterial = null
 
 		if shape_pts.is_empty():
 			# Circle. Dual colour is baked into a stripe texture on ONE ring
@@ -331,27 +352,22 @@ func _build_halos(shape_pts: Array, radius: float, tube_r: float, dual_color: bo
 		_halo_busy.append(false)
 
 
-func _halo_material() -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.emission_enabled           = true
-	m.emission_energy_multiplier = 4.0
-	m.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
-	# Pure glow rings, not lit geometry: unshaded skips the PBR lighting model
-	# (SSAO / SSR / shadow lookups per fragment) and additive composites cheaper
-	# than alpha-over for hundreds of overlapping transparent rings — and needs
-	# no back-to-front sort order to look right. TRANSPARENCY_ALPHA is still
-	# required to land in the transparent pass at all; albedo alpha is what the
-	# fade tweens drive.
-	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	m.blend_mode   = BaseMaterial3D.BLEND_MODE_ADD
+## Pure glow rings, not lit geometry. fx_ring declares
+## `blend_add, unshaded, depth_draw_never` in its render_mode, which is the same
+## bargain the old StandardMaterial3D struck by hand: skip the PBR lighting
+## model (no SSAO / SSR / shadow lookup per fragment) and composite additively,
+## so hundreds of overlapping rings need no back-to-front sort to look right.
+func _halo_material() -> ShaderMaterial:
+	var m: ShaderMaterial = NeonMat.ring(Color.WHITE, 4.0)
+	m.set_shader_parameter("alpha", 0.0)
 	return m
 
 
 ## Traces a closed outline through pts using the shared unit cube, one child per
 ## edge. When mat_even is non-null the edges alternate materials, giving the
 ## striped dual-colour look.
-func _build_shape_segments(root: Node3D, pts: Array, mat_odd: StandardMaterial3D,
-		mat_even: StandardMaterial3D, tube_r: float) -> void:
+func _build_shape_segments(root: Node3D, pts: Array, mat_odd: ShaderMaterial,
+		mat_even: ShaderMaterial, tube_r: float) -> void:
 	var n: int = pts.size()
 	var side: float = tube_r * 2.0
 	for i in n:
@@ -381,25 +397,24 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 		old_spin.kill()
 	_halo_cur = i + 1
 
-	var mat_a: StandardMaterial3D = _halo_mats_a[i]
-	var mat_b: StandardMaterial3D = _halo_mats_b[i]
+	var mat_a: ShaderMaterial = _halo_mats_a[i]
+	var mat_b: ShaderMaterial = _halo_mats_b[i]
 
 	if _halo_textured:
-		var tex: ImageTexture = _stripe_texture(col_a, col_b)
-		mat_a.albedo_texture   = tex
-		mat_a.emission_texture = tex
-		# Texture carries both colours; a transparent tint means "no tint".
-		mat_a.emission     = Color(1.0, 1.0, 1.0, 0.0)
-		mat_a.albedo_color = Color(1.0, 1.0, 1.0, 0.0)
+		# The stripe texture carries both colours; use_tex makes the shader read
+		# it instead of the flat tint.
+		mat_a.set_shader_parameter("stripe_tex", _stripe_texture(col_a, col_b))
+		mat_a.set_shader_parameter("use_tex", true)
 	else:
-		mat_a.emission     = col_a
-		mat_a.albedo_color = Color(col_a.r, col_a.g, col_a.b, 0.0)
-	mat_a.emission_energy_multiplier = 4.0
+		mat_a.set_shader_parameter("use_tex", false)
+		NeonMat.set_tint(mat_a, col_a)
+	NeonMat.set_energy(mat_a, 4.0)
+	mat_a.set_shader_parameter("alpha", 0.0)
 
 	if mat_b != null:
-		mat_b.emission                   = col_b
-		mat_b.albedo_color               = Color(col_b.r, col_b.g, col_b.b, 0.0)
-		mat_b.emission_energy_multiplier = 4.0
+		NeonMat.set_tint(mat_b, col_b)
+		NeonMat.set_energy(mat_b, 4.0)
+		mat_b.set_shader_parameter("alpha", 0.0)
 
 	var pivot: Node3D = _halo_pivots[i]
 	pivot.position         = pos
@@ -408,9 +423,9 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 	_halo_busy[i] = true
 
 	var tw_in: Tween = _new_tween()
-	tw_in.tween_property(mat_a, "albedo_color:a", 0.80, 0.15)
+	_tw_param(tw_in, mat_a, "alpha", 0.0, 0.80, 0.15, false)
 	if mat_b != null:
-		tw_in.parallel().tween_property(mat_b, "albedo_color:a", 0.70, 0.15)
+		_tw_param(tw_in, mat_b, "alpha", 0.0, 0.70, 0.15)
 
 	var spin: Tween = _new_tween()
 	spin.tween_property(pivot, "rotation_degrees:z", spin_deg, spin_s)
@@ -421,11 +436,11 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 
 	var tw_out: Tween = _new_tween()
 	tw_out.tween_interval(life_s)
-	tw_out.tween_property(mat_a, "albedo_color:a", 0.0, 0.18)
-	tw_out.parallel().tween_property(mat_a, "emission_energy_multiplier", 0.0, 0.18)
+	_tw_param(tw_out, mat_a, "alpha",  0.80, 0.0, 0.18, false)
+	_tw_param(tw_out, mat_a, "energy", 4.0,  0.0, 0.18)
 	if mat_b != null:
-		tw_out.parallel().tween_property(mat_b, "albedo_color:a", 0.0, 0.22)
-		tw_out.parallel().tween_property(mat_b, "emission_energy_multiplier", 0.0, 0.22)
+		_tw_param(tw_out, mat_b, "alpha",  0.70, 0.0, 0.22)
+		_tw_param(tw_out, mat_b, "energy", 4.0,  0.0, 0.22)
 	tw_out.tween_callback(func() -> void:
 		pivot.visible = false
 		_halo_busy[i] = false
@@ -446,13 +461,11 @@ func update_halo_colors(col_a: Color, col_b: Color) -> void:
 	for i in range(_halo_pivots.size()):
 		if not _halo_busy[i]:
 			continue
-		var ma: StandardMaterial3D = _halo_mats_a[i]
-		ma.albedo_color = Color(col_a.r, col_a.g, col_a.b, ma.albedo_color.a)
-		ma.emission     = col_a
-		var mb: StandardMaterial3D = _halo_mats_b[i]
+		# Alpha is a separate uniform now, so retinting cannot disturb the fade.
+		NeonMat.set_tint(_halo_mats_a[i], col_a)
+		var mb: ShaderMaterial = _halo_mats_b[i]
 		if mb != null:
-			mb.albedo_color = Color(col_b.r, col_b.g, col_b.b, mb.albedo_color.a)
-			mb.emission     = col_b
+			NeonMat.set_tint(mb, col_b)
 
 
 ## 256x1 alternating-stripe texture for dual-colour circle halos. Rebuilt only

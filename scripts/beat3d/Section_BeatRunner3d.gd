@@ -57,9 +57,10 @@ extends Node3D
 
 var _song_finish_pending: bool = false
 var _end_screen_active:  bool  = false
-var _end_screen_sel:     int   = 0     # 0 = play again, 1 = song select
-var _end_lbl_again:      Label = null
-var _end_lbl_select:     Label = null
+var _end_screen_sel:     int   = 0     # 0 = play again, 1 = song select, 2 = main menu
+# Held as a list rather than one var per pill: the navigation used to toggle with
+# `1 - _end_screen_sel`, which silently cannot reach a third option.
+var _end_nav_labels:     Array[PlateButton] = []
 var _gameplay_pulse_index: int = 0
 var _runner_avg_beat_s: float = 0.5
 
@@ -98,54 +99,23 @@ var _combo:      int   = 0
 var _max_combo:  int   = 0   # highest combo reached this run
 var _gates_hit:  int   = 0   # total notes hit
 var _gates_missed: int = 0   # total notes missed
-var _health_pct: float = 0.50   # 0.0 – 1.0, starts at 50 %
+# Starts at 25 %. This used to have three different answers: the declaration
+# said 0.50, _create_hud() overwrote it with 0.25 at runtime, and the HP readout
+# was built with a hardcoded "50%" placeholder string.
+var _health_pct: float = 0.25   # 0.0 – 1.0
 
-var _hud_score_label:   Label     = null
-var _hud_score_cap:     Label     = null   # "SCORE" caption — rainbow-cycled with the number
-var _hud_combo_label:   Label     = null
-var _hud_score_group:   Control   = null   # score+combo card — fades to a low-profile idle
-											# opacity when nothing's happening, snaps back on
-											# a hit/miss, so it stays out of the way of the lanes
-var _hud_score_idle_tw: Tween     = null
-var _hud_score_card:    Panel     = null   # rainbow-cycled border/glow (Meeko's "echoes")
-var _hud_score_prev:    int       = 0      # last displayed score — lets us pop up "+N" and detect increases
-var _hud_score_flash_tw: Tween    = null   # brightness pulse on the number itself
-var _hud_score_card_w:  float     = 0.0    # cached card geometry — reused to place "+N" popups
-var _hud_score_card_m:  float     = 0.0
-var _hud_hp_label:      Label     = null   # "HP" caption
-var _hud_hp_pct_label:  Label     = null   # "72%" readout — stored directly (was find_child())
-var _hud_hp_group:      Control   = null
-var _hud_hp_bar_w:      float     = 0.0    # single source of truth for the bar's pixel width
-var _hud_hp_bar_h:      float     = 16.0   # ditto for height (drives the pill corner radius)
-var _hud_hp_fill_tw:    Tween     = null   # smooth width slide on damage/heal
-var _hud_hp_displayed_pct: float  = 0.25   # the value currently being animated toward/from —
-											# lets a new hit/miss retarget mid-slide smoothly
-var _hud_hp_pulse_tw:   Tween     = null   # looping low-HP warning pulse; only runs while critical
-var _hud_rainbow_hue:   float     = 0.0    # drives the ever-shifting "echoes" colour cycle (score
-											# card + progress bar — smooth continuous drift)
-var _hud_prog_cap:      ColorRect = null   # song-progress bar's leading-edge glow cap
-
-# HP bar: one continuous pill-shaped bar. Colour drifts smoothly (see
-# _update_hud_hp_color) — same cycle as the score card, same speed, reverse
-# direction. (Built on "N flush zones" machinery from an earlier multi-colour
-# version — set _HUD_HP_SEGMENTS back above 1 to bring that back.)
-const _HUD_HP_SEGMENTS:  int   = 1
-var _hud_hp_seg_w:       float          = 0.0   # pixel width of one segment
-var _hud_hp_seg_tracks:  Array[Panel]   = []
-var _hud_hp_seg_fills:   Array[Panel]   = []
-var _hud_hp_lightning:   Array[ColorRect] = []   # electric-arc overlay, one per fill segment
-var _hud_electric_shader_cache: Shader = null   # built once, shared by every bolt overlay
-# Live-mutated HUD styleboxes. The rainbow chrome recolours these EVERY frame;
-# building fresh StyleBoxFlat objects and re-running add_theme_stylebox_override
-# each time meant three allocations plus three theme-changed invalidations (and
-# the re-layout they drag along) per frame, forever. Installing them once and
-# then just writing the colour fields is visually identical — StyleBox emits
-# `changed`, which queues a redraw and nothing else.
-var _hud_card_sb:      StyleBoxFlat = null
-var _hud_hp_track_sbs: Array[StyleBoxFlat] = []
-var _hud_hp_fill_sbs:  Array[StyleBoxFlat] = []
-var _hud_flash:         ColorRect = null
-var _hud_wj_label:      Label     = null   # "WALL JUMP ×2!" flash label
+# ── HUD ─────────────────────────────────────────────────────────────────────────
+# The gameplay HUD lives in scripts/ui/GameHud.gd — it used to be ~300 lines of
+# Label.new()/Panel.new() right here, in Godot's default font. This script now
+# only drives it.
+#
+# _hud_flash is kept as its own handle because the pause menu, death screen,
+# results panel and dev toast all reach their parent Control through
+# _hud_flash.get_parent(). New code should call _hud.overlay_root() instead.
+var _hud:              GameHud   = null
+var _hud_flash:        ColorRect = null
+var _hud_score_prev:   int       = 0     # last score shown — lets us detect an increase
+var _hud_rainbow_hue:  float     = 0.0   # phase along UiStyle's signature colour band
 
 # 3D speed streaks — elongated particles that rush past the player at high combo
 var _speed_streaks:     GPUParticles3D          = null
@@ -181,7 +151,7 @@ var _warmup_done:      bool   = false      # set true once _warmup_shader_precom
 # awaits a frame between build stages and shows progress here instead.
 var _loading_layer: CanvasLayer = null
 var _loading_label: Label       = null
-var _loading_bar:   ProgressBar = null
+var _loading_bar_rect: ColorRect = null   # shader meter, same component as the HUD's
 
 # ── Pause state ───────────────────────────────────────────────────────────────
 var _paused: bool = false
@@ -189,6 +159,7 @@ var _paused: bool = false
 var _pause_canvas: CanvasLayer  = null
 var _pause_root:   Control      = null
 var _pause_option: int          = 0       # 0 = RESUME, 1 = RESTART, 2 = MAIN MENU, 3 = SONG SELECT
+var _pause_buttons: Array[PlateButton] = []   # index matches _PAUSE_OPTIONS
 
 # ── Gate spawn animation ──────────────────────────────────────────────────────
 var _gate_animated: Array[bool] = []      # true once the gate's intro tween has fired
@@ -214,8 +185,8 @@ var _electric_zones:   Array[Dictionary] = []  # [{start_t, end_t}] seconds; emp
 
 # ── Electric theme ────────────────────────────────────────────────────────────
 @warning_ignore("unused_private_class_variable")
-var _elec_obs_mats:   Array[StandardMaterial3D] = []   # obstacle arc meshes — pulse hard
-var _elec_env_mats:   Array[StandardMaterial3D] = []   # pylon tip glows — pulse subtly
+var _elec_obs_mats:   Array[Material] = []   # obstacle arc meshes — pulse hard
+var _elec_env_mats:   Array[Material] = []   # pylon tip glows — pulse subtly
 # Arc spark lights, one per electric gate arc. There are ~500 of these on a
 # fully electric chart and the pulse used to write light_energy on every single
 # one every tick, including the hundreds sitting kilometres away behind the fog.
@@ -380,13 +351,7 @@ var _turn_is_right:     Array[bool]    = []   # true = right turn; used by banki
 var _arc_fx_cursor:     int            = 0
 
 # ── HUD progress ─────────────────────────────────────────────────────────────
-var _hud_progress_fill: ColorRect = null
 var _song_total_duration: float   = 0.0
-# Viewport size, cached and refreshed from the viewport's own size_changed
-# signal. _update_hud_progress, _update_lyrics and _hud_s() each used to call
-# get_viewport().get_visible_rect() every frame for a value that changes only
-# when the window is resized.
-var _vp_size: Vector2 = Vector2(1920, 1080)
 
 # ── SFX ──────────────────────────────────────────────────────────────────────
 var _sfx_miss: AudioStreamPlayer = null
@@ -429,7 +394,7 @@ var _charge_root:         Node3D    = null    # parent for hoop meshes
 var _charge_last_held:    bool      = false   # previous-frame hold state (release edge detect)
 var _charge_release_t:    float     = -1.0    # song-time of the most recent hold release
 var _charge_mult_timer:   float     = 0.0     # seconds the ×100 window has left
-var _hud_charge_label:    Label     = null
+var _charge_mult_total:   float     = 0.0     # its full length, so the HUD can show it draining
 
 const _CHARGE_LEAD_S:       float = 2.5    # spawn the tunnel this many seconds early (preview)
 const _CHARGE_HOOP_SPACING: float = 4.0    # metres between hoops
@@ -451,7 +416,7 @@ var _grind_rail_active:  bool      = false
 var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
-var _grind_rail_mats:    Array[StandardMaterial3D] = []   # rebuilt each segment; colored by GameConfig.level_color_rail, cycle-overridable
+var _grind_rail_mats:    Array[Material] = []   # colored by GameConfig.level_color_rail, cycle-overridable
 
 # Spark nodes for the active segment (rebuilt on each segment entry)
 var _spark_nodes:       Array[Node3D] = []
@@ -477,15 +442,11 @@ var _grind_flow_mult:   int  = 1
 var _grind_miss_streak: int  = 0
 var _grind_failed:      bool = false
 
-# HUD
-var _hud_grind_label: Label = null
 
 # ── Lyrics (on-screen, synced; fixed bottom-of-screen position) ───────────────
 var _lyrics:            Array[Dictionary] = []    # [{mode,t_start,t_end,words:[{t,w}],text}]
-var _lyrics_hud:        HBoxContainer     = null  # word row, anchored to bottom centre
 var _lyrics_active_idx: int               = -1
 var _lyrics_revealed:   int               = 0
-var _lyrics_slide_off:  float             = 0.0   # vertical entrance offset, tweens to 0
 var _lyric_font:        Font              = null  # randomly chosen each run from res://fonts/
 const _LYRICS_HOLD_S:   float             = 1.1   # how long a finished line lingers on screen
 const _LYRIC_COLORS: Array[Color] = [
@@ -554,6 +515,8 @@ func _apply_beatmap_lyric_font(d: Dictionary) -> void:
 	var path := "res://fonts/" + choice
 	if ResourceLoader.exists(path):
 		_lyric_font = load(path)
+		if _hud != null:
+			_hud.set_lyric_font(_lyric_font)
 
 
 func _pick_random_lyric_font() -> void:
@@ -584,14 +547,16 @@ func _ready() -> void:
 
 	# Apply user settings before any world/material setup
 	_pick_random_lyric_font()
-	_refresh_vp_size()
-	var _vp: Viewport = get_viewport()
-	if _vp != null and not _vp.size_changed.is_connected(_refresh_vp_size):
-		_vp.size_changed.connect(_refresh_vp_size)
+	# World shaders strip their optional terms on the cheaper tiers. Set before
+	# any material is built so nothing is created at the wrong detail level.
+	NeonMat.clear_cache()
+	var _tier_idx: int = GraphicsQuality.TIERS.find(GraphicsQuality.tier)
+	NeonMat.set_detail(clampf(float(_tier_idx), 0.0, 2.0))
 	_fx_tween_host = Node.new()
 	_fx_tween_host.name = "FxTweenHost"
 	add_child(_fx_tween_host)
 	_build_fx_pool()
+	_build_echo_pool()
 	# Pull the tier's CPU-cost knobs before anything spawns — decoration density
 	# is baked in at build time, so these have to be read before the spawners run.
 	_deco_interval        = 1.0 / maxf(1.0, float(GraphicsQuality.get_setting("deco_update_hz", 30)))
@@ -689,6 +654,8 @@ func _build_loading_ui() -> void:
 	_loading_layer.name  = "LoadingLayer"
 	add_child(_loading_layer)
 
+	var s: float = UiStyle.scale_for(_vp())
+
 	var root := Control.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -696,33 +663,52 @@ func _build_loading_ui() -> void:
 
 	var bg := ColorRect.new()
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	bg.color = Color(0.05, 0.02, 0.09, 1.0)
+	bg.color = UiStyle.INK_DEEP
 	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(bg)
 
 	var center := CenterContainer.new()
 	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(center)
 
-	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", 12)
-	vb.custom_minimum_size = Vector2(420, 0)
-	center.add_child(vb)
+	# This is the first thing seen on entering a level, so it sets the tone for
+	# everything after it.
+	var card := PlatePanel.create(int(30 * s), UiStyle.VIOLET, 24.0 * s)
+	card.custom_minimum_size = Vector2(560 * s, 0)
+	center.add_child(card)
 
-	_loading_label = Label.new()
-	_loading_label.text = "Loading level…"
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(14 * s))
+	vb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(vb)
+
+	_loading_label = UiStyle.label("LOADING LEVEL", UiStyle.caption(5.0), int(16 * s), Color.WHITE)
 	_loading_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_loading_label.add_theme_font_size_override("font_size", 20)
-	_loading_label.add_theme_color_override("font_color", Color(0.80, 0.70, 1.00, 0.9))
+	_loading_label.self_modulate = Color(0.82, 0.72, 1.00, 0.95)
 	vb.add_child(_loading_label)
 
-	_loading_bar = ProgressBar.new()
-	_loading_bar.min_value = 0.0
-	_loading_bar.max_value = 1.0
-	_loading_bar.value     = 0.0
-	_loading_bar.show_percentage = false
-	_loading_bar.custom_minimum_size = Vector2(0, 14)
-	vb.add_child(_loading_bar)
+	# A shader bar rather than a themed ProgressBar, so the loading meter and the
+	# in-level HP/charge meters are visibly the same component.
+	_loading_bar_rect = ColorRect.new()
+	_loading_bar_rect.color = Color.WHITE
+	_loading_bar_rect.custom_minimum_size = Vector2(0, 18 * s)
+	_loading_bar_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var m := ShaderMaterial.new()
+	m.shader = load("res://shaders/hud_bar.gdshader") as Shader
+	m.set_shader_parameter("skew_px",     7.0)
+	m.set_shader_parameter("tick_count",  10.0)
+	m.set_shader_parameter("bolt_amount", 0.0)
+	m.set_shader_parameter("fill_pct",    0.0)
+	m.set_shader_parameter("ghost_pct",   0.0)
+	m.set_shader_parameter("ghost_color", Color(0, 0, 0, 0))
+	m.set_shader_parameter("fill_color",  UiStyle.PINK)
+	m.set_shader_parameter("fill_color2", UiStyle.CYAN)
+	m.set_shader_parameter("edge_color",  UiStyle.VIOLET)
+	_loading_bar_rect.material = m
+	_loading_bar_rect.resized.connect(func() -> void:
+		m.set_shader_parameter("rect_size", _loading_bar_rect.size))
+	vb.add_child(_loading_bar_rect)
 
 
 ## Updates the loading overlay and yields one frame so the bar/label above
@@ -730,8 +716,11 @@ func _build_loading_ui() -> void:
 func _loading_step(text: String, frac: float) -> void:
 	if _loading_label != null:
 		_loading_label.text = text
-	if _loading_bar != null:
-		_loading_bar.value = frac
+	if _loading_bar_rect != null:
+		var lm := _loading_bar_rect.material as ShaderMaterial
+		if lm != null:
+			lm.set_shader_parameter("fill_pct",  clampf(frac, 0.0, 1.0))
+			lm.set_shader_parameter("ghost_pct", clampf(frac, 0.0, 1.0))
 	await get_tree().process_frame
 
 
@@ -772,6 +761,10 @@ func _process(delta: float) -> void:
 
 	# Beat phase decays quickly (full fade in ~0.28 s) — drives beat-sync brightness spikes
 	_beat_phase = maxf(0.0, _beat_phase - delta * 3.6)
+	# ...and the HUD chassis breathes on the same value, so the whole UI is
+	# locked to the song rather than free-running on its own clock.
+	if _hud != null:
+		_hud.pulse_beat(_beat_phase)
 	# Beat camera pulse decays — drives FOV kick
 	_beat_cam_t = maxf(0.0, _beat_cam_t - delta * 5.0)
 	# Vitality drifts gently toward 0.50 baseline when nothing is happening
@@ -787,8 +780,12 @@ func _process(delta: float) -> void:
 	# Charge OVERDRIVE window countdown (gameplay time — not while paused).
 	if _charge_mult_timer > 0.0:
 		_charge_mult_timer = maxf(0.0, _charge_mult_timer - delta)
+		_update_charge_hud()      # the ×100 window visibly drains away
 		if _charge_mult_timer <= 0.0:
-			_update_hud_score()   # multiplier label drops back to the combo-based value
+			if _hud != null:
+				_hud.clear_overdrive()
+			_update_charge_hud()
+			_update_hud_score()   # multiplier drops back to the combo-based value
 
 	# Song progress bar
 	_update_hud_progress(t_s)
@@ -902,6 +899,8 @@ func _spawn_countdown_ui() -> void:
 	cl.name  = "CountdownLayer"
 	add_child(cl)
 
+	var s: float = UiStyle.scale_for(_vp())
+
 	var root := Control.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -910,39 +909,41 @@ func _spawn_countdown_ui() -> void:
 	# Dark semi-transparent overlay so the player can see the track loading
 	var bg := ColorRect.new()
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	bg.color = Color(0.0, 0.0, 0.0, 0.55)
+	bg.color = Color(0.02, 0.01, 0.06, 0.58)
 	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	root.add_child(bg)
 
 	# Song title
-	_countdown_title = Label.new()
 	var title_text: String = _beatmap_title if _beatmap_title != "" else str(Run.current_song_key).strip_edges()
 	if title_text == "" or title_text == "null":
-		title_text = "Get ready…"
-	_countdown_title.text = title_text
+		title_text = "GET READY"
+	# The fallback is the beatmap key, which is a filename — "echoes_in_my_blood"
+	# should not reach the player with its underscores still in it.
+	title_text = title_text.replace("_", " ")
+	_countdown_title = UiStyle.label(title_text.to_upper(), UiStyle.caption(6.0), int(20 * s), Color.WHITE)
 	_countdown_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_countdown_title.set_anchors_preset(Control.PRESET_CENTER)
 	_countdown_title.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	_countdown_title.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	_countdown_title.offset_top      = -80
-	_countdown_title.offset_bottom   = -80 + 32
-	_countdown_title.add_theme_font_size_override("font_size", 22)
-	_countdown_title.add_theme_color_override("font_color", Color(0.80, 0.70, 1.00, 0.85))
-	_countdown_title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_countdown_title.offset_left     = -560 * s
+	_countdown_title.offset_right    = 560 * s
+	_countdown_title.offset_top      = -110 * s
+	_countdown_title.offset_bottom   = -110 * s + 40 * s
+	_countdown_title.self_modulate   = UiStyle.signature_color(0.2)
 	root.add_child(_countdown_title)
 
-	# Big countdown label
-	_countdown_label = Label.new()
-	_countdown_label.text = "GET READY"
+	# Big countdown numeral
+	_countdown_label = UiStyle.label("GET READY", UiStyle.display(900, 6.0), int(88 * s), Color.WHITE)
 	_countdown_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_countdown_label.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
 	_countdown_label.set_anchors_preset(Control.PRESET_CENTER)
 	_countdown_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	_countdown_label.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	_countdown_label.offset_top      = -50
-	_countdown_label.offset_bottom   = -50 + 100
-	_countdown_label.add_theme_font_size_override("font_size", 96)
-	_countdown_label.add_theme_color_override("font_color", Color(1.00, 0.45, 0.72, 1.0))
-	_countdown_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_countdown_label.offset_left     = -560 * s
+	_countdown_label.offset_right    = 560 * s
+	_countdown_label.offset_top      = -55 * s
+	_countdown_label.offset_bottom   = 55 * s
+	_countdown_label.self_modulate   = Color(1.00, 0.45, 0.72)
 	root.add_child(_countdown_label)
 
 
@@ -994,7 +995,7 @@ func _start_level() -> void:
 	# "GO!" flash — then remove the entire countdown canvas
 	if _countdown_label != null:
 		_countdown_label.text = "GO!"
-		_countdown_label.add_theme_color_override("font_color", Color(0.30, 1.00, 0.55, 1.0))
+		_countdown_label.self_modulate = Color(0.30, 1.00, 0.55, 1.0)
 		var gtw := create_tween()
 		gtw.tween_property(_countdown_label, "modulate:a", 0.0, 0.45)
 		# Remove the whole CountdownLayer once the flash is done
@@ -1117,7 +1118,7 @@ func _load_chart_and_build_plan() -> void:
 	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
 	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.50)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.55)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
@@ -1166,7 +1167,7 @@ func _setup_runner_rng() -> void:
 				while Save.is_seed_used(Run.current_song_key, _runner_rng.seed):
 					_runner_rng.randomize()
 				Run.run_seed   = _runner_rng.seed
-				Run.song_lives = 3   # fresh song → full 3 lives
+				Run.song_lives = GameConfig.lives_per_song   # fresh song → full lives
 				Save.mark_seed_used(Run.current_song_key, Run.run_seed)
 
 		_:
@@ -1911,7 +1912,6 @@ func _gen_wall_jump(beat_count: int, start_lane: int) -> Array[String]:
 		actions.append("wall_left" if (wj_i % 2 == 0) == first_is_left else "wall_right")
 
 	return actions
-
 
 
 # ── 25 new pattern generators ────────────────────────────────────────────────
@@ -3286,7 +3286,6 @@ func _track_full_width() -> float:
 	return (player.lane_xs[player.lane_xs.size() - 1] - player.lane_xs[0]) + lane_blocker_width
 
 
-
 ## Returns the tint colour for each gate action type.
 func _action_color(action: String) -> Color:
 	match action:
@@ -4017,7 +4016,7 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 	var env_base: float = lerpf(0.6, 1.2, vit)
 	var env_e:    float = lerpf(env_base, env_peak, _elec_pulse_t)
 	for mat in _elec_env_mats:
-		mat.emission_energy_multiplier = env_e
+		NeonMat.set_energy(mat, env_e)
 
 	# Shared point lights. Every one of these gets the SAME energy, so the only
 	# thing that matters is not writing it to lights the player cannot possibly
@@ -5400,307 +5399,18 @@ func _award_near_miss(_idx: int) -> void:
 # ── HUD ──────────────────────────────────────────────────────────────────────
 
 func _create_hud() -> void:
-	_health_pct = 0.25
-	_hud_hp_displayed_pct = _health_pct
+	_hud = GameHud.new()
+	add_child(_hud)
+	# The pause menu, death screen, results panel and dev toast all locate their
+	# parent Control via _hud_flash.get_parent(); keeping this pointed at the
+	# HUD's own flash rect leaves those seven call sites working unchanged.
+	_hud_flash = _hud.flash_rect
 
-	var cl := CanvasLayer.new()
-	cl.layer = 20
-	add_child(cl)
-
-	var root := Control.new()
-	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	cl.add_child(root)
-
-	var s: float = _hud_s()
-
-	# ── Score + Combo card (top-right) ────────────────────────────────────────
-	# Everything lives under one Control (_hud_score_group) so the whole cluster
-	# can fade to a low, out-of-the-way "idle" opacity a moment after the last
-	# hit/miss and snap back the instant something happens — see _hud_score_bump().
-	_hud_score_group = Control.new()
-	_hud_score_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_hud_score_group.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_score_group)
-
-	var card_w: float = 196.0 * s
-	var card_h: float = 92.0  * s
-	var card_m: float = 14.0  * s
-	_hud_score_card_w = card_w
-	_hud_score_card_m = card_m
-
-	var score_card := Panel.new()
-	score_card.anchor_left  = 1.0; score_card.anchor_right  = 1.0
-	score_card.anchor_top   = 0.0; score_card.anchor_bottom = 0.0
-	score_card.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	score_card.offset_left   = -(card_m + card_w); score_card.offset_right  = -card_m
-	score_card.offset_top    = card_m;             score_card.offset_bottom = card_m + card_h
-	# Kept as _hud_card_sb so the per-frame rainbow recolour can mutate this
-	# instance in place rather than building and installing a new one each frame.
-	_hud_card_sb = _hud_card_style(Color(0.55, 0.16, 0.85, 1.0))
-	score_card.add_theme_stylebox_override("panel", _hud_card_sb)
-	score_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_score_group.add_child(score_card)
-	_hud_score_card = score_card   # border/glow repainted every frame — see _update_hud_rainbow
-
-	var score_margin := MarginContainer.new()
-	score_margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	score_margin.add_theme_constant_override("margin_left",   int(18 * s))
-	score_margin.add_theme_constant_override("margin_right",  int(16 * s))
-	score_margin.add_theme_constant_override("margin_top",    int(12 * s))
-	score_margin.add_theme_constant_override("margin_bottom", int(12 * s))
-	score_margin.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	score_card.add_child(score_margin)
-
-	var score_vbox := VBoxContainer.new()
-	score_vbox.add_theme_constant_override("separation", int(1 * s))
-	score_vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	score_margin.add_child(score_vbox)
-
-	_hud_score_cap = Label.new()
-	_hud_score_cap.text = "SCORE"
-	_hud_score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	# White base: the rainbow cycle drives the visible colour through
-	# self_modulate every frame (see _update_hud_rainbow), which multiplies.
-	_hud_score_cap.add_theme_color_override("font_color", Color.WHITE)
-	_hud_score_cap.self_modulate = Color(0.74, 0.52, 1.00, 0.75)
-	_hud_score_cap.add_theme_font_size_override("font_size", int(11 * s))
-	_hud_score_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	score_vbox.add_child(_hud_score_cap)
-
-	_hud_score_label = Label.new()
-	_hud_score_label.text = "0"
-	_hud_score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_score_label.add_theme_color_override("font_color", Color.WHITE)
-	_hud_score_label.self_modulate = Color(1.00, 0.55, 0.86, 1.0)
-	_hud_score_label.add_theme_font_size_override("font_size", int(33 * s))
-	_hud_score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_score_label.pivot_offset = Vector2(card_w * 0.5, 14 * s)   # punch-scale grows from centre
-	score_vbox.add_child(_hud_score_label)
-
-	_hud_combo_label = Label.new()
-	_hud_combo_label.text = ""
-	_hud_combo_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	_hud_combo_label.add_theme_color_override("font_color", Color(1.00, 0.88, 0.30, 1.0))
-	_hud_combo_label.add_theme_font_size_override("font_size", int(15 * s))
-	_hud_combo_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	score_vbox.add_child(_hud_combo_label)
-
-	# ── Health bar (top-left) ─────────────────────────────────────────────────
-	# Layout: [HP label] [pill-shaped bar] [percentage]. Grouped so the low-HP
-	# warning pulse (see _hud_update_low_health_warning) can tint the whole thing.
-	_hud_hp_group = Control.new()
-	_hud_hp_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_hud_hp_group.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_hp_group)
-
-	_hud_hp_bar_w = 216.0 * s
-	_hud_hp_bar_h = 19.0 * s
-	var bar_h:   float = _hud_hp_bar_h
-	var bar_x:   float = 16.0 * s
-	var bar_y:   float = 16.0 * s
-	var label_w: float = 30.0 * s
-
-	# "HP" label
-	_hud_hp_label = Label.new()
-	_hud_hp_label.text = "HP"
-	_hud_hp_label.anchor_left   = 0.0; _hud_hp_label.anchor_right  = 0.0
-	_hud_hp_label.anchor_top    = 0.0; _hud_hp_label.anchor_bottom = 0.0
-	_hud_hp_label.offset_left   = bar_x
-	_hud_hp_label.offset_right  = bar_x + label_w
-	_hud_hp_label.offset_top    = bar_y - 2 * s
-	_hud_hp_label.offset_bottom = bar_y + bar_h
-	_hud_hp_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_hud_hp_label.add_theme_color_override("font_color", Color(1.00, 0.55, 0.75, 0.90))
-	_hud_hp_label.add_theme_font_size_override("font_size", int(13 * s))
-	_hud_hp_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
-	_hud_hp_label.add_theme_constant_override("outline_size", int(3 * s))
-	_hud_hp_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_hp_group.add_child(_hud_hp_label)
-
-	var bx: float = bar_x + label_w + 6.0 * s
-
-	# ONE continuous pill-shaped bar made of 3 flush segments (no gap between them) —
-	# only the first segment rounds its left end and only the last rounds its right
-	# end (see _hud_pill_style_sides), so it reads as a single bar. Colour drifts
-	# smoothly (see _update_hud_hp_color). Health % is one continuous 0–1 value;
-	# a segment fills proportionally to how much of ITS third is covered.
-	_hud_hp_seg_w = _hud_hp_bar_w / float(_HUD_HP_SEGMENTS)
-	_hud_hp_seg_tracks.clear(); _hud_hp_seg_fills.clear(); _hud_hp_lightning.clear()
-	# Drop the cached live styleboxes too — they belong to the panels being replaced.
-	_hud_hp_track_sbs.clear(); _hud_hp_fill_sbs.clear()
-
-	for i in range(_HUD_HP_SEGMENTS):
-		var seg_x: float = bx + float(i) * _hud_hp_seg_w
-		var round_l: bool = i == 0
-		var round_r: bool = i == _HUD_HP_SEGMENTS - 1
-
-		var seg_track := Panel.new()
-		seg_track.anchor_left = 0.0; seg_track.anchor_right  = 0.0
-		seg_track.anchor_top  = 0.0; seg_track.anchor_bottom = 0.0
-		seg_track.offset_left   = seg_x;    seg_track.offset_right  = seg_x + _hud_hp_seg_w
-		seg_track.offset_top    = bar_y;    seg_track.offset_bottom = bar_y + bar_h
-		var seg_track_sb: StyleBoxFlat = _hud_pill_style_sides(
-			Color(0.05, 0.02, 0.09, 0.90), bar_h * 0.5, round_l, round_r, Color(1.00, 0.35, 0.65, 0.55))
-		seg_track.add_theme_stylebox_override("panel", seg_track_sb)
-		_hud_hp_track_sbs.append(seg_track_sb)
-		seg_track.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		seg_track.pivot_offset = Vector2(_hud_hp_seg_w * 0.5, bar_h * 0.5)   # for the heal punch-scale
-		_hud_hp_group.add_child(seg_track)
-		_hud_hp_seg_tracks.append(seg_track)
-
-		var seg_fill := Panel.new()
-		seg_fill.anchor_left = 0.0; seg_fill.anchor_right  = 0.0
-		seg_fill.anchor_top  = 0.0; seg_fill.anchor_bottom = 1.0
-		seg_fill.offset_left  = 0.0
-		seg_fill.offset_right = _hud_hp_seg_w * clampf(_health_pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
-		var seg_fill_sb: StyleBoxFlat = _hud_pill_style_sides(
-			Color(0.35, 1.00, 0.55, 1.0), bar_h * 0.5, round_l, round_r)
-		seg_fill.add_theme_stylebox_override("panel", seg_fill_sb)
-		_hud_hp_fill_sbs.append(seg_fill_sb)
-		seg_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		seg_track.add_child(seg_fill)
-		_hud_hp_seg_fills.append(seg_fill)
-
-		# Electric-arc overlay — anchored full-rect of the fill, so it
-		# automatically tracks the fill's current (animated) width and
-		# stays clipped to the pill shape via its own shader SDF. Purely
-		# decorative flair inside the filler; see _hud_electric_shader().
-		var seg_bolt := ColorRect.new()
-		seg_bolt.anchor_left = 0.0; seg_bolt.anchor_right  = 1.0
-		seg_bolt.anchor_top  = 0.0; seg_bolt.anchor_bottom = 1.0
-		seg_bolt.offset_left = 0.0; seg_bolt.offset_right  = 0.0
-		seg_bolt.offset_top  = 0.0; seg_bolt.offset_bottom = 0.0
-		seg_bolt.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		seg_bolt.color = Color(1, 1, 1, 1)   # unused — shader drives all visible color
-		var bolt_mat := ShaderMaterial.new()
-		bolt_mat.shader = _hud_electric_shader()
-		bolt_mat.set_shader_parameter("radius", bar_h * 0.5)
-		bolt_mat.set_shader_parameter("rect_size", Vector2(_hud_hp_seg_w, bar_h))
-		bolt_mat.set_shader_parameter("seed", float(i) * 11.0)
-		seg_bolt.material = bolt_mat
-		seg_fill.add_child(seg_bolt)
-		_hud_hp_lightning.append(seg_bolt)
-
-	# Percentage text (right of bar)
-	_hud_hp_pct_label = Label.new()
-	_hud_hp_pct_label.text = "50%"
-	_hud_hp_pct_label.anchor_left = 0.0; _hud_hp_pct_label.anchor_right  = 0.0
-	_hud_hp_pct_label.offset_left   = bx + _hud_hp_bar_w + 8 * s
-	_hud_hp_pct_label.offset_right  = bx + _hud_hp_bar_w + 8 * s + 58 * s
-	_hud_hp_pct_label.offset_top    = bar_y - 2 * s
-	_hud_hp_pct_label.offset_bottom = bar_y + bar_h
-	_hud_hp_pct_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	_hud_hp_pct_label.add_theme_color_override("font_color", Color.WHITE)
-	_hud_hp_pct_label.self_modulate = Color(0.90, 0.90, 0.95, 0.75)
-	_hud_hp_pct_label.add_theme_font_size_override("font_size", int(13 * s))
-	_hud_hp_pct_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.55))
-	_hud_hp_pct_label.add_theme_constant_override("outline_size", int(3 * s))
-	_hud_hp_pct_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_hp_group.add_child(_hud_hp_pct_label)
-
-	# ── Song progress bar (bottom of screen) ─────────────────────────────────
-	var prog_bg := ColorRect.new()
-	prog_bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	prog_bg.anchor_top    = 1.0; prog_bg.anchor_bottom = 1.0
-	prog_bg.grow_vertical = Control.GROW_DIRECTION_BEGIN
-	prog_bg.offset_top    = -6;  prog_bg.offset_bottom = 0
-	prog_bg.color = Color(0.05, 0.02, 0.12, 0.88)
-	prog_bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(prog_bg)
-
-	_hud_progress_fill = ColorRect.new()
-	_hud_progress_fill.anchor_left   = 0.0; _hud_progress_fill.anchor_right  = 0.0
-	_hud_progress_fill.anchor_top    = 1.0; _hud_progress_fill.anchor_bottom = 1.0
-	_hud_progress_fill.grow_vertical = Control.GROW_DIRECTION_BEGIN
-	_hud_progress_fill.offset_left   = 0; _hud_progress_fill.offset_right  = 0
-	_hud_progress_fill.offset_top    = -6; _hud_progress_fill.offset_bottom = 0
-	_hud_progress_fill.color = Color(0.75, 0.22, 1.00, 1.0)   # violet
-	_hud_progress_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_progress_fill)
-
-	# Tiny glow cap at the leading edge of the progress fill
-	var prog_cap := ColorRect.new()
-	prog_cap.name = "ProgCap"
-	prog_cap.anchor_left   = 0.0; prog_cap.anchor_right  = 0.0
-	prog_cap.anchor_top    = 1.0; prog_cap.anchor_bottom = 1.0
-	prog_cap.grow_vertical = Control.GROW_DIRECTION_BEGIN
-	prog_cap.offset_left   = 0;   prog_cap.offset_right  = 4
-	prog_cap.offset_top    = -8;  prog_cap.offset_bottom = 0
-	prog_cap.color = Color(1.0, 0.75, 1.0, 0.85)
-	prog_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(prog_cap)
-	_hud_prog_cap = prog_cap   # recoloured every frame — see _update_hud_rainbow
-
-	# ── Full-screen edge flash (hit / miss feedback) ───────────────────────────
-	_hud_flash = ColorRect.new()
-	_hud_flash.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_hud_flash.color = Color(0.0, 0.0, 0.0, 0.0)
-	_hud_flash.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(_hud_flash)
-
-	# Wall-jump bonus label — centred, gold, visible only while bonus is active
-	_hud_wj_label = Label.new()
-	_hud_wj_label.text = "⬆ WALL JUMP  ×2 !"
-	_hud_wj_label.anchor_left   = 0.5; _hud_wj_label.anchor_right  = 0.5
-	_hud_wj_label.anchor_top    = 0.0; _hud_wj_label.anchor_bottom = 0.0
-	_hud_wj_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	_hud_wj_label.offset_left  = -200; _hud_wj_label.offset_right  = 200
-	_hud_wj_label.offset_top   = 100;  _hud_wj_label.offset_bottom = 140
-	_hud_wj_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_hud_wj_label.add_theme_color_override("font_color",   Color(1.00, 0.82, 0.10, 1.0))
-	_hud_wj_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	_hud_wj_label.add_theme_constant_override("outline_size", 7)
-	_hud_wj_label.add_theme_font_size_override("font_size", 26)
-	_hud_wj_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_wj_label.visible = false
-	root.add_child(_hud_wj_label)
-
-	# Grind / FLOW label — bottom-centre, orange, shown during active rap segment
-	_hud_grind_label = Label.new()
-	_hud_grind_label.text = ""
-	_hud_grind_label.anchor_left   = 0.5; _hud_grind_label.anchor_right  = 0.5
-	_hud_grind_label.anchor_top    = 1.0; _hud_grind_label.anchor_bottom = 1.0
-	_hud_grind_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	_hud_grind_label.offset_left   = -220; _hud_grind_label.offset_right  = 220
-	_hud_grind_label.offset_top    = -52;  _hud_grind_label.offset_bottom = -18
-	_hud_grind_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_hud_grind_label.add_theme_color_override("font_color",   Color(1.00, 0.60, 0.10, 1.0))
-	_hud_grind_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	_hud_grind_label.add_theme_constant_override("outline_size", 6)
-	_hud_grind_label.add_theme_font_size_override("font_size", 18)
-	_hud_grind_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_grind_label.visible = false
-	root.add_child(_hud_grind_label)
-
-	# Charge meter — bottom-centre, cyan, shown only during a drop buildup. Sits a row
-	# above the grind label so the two never overlap.
-	_hud_charge_label = Label.new()
-	_hud_charge_label.text = ""
-	_hud_charge_label.anchor_left   = 0.5; _hud_charge_label.anchor_right  = 0.5
-	_hud_charge_label.anchor_top    = 1.0; _hud_charge_label.anchor_bottom = 1.0
-	_hud_charge_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	_hud_charge_label.offset_left   = -320; _hud_charge_label.offset_right  = 320
-	_hud_charge_label.offset_top    = -92;  _hud_charge_label.offset_bottom = -58
-	_hud_charge_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_hud_charge_label.add_theme_color_override("font_color", Color(0.45, 0.95, 1.00, 1.0))
-	_hud_charge_label.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	_hud_charge_label.add_theme_constant_override("outline_size", 6)
-	_hud_charge_label.add_theme_font_size_override("font_size", 20)
-	_hud_charge_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_hud_charge_label.visible = false
-	root.add_child(_hud_charge_label)
-
-	# Lyrics row — fixed at bottom of screen (positioned each frame in _update_lyrics).
-	# Words fly in one at a time with neon glow; sentence lines appear whole.
-	_lyrics_hud = HBoxContainer.new()
-	_lyrics_hud.add_theme_constant_override("separation", 12)
-	_lyrics_hud.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_lyrics_hud.visible = false
-	root.add_child(_lyrics_hud)
-
+	_hud.set_lyric_font(_lyric_font)
+	_hud.set_chrome_phase(_hud_rainbow_hue)
+	_hud.set_lives(Run.song_lives, GameConfig.lives_per_song)
+	_hud.set_health(_health_pct)
 	_update_hud_score()
-	_update_hud_health()
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -5710,7 +5420,7 @@ func _create_hud() -> void:
 # Drives the lyric row each frame: picks the active line, reveals rap words as their times
 # pass (sentence lines appear whole), positions at bottom-centre, and fades out at end.
 func _update_lyrics(t_s: float) -> void:
-	if _lyrics_hud == null or _lyrics.is_empty():
+	if _hud == null or _lyrics.is_empty():
 		return
 	# Monotonic cursor instead of a full rescan. This used to walk EVERY lyric
 	# line every frame (and deliberately kept the last match rather than
@@ -5730,81 +5440,50 @@ func _update_lyrics(t_s: float) -> void:
 			idx = i
 	if idx != _lyrics_active_idx:
 		_lyrics_active_idx = idx
-		for c in _lyrics_hud.get_children():
-			c.queue_free()
 		_lyrics_revealed = 0
-		_lyrics_hud.modulate.a = 1.0
-		# Slide-in entrance: start 28 px below, tween to resting position.
-		_lyrics_slide_off = 28.0
-		create_tween().tween_property(self, "_lyrics_slide_off", 0.0, 0.22) \
-			.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		_hud.lyrics_begin_line()
 	if idx < 0:
-		_lyrics_hud.visible = false
+		_hud.lyrics_visible(false)
 		return
-	_lyrics_hud.visible = true
+	_hud.lyrics_visible(true)
+
 	var cur: Dictionary = _lyrics[idx]
 	if String(cur["mode"]) == "rap":
 		var words: Array = cur["words"]
 		while _lyrics_revealed < words.size() and t_s >= float(words[_lyrics_revealed]["t"]):
-			_lyrics_pop_word(String(words[_lyrics_revealed]["w"]), _lyrics_revealed)
+			# Karaoke wipe runs for as long as this word actually holds — up to
+			# the next word's onset, or the end of the line for the last one.
+			var w_t: float = float(words[_lyrics_revealed]["t"])
+			var w_end: float = float(words[_lyrics_revealed + 1]["t"]) 				if _lyrics_revealed + 1 < words.size() else float(cur["t_end"])
+			_hud.lyrics_add_word(
+				String(words[_lyrics_revealed]["w"]),
+				_LYRIC_COLORS[_lyrics_revealed % _LYRIC_COLORS.size()],
+				0.0,
+				clampf(w_end - w_t, 0.10, 0.85))
 			_lyrics_revealed += 1
 	elif _lyrics_revealed == 0:
-		# Split into individual words so each gets its own colour.
+		# Sung lines arrive whole; split so each word gets its own colour, and
+		# stagger them in so the line still reads left to right.
 		var word_list := String(cur["text"]).split(" ", false)
+		var span: float = maxf(float(cur["t_end"]) - float(cur["t_start"]), 0.4)
+		var per: float = span / float(maxi(word_list.size(), 1))
 		for wi: int in range(word_list.size()):
-			_lyrics_pop_word(word_list[wi], wi, wi * 0.07)
-		_lyrics_revealed = max(1, word_list.size())
-	# Fixed position: bottom 20 % of screen, centred horizontally.
-	_lyrics_hud.position = Vector2(
-		_vp_size.x * 0.5 - _lyrics_hud.size.x * 0.5,
-		_vp_size.y * 0.80 + _lyrics_slide_off
-	)
+			_hud.lyrics_add_word(
+				word_list[wi],
+				_LYRIC_COLORS[wi % _LYRIC_COLORS.size()],
+				float(wi) * 0.07,
+				clampf(per, 0.12, 0.60))
+		_lyrics_revealed = maxi(1, word_list.size())
+
 	# Fade out as the line hold ends.
 	var fade_end: float = float(cur["t_end"]) + _LYRICS_HOLD_S
-	_lyrics_hud.modulate.a = clampf((fade_end - t_s) / 0.4, 0.0, 1.0)
+	_hud.lyrics_set_alpha(clampf((fade_end - t_s) / 0.4, 0.0, 1.0))
 
 
 # Spawns one word into the lyric row. color_idx drives the rainbow cycle; delay lets
 # line-mode words stagger in. Words fly up, elastic-bounce, then idle-float.
-func _lyrics_pop_word(w: String, color_idx: int, delay: float = 0.0) -> void:
-	if _lyrics_hud == null:
-		return
-	if delay > 0.0:
-		await get_tree().create_timer(delay).timeout
-		if not is_instance_valid(_lyrics_hud):
-			return
-	var col: Color = _LYRIC_COLORS[color_idx % _LYRIC_COLORS.size()]
-	var lbl := Label.new()
-	lbl.text = w
-	if _lyric_font != null:
-		lbl.add_theme_font_override("font", _lyric_font)
-	lbl.add_theme_font_size_override("font_size", 40)
-	lbl.add_theme_color_override("font_color",         Color(1.0, 1.0, 1.0, 1.0))
-	lbl.add_theme_color_override("font_outline_color", col)
-	lbl.add_theme_constant_override("outline_size", 10)
-	lbl.add_theme_color_override("font_shadow_color",  Color(col.r, col.g, col.b, 0.55))
-	lbl.add_theme_constant_override("shadow_offset_x", 0)
-	lbl.add_theme_constant_override("shadow_offset_y", 0)
-	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_lyrics_hud.add_child(lbl)
-	# Start below and invisible; scale at 1.15 for a quick squish-in feel.
-	lbl.position.y = 32.0
-	lbl.modulate.a = 0.0
-	lbl.scale      = Vector2(1.15, 1.15)
-	var tw := create_tween().set_parallel(true)
-	tw.tween_property(lbl, "position:y", 0.0, 0.24).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-	tw.tween_property(lbl, "modulate:a", 1.0, 0.16)
-	tw.tween_property(lbl, "scale", Vector2.ONE, 0.22).set_trans(Tween.TRANS_ELASTIC).set_ease(Tween.EASE_OUT)
-	# After landing: gentle idle float bound to the label (auto-stops when label is freed).
-	await get_tree().create_timer(0.26).timeout
-	if not is_instance_valid(lbl):
-		return
-	var phase: float = randf() * TAU   # stagger so words don't all bob in sync
-	var float_tw := lbl.create_tween().set_loops()
-	float_tw.tween_property(lbl, "position:y", -5.0 + sin(phase) * 2.0, 0.85 + randf() * 0.15) \
-		.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	float_tw.tween_property(lbl, "position:y", 0.0 + sin(phase) * 2.0, 0.85 + randf() * 0.15) \
-		.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+# (Word spawning, wrapping, the karaoke wipe and the idle float now live in
+# GameHud.lyrics_add_word — see scripts/ui/GameHud.gd.)
 
 
 # Parses the optional "lyrics" array from the chart. Two entry shapes:
@@ -6100,8 +5779,7 @@ func _spawn_charge_tunnel(seg: Dictionary) -> void:
 		idx += 1
 		pd  += _CHARGE_HOOP_SPACING
 
-	if _hud_charge_label != null:
-		_hud_charge_label.visible = true
+	_update_charge_hud()
 
 
 func _despawn_charge_tunnel() -> void:
@@ -6112,8 +5790,8 @@ func _despawn_charge_tunnel() -> void:
 	_charge_building = false
 	if player != null:
 		player.set_charge_slide(false)
-	if _hud_charge_label != null:
-		_hud_charge_label.visible = false
+	if _hud != null:
+		_hud.set_charge(0.0, "", false)
 
 
 ## Cash in the charge on the drop. Final fill = charge × release-timing quality; a high
@@ -6138,6 +5816,7 @@ func _finalize_charge(t_s: float) -> void:
 
 	if fill >= _CHARGE_MIN_FILL:
 		_charge_mult_timer = lerpf(_CHARGE_MULT_MIN_S, _CHARGE_MULT_MAX_S, clampf(fill, 0.0, 1.0))
+		_charge_mult_total = _charge_mult_timer
 		_hud_flash_color(Color(0.30, 0.85, 1.00, 0.40), 0.55)
 		_show_grind_banner("⚡  ×%d  OVERDRIVE  (%.1fs)" % [_CHARGE_MULT_VALUE, _charge_mult_timer],
 			Color(0.40, 0.90, 1.00))
@@ -6148,20 +5827,19 @@ func _finalize_charge(t_s: float) -> void:
 
 
 func _update_charge_hud() -> void:
-	if _hud_charge_label == null:
+	if _hud == null:
+		return
+	# The OVERDRIVE countdown owns the meter while it is running — it reuses the
+	# same chassis, draining as a timer rather than filling as a charge.
+	if _charge_mult_timer > 0.0:
+		_hud.set_overdrive(_charge_mult_timer, _charge_mult_total)
 		return
 	if not _charge_active:
-		_hud_charge_label.visible = false
+		_hud.set_charge(0.0, "", false)
 		return
-	_hud_charge_label.visible = true
-	var filled: int = clampi(int(round(_charge * 10.0)), 0, 10)
-	var bar: String = ""
-	for i in range(10):
-		bar += "█" if i < filled else "░"
-	var state: String = "HOLD ⟂ THREAD" if _charge_building else "GET READY"
-	_hud_charge_label.text = "⚡ CHARGE  [%s]  %d%%   %s" % [bar, int(round(_charge * 100.0)), state]
-	_hud_charge_label.add_theme_color_override("font_color",
-		Color(0.45, 0.95, 1.00).lerp(Color(1.00, 0.95, 0.35), _charge))
+	# Was a row of █/░ block characters in a Label; it is a real meter now.
+	var state: String = "HOLD  ⟂  THREAD" if _charge_building else "GET READY"
+	_hud.set_charge(_charge, state, true)
 
 
 func _update_grind_system(t_s: float) -> void:
@@ -6248,8 +5926,6 @@ func _spawn_grind_rail(seg: Dictionary) -> void:
 			_spark_tap_pds.append(pd)
 			_grind_total_this_seg += 1
 
-	if _hud_grind_label != null:
-		_hud_grind_label.visible = true
 	_update_grind_hud()
 
 
@@ -6406,45 +6082,100 @@ func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 			pd += plen
 		return
 
-	const N_SEGS: int  = 80
+	# One swept tube, not 80 boxes.
+	#
+	# This used to build a Node3D + BoxMesh + MeshInstance3D + StandardMaterial3D
+	# per segment — 320 nodes and 80 separate materials for what is visually a
+	# single bar, none of which could batch, and which read as a row of abutting
+	# bricks wherever the path curved. A ring-swept ArrayMesh is one node, one
+	# mesh and one material, and it is genuinely continuous.
+	const N_SEGS: int   = 80
+	const RING:   int   = 6            # hexagonal section; the shader does the rounding
+	const RADIUS: float = 0.055
 	const RAIL_H: float = 0.88
 	var pd_step: float  = (end_pd - start_pd) / float(N_SEGS)
 	var lat: float      = _GRIND_RAIL_LATERAL
 
-	for i in range(N_SEGS):
-		# Sample the rail at this segment's ends so the bar orients along the full 3D
-		# tangent (corkscrews, dives, climbs) instead of a flat yaw only.
-		var pd_a: float = start_pd + float(i) * pd_step
-		var pd_b: float = start_pd + float(i + 1) * pd_step
-		var oa: Vector2 = _grind_branch_offset(pd_a)
-		var ob: Vector2 = _grind_branch_offset(pd_b)
-		var p0: Vector3 = _path_world_pos(pd_a, lat + oa.x, RAIL_H + oa.y)
-		var p1: Vector3 = _path_world_pos(pd_b, lat + ob.x, RAIL_H + ob.y)
-		var seg_len: float = maxf(0.05, p0.distance_to(p1)) * 1.04
+	# Sample the centre line first so each ring can be oriented from the tangent
+	# either side of it — that is what keeps corkscrews and dives from pinching.
+	var pts: PackedVector3Array = PackedVector3Array()
+	for i in range(N_SEGS + 1):
+		var pd_i: float = start_pd + float(i) * pd_step
+		var oi: Vector2 = _grind_branch_offset(pd_i)
+		pts.append(_path_world_pos(pd_i, lat + oi.x, RAIL_H + oi.y))
 
-		var node := Node3D.new()
-		node.position = (p0 + p1) * 0.5
-		var dir: Vector3 = p1 - p0
-		if dir.length() > 0.001:
-			var up_ref: Vector3 = Vector3.UP
-			if absf(dir.normalized().dot(Vector3.UP)) > 0.97:
-				up_ref = Vector3.RIGHT   # avoid look_at gimbal on near-vertical bits
-			node.look_at_from_position(node.position, p1, up_ref)
-		_grind_rail_root.add_child(node)
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 
-		# Main bar — box runs along local -Z, which look_at points down the tangent.
-		var bm := BoxMesh.new()
-		bm.size = Vector3(0.09, 0.09, seg_len)
-		var mi := MeshInstance3D.new()
-		mi.mesh = bm
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color              = GameConfig.level_color_rail
-		mat.emission_enabled          = true
-		mat.emission                  = GameConfig.level_color_rail
-		mat.emission_energy_multiplier = 6.0
-		mi.material_override          = mat
-		node.add_child(mi)
-		_grind_rail_mats.append(mat)
+	var total_len: float = 0.0
+	for i in range(pts.size() - 1):
+		total_len += pts[i].distance_to(pts[i + 1])
+	total_len = maxf(total_len, 0.001)
+
+	# UV.x runs along the rail so neon_tube can flow energy down it; UV.y wraps
+	# the ring. Repeating x per metre keeps the flow speed independent of length.
+	var run: float = 0.0
+	var rings: Array[PackedVector3Array] = []
+	var uvx: PackedFloat32Array = PackedFloat32Array()
+	for i in range(pts.size()):
+		var fwd: Vector3
+		if i == 0:
+			fwd = pts[1] - pts[0]
+		elif i == pts.size() - 1:
+			fwd = pts[i] - pts[i - 1]
+		else:
+			fwd = pts[i + 1] - pts[i - 1]
+		if fwd.length() < 0.0001:
+			fwd = Vector3.FORWARD
+		fwd = fwd.normalized()
+
+		var up_ref: Vector3 = Vector3.UP
+		if absf(fwd.dot(Vector3.UP)) > 0.97:
+			up_ref = Vector3.RIGHT      # avoid a degenerate frame on vertical bits
+		var right: Vector3 = fwd.cross(up_ref).normalized()
+		var up:    Vector3 = right.cross(fwd).normalized()
+
+		var ring := PackedVector3Array()
+		for k in range(RING):
+			var a: float = TAU * float(k) / float(RING)
+			ring.append(pts[i] + (right * cos(a) + up * sin(a)) * RADIUS)
+		rings.append(ring)
+
+		if i > 0:
+			run += pts[i].distance_to(pts[i - 1])
+		uvx.append(run / 2.0)           # one flow repeat every 2 m
+
+	for i in range(rings.size() - 1):
+		var r0: PackedVector3Array = rings[i]
+		var r1: PackedVector3Array = rings[i + 1]
+		for k in range(RING):
+			var k2: int = (k + 1) % RING
+			var v0: Vector3 = r0[k];  var v1: Vector3 = r0[k2]
+			var v2: Vector3 = r1[k];  var v3: Vector3 = r1[k2]
+			var u0: float = float(k) / float(RING)
+			var u1: float = float(k + 1) / float(RING)
+			# Two triangles per quad, wound so the outside faces out.
+			st.set_uv(Vector2(uvx[i], u0));     st.add_vertex(v0)
+			st.set_uv(Vector2(uvx[i + 1], u0)); st.add_vertex(v2)
+			st.set_uv(Vector2(uvx[i], u1));     st.add_vertex(v1)
+
+			st.set_uv(Vector2(uvx[i], u1));     st.add_vertex(v1)
+			st.set_uv(Vector2(uvx[i + 1], u0)); st.add_vertex(v2)
+			st.set_uv(Vector2(uvx[i + 1], u1)); st.add_vertex(v3)
+
+	st.generate_normals()
+
+	var rail_mi := MeshInstance3D.new()
+	rail_mi.mesh = st.commit()
+	var rail_mat: ShaderMaterial = NeonMat.tube(GameConfig.level_color_rail, 6.0)
+	rail_mat.set_shader_parameter("use_uv", true)
+	rail_mat.set_shader_parameter("core_width", 1.35)   # whole tube glows, rim brightest
+	rail_mat.set_shader_parameter("flow_scale", 1.0)    # uvx already carries the repeat
+	rail_mat.set_shader_parameter("flow_amount", 0.55)
+	rail_mat.set_shader_parameter("flow_speed", 2.4)
+	rail_mi.material_override = rail_mat
+	_grind_rail_root.add_child(rail_mi)
+	_grind_rail_mats.append(rail_mat)
 
 
 func _build_spark_node(pd: float) -> Node3D:
@@ -6474,17 +6205,14 @@ func _build_spark_node(pd: float) -> Node3D:
 		root.add_child(sp_light)
 		return root
 
-	# Orb mesh — slightly flattened sphere
+	# Orb mesh — slightly flattened sphere. On energy_orb the fresnel is inverted,
+	# so the hot spot sits in the middle and the silhouette falls away; a flat
+	# emissive sphere was just a disc on screen with all its shape thrown out.
 	var sm := SphereMesh.new()
 	sm.radius = 0.21; sm.height = 0.38
 	var mi := MeshInstance3D.new()
 	mi.mesh  = sm
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color              = orb_col
-	mat.emission_enabled          = true
-	mat.emission                  = orb_col
-	mat.emission_energy_multiplier = 9.0
-	mi.material_override          = mat
+	mi.material_override = NeonMat.orb(orb_col, 9.0)
 	root.add_child(mi)
 
 	# Glow ring — flat disc
@@ -6540,8 +6268,8 @@ func _despawn_grind_rail() -> void:
 	_grind_rail_root = null
 	_grind_rail_mats.clear()
 
-	if _hud_grind_label != null:
-		_hud_grind_label.visible = false
+	if _hud != null:
+		_hud.set_flow(0, 0, 1, false)
 
 
 func _update_spark_visibility() -> void:
@@ -6631,10 +6359,8 @@ func _catch_spark(idx: int) -> void:
 		_spark_nodes[idx] = null   # prevent double-free
 
 	# Combo flash
-	if _hud_combo_label != null and _combo >= 2:
-		var ctw := create_tween()
-		ctw.tween_property(_hud_combo_label, "modulate", Color(1.5, 1.5, 0.3, 1.0), 0.05)
-		ctw.tween_property(_hud_combo_label, "modulate", Color(1.0, 1.0, 1.0, 1.0), 0.12)
+	if _hud != null and _combo >= 2:
+		_hud.combo_flash(Color(1.5, 1.5, 0.3, 1.0), 0.05, 0.12)
 
 	# Milestone check (re-uses the same streak system)
 	const _GRIND_MILESTONES: Array[int] = [10, 25, 50, 100, 200]
@@ -6645,15 +6371,10 @@ func _catch_spark(idx: int) -> void:
 
 
 func _update_grind_hud() -> void:
-	if _hud_grind_label == null:
+	if _hud == null:
 		return
-	if not _grind_rail_active or _grind_total_this_seg == 0:
-		_hud_grind_label.visible = false
-		return
-	_hud_grind_label.visible = true
-	var pct: int = int(float(_grind_caught_this_seg) / float(_grind_total_this_seg) * 100.0)
-	_hud_grind_label.text = "◈  FLOW  %d / %d  (%d%%)   ×%d" % [
-		_grind_caught_this_seg, _grind_total_this_seg, pct, _grind_flow_mult]
+	_hud.set_flow(_grind_caught_this_seg, _grind_total_this_seg, _grind_flow_mult,
+		_grind_rail_active and _grind_total_this_seg > 0)
 
 
 # Drop the player off the rail mid-section after too many missed sparks. They forfeit
@@ -6664,8 +6385,8 @@ func _grind_fail_off() -> void:
 		return
 	_grind_failed = true
 	_show_grind_banner("✕  DROPPED!", Color(1.0, 0.35, 0.30))
-	if _hud_grind_label != null:
-		_hud_grind_label.visible = false
+	if _hud != null:
+		_hud.set_flow(0, 0, 1, false)
 
 
 # Floating "+score" popup at a world position, drifting up and fading. Larger and
@@ -6734,58 +6455,29 @@ func _score_multiplier() -> int:
 
 
 func _update_wj_bonus_label() -> void:
-	if _hud_wj_label == null:
+	if _hud == null:
 		return
 	if _wj_mult_timer <= 0.0:
-		_hud_wj_label.visible = false
+		_hud.set_wall_jump(false)
 		return
-	# Fade out gracefully in the last 2 seconds
-	var alpha: float = clamp(_wj_mult_timer / 2.0, 0.0, 1.0)
-	_hud_wj_label.visible = true
-	_hud_wj_label.modulate = Color(1.0, 1.0, 1.0, alpha)
+	# Fade out gracefully over the last 2 seconds.
+	_hud.set_wall_jump(true, clampf(_wj_mult_timer / 2.0, 0.0, 1.0))
 
 
 func _activate_wj_bonus() -> void:
 	_wj_mult_timer = _WJ_MULT_DURATION
-	if _hud_wj_label != null:
-		_hud_wj_label.visible = true
-		_hud_wj_label.modulate = Color(1.0, 1.0, 1.0, 1.0)
+	if _hud != null:
+		_hud.set_wall_jump(true, 1.0)
 	# Gold screen flash to signal the bonus
 	_hud_flash_color(Color(1.00, 0.80, 0.10, 0.30), 0.50)
 
 
 func _update_hud_score() -> void:
-	if _hud_score_label != null:
-		var delta: int = _score - _hud_score_prev
-		_hud_score_prev = _score
-		var changed: bool = delta != 0
-		_hud_score_label.text = str(_score)
-		if changed:
-			# Punch-scale...
-			var stw := create_tween()
-			stw.tween_property(_hud_score_label, "scale", Vector2(1.16, 1.16), 0.06) \
-				.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-			stw.tween_property(_hud_score_label, "scale", Vector2.ONE, 0.16) \
-				.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
-			# ...plus a bright flash-pulse so an increase reads as a beat, not just new text.
-			if _hud_score_flash_tw != null and _hud_score_flash_tw.is_valid():
-				_hud_score_flash_tw.kill()
-			_hud_score_label.modulate = Color(2.0, 2.0, 2.0, 1.0)
-			_hud_score_flash_tw = create_tween()
-			_hud_score_flash_tw.tween_property(_hud_score_label, "modulate", Color.WHITE, 0.24) \
-				.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
-		if delta > 0:
-			_hud_spawn_score_popup(delta)
-	if _hud_combo_label != null:
-		if _combo >= 2:
-			var m: int = _score_multiplier()
-			if m > 1:
-				_hud_combo_label.text = "× %d  COMBO  %d✕" % [_combo, m]
-			else:
-				_hud_combo_label.text = "× %d  COMBO" % _combo
-		else:
-			_hud_combo_label.text = ""
-	_hud_score_bump()
+	if _hud == null:
+		return
+	var delta: int = _score - _hud_score_prev
+	_hud_score_prev = _score
+	_hud.set_score(_score, _combo, _score_multiplier(), maxi(delta, 0))
 
 
 ## Keeps the score card at full opacity while things are happening, then lets it
@@ -6793,14 +6485,8 @@ func _update_hud_score() -> void:
 ## reads clearly in the moment but doesn't compete for attention with the lanes
 ## during a quiet stretch. Called on every score update.
 func _hud_score_bump() -> void:
-	if _hud_score_group == null:
-		return
-	if _hud_score_idle_tw != null and _hud_score_idle_tw.is_valid():
-		_hud_score_idle_tw.kill()
-	_hud_score_group.modulate.a = 1.0
-	_hud_score_idle_tw = create_tween()
-	_hud_score_idle_tw.tween_interval(2.2)
-	_hud_score_idle_tw.tween_property(_hud_score_group, "modulate:a", 0.62, 0.5)
+	if _hud != null:
+		_hud.score_bump()
 
 
 ## Floating "+N" that pops up above the score card and drifts up while fading —
@@ -6808,39 +6494,8 @@ func _hud_score_bump() -> void:
 ## Drives its own offsets directly (not "position") since a freshly-added
 ## Control's position isn't valid until the next layout pass — offsets are.
 func _hud_spawn_score_popup(delta_pts: int) -> void:
-	if _hud_score_group == null or delta_pts <= 0:
-		return
-	var lbl := Label.new()
-	lbl.text = "+%d" % delta_pts
-	lbl.anchor_left  = 1.0; lbl.anchor_right  = 1.0
-	lbl.anchor_top   = 0.0; lbl.anchor_bottom = 0.0
-	lbl.grow_horizontal = Control.GROW_DIRECTION_BEGIN
-	lbl.offset_left   = -(_hud_score_card_m + _hud_score_card_w)
-	lbl.offset_right  = -_hud_score_card_m
-	lbl.offset_top    = _hud_score_card_m - 6.0
-	lbl.offset_bottom = _hud_score_card_m + 18.0
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	lbl.add_theme_font_size_override("font_size", 15)
-	lbl.add_theme_color_override("font_color", Color(1.0, 1.0, 1.0, 1.0))
-	lbl.add_theme_color_override("font_outline_color", Color(0.0, 0.0, 0.0, 0.65))
-	lbl.add_theme_constant_override("outline_size", 4)
-	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	lbl.modulate.a   = 0.0
-	_hud_score_group.add_child(lbl)
-
-	var top0: float = lbl.offset_top
-	var bot0: float = lbl.offset_bottom
-	var tw_move := create_tween()
-	tw_move.tween_method(func(v: float) -> void:
-		lbl.offset_top    = top0 + v
-		lbl.offset_bottom = bot0 + v
-	, 0.0, -30.0, 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
-
-	var tw_fade := create_tween()
-	tw_fade.tween_property(lbl, "modulate:a", 1.0, 0.08)
-	tw_fade.tween_interval(0.32)
-	tw_fade.tween_property(lbl, "modulate:a", 0.0, 0.30)
-	tw_fade.tween_callback(lbl.queue_free)
+	if _hud != null:
+		_hud.score_popup(delta_pts)
 
 
 ## force_pulse: play the heal-pulse even if HP is already capped at 100% (or
@@ -6848,315 +6503,99 @@ func _hud_spawn_score_popup(delta_pts: int) -> void:
 ## the bar still gives positive feedback for "you did that right" at full HP,
 ## where the fill itself has nothing left to show for it.
 func _update_hud_health(force_pulse: bool = false) -> void:
-	if _hud_hp_seg_fills.is_empty():
-		return
-	var pct: float = clamp(_health_pct, 0.0, 1.0)
-
-	if force_pulse or pct > _hud_hp_displayed_pct + 0.0005:
-		_hud_hp_heal_pulse()
-
-	# Animate width + the percentage readout together via tween_method so the bar
-	# visibly slides from the old value to the new one over half a second, rather
-	# than snapping instantly. Segment colour is NOT touched here — each segment's
-	# strobe colour is owned entirely by _update_hud_rainbow, independent of this.
-	if _hud_hp_fill_tw != null and _hud_hp_fill_tw.is_valid():
-		_hud_hp_fill_tw.kill()
-	_hud_hp_fill_tw = create_tween()
-	_hud_hp_fill_tw.tween_method(_hud_hp_apply_display, _hud_hp_displayed_pct, pct, 0.55) \
-		.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
-
-	_hud_update_low_health_warning(pct)
+	if _hud != null:
+		_hud.set_health(_health_pct, force_pulse)
 
 
-## Punch-scale + brightness flash on the bar itself when HP goes UP — mirrors the
-## score's pulse so a heal reads as a beat, not just a bar quietly sliding wider.
-## Applied to the segment Panels directly (not _hud_hp_group), since the group's
-## own modulate is already owned by the low-HP warning loop — this stays clear of it.
-## Each segment gets its own two tweens (scale sequence + fade); harmless if a
-## fast heal streak restarts one mid-flight — Tween just keeps driving the
-## property toward whatever the newest target is.
 func _hud_hp_heal_pulse() -> void:
-	for track in _hud_hp_seg_tracks:
-		if track == null:
-			continue
-		track.scale    = Vector2.ONE
-		track.modulate = Color(1.7, 1.7, 1.7, 1.0)
-
-		var seq := create_tween()
-		seq.tween_property(track, "scale", Vector2(1.0, 1.35), 0.07) \
-			.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		seq.tween_property(track, "scale", Vector2.ONE, 0.18) \
-			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
-
-		var fade := create_tween()
-		fade.tween_property(track, "modulate", Color.WHITE, 0.22) \
-			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_OUT)
+	if _hud != null:
+		_hud.hp_heal_pulse()
 
 
-## One animated frame of the HP bar's slide — called continuously by the tween in
-## _update_hud_health. Each of the 3 segments fills proportionally to how much of
-## its own third the current (animated) health value covers.
-func _hud_hp_apply_display(pct: float) -> void:
-	_hud_hp_displayed_pct = pct
-	if _hud_hp_pct_label != null:
-		_hud_hp_pct_label.text = "%d%%" % int(round(pct * 100.0))
-	for i in range(_hud_hp_seg_fills.size()):
-		var frac: float = clampf(pct * float(_HUD_HP_SEGMENTS) - float(i), 0.0, 1.0)
-		var fill_w: float = _hud_hp_seg_w * frac
-		var seg_fill: Panel = _hud_hp_seg_fills[i]
-		if seg_fill != null:
-			seg_fill.offset_right = fill_w
-		# Keep the electric-arc overlay's shader in sync with the fill's
-		# CURRENT (animated) width, so its rounded-pill clipping never lags
-		# a frame behind or squishes against the wrong size.
-		if i < _hud_hp_lightning.size() and _hud_hp_lightning[i] != null:
-			var bolt_mat: ShaderMaterial = _hud_hp_lightning[i].material as ShaderMaterial
-			if bolt_mat != null:
-				bolt_mat.set_shader_parameter("rect_size", Vector2(maxf(0.01, fill_w), _hud_hp_bar_h))
-				bolt_mat.set_shader_parameter("hp_pct", pct)
+# (The animated fill, the percentage readout and the damage-lag ghost trail are
+# driven inside GameHud.set_health now.)
 
 
-## Below this HP the bar gently pulses to make sure a distracted player notices —
-## resting state otherwise stays calm so it never fights for attention on its own.
-const _HUD_LOW_HP_THRESHOLD: float = 0.20
-
+## Below GameHud.LOW_HP_THRESHOLD the bar strobes so a distracted player notices;
+## the resting state otherwise stays calm and never fights for attention.
 func _hud_update_low_health_warning(pct: float) -> void:
-	if _hud_hp_group == null:
-		return
-	var critical: bool = pct < _HUD_LOW_HP_THRESHOLD
-	var pulsing: bool  = _hud_hp_pulse_tw != null and _hud_hp_pulse_tw.is_valid()
-	if critical and not pulsing:
-		_hud_hp_pulse_tw = _hud_hp_group.create_tween().set_loops()
-		_hud_hp_pulse_tw.tween_property(_hud_hp_group, "modulate", Color(1.5, 0.55, 0.55, 1.0), 0.35) \
-			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		_hud_hp_pulse_tw.tween_property(_hud_hp_group, "modulate", Color.WHITE, 0.35) \
-			.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	elif not critical and pulsing:
-		_hud_hp_pulse_tw.kill()
-		_hud_hp_group.modulate = Color.WHITE
+	if _hud != null:
+		_hud.set_low_health(pct < GameHud.LOW_HP_THRESHOLD)
 
 
-## "Echoes in his blood" — Meeko's HUD chrome never settles on one colour. The
-## score card and the HP bar both drift smoothly and continuously through the
-## same hue cycle at the same speed, but in OPPOSITE directions — score runs
-## red→orange→yellow→green→blue→purple while the HP bar runs the reverse, so
-## they're always sweeping past each other rather than moving in lockstep.
-const _HUD_RAINBOW_SAT: float = 0.72
-const _HUD_RAINBOW_VAL: float = 1.0
-
+## "Echoes in his blood" — Meeko's HUD chrome still never settles on one colour,
+## but it no longer sweeps the whole hue wheel. It walks the game's own band
+## (pink → violet → cyan) and ping-pongs back; the score plate and the HP bar run
+## it in opposite directions, so they sweep past each other without either one
+## ever leaving the palette. See UiStyle.signature_color.
 func _update_hud_rainbow(delta: float) -> void:
-	_hud_rainbow_hue = fmod(_hud_rainbow_hue + delta * 0.055, 1.0)   # ~18 s per full loop
-
-	if _hud_score_card != null:
-		var c_border: Color = Color.from_hsv(fmod(_hud_rainbow_hue, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
-		if _hud_card_sb == null:
-			_hud_card_sb = _hud_card_style(c_border)
-			_hud_score_card.add_theme_stylebox_override("panel", _hud_card_sb)
-		else:
-			_hud_card_sb.border_color = c_border
-			_hud_card_sb.shadow_color = Color(c_border.r, c_border.g, c_border.b, 0.35)
-	# self_modulate, NOT add_theme_color_override. An override fires
-	# NOTIFICATION_THEME_CHANGED, which throws away the Label's shaped-text buffer
-	# AND calls update_minimum_size() - dirtying the enclosing VBox/MarginContainer
-	# and queueing a layout sort. Doing that three times a frame forever meant
-	# re-shaping text at the render rate. self_modulate is a plain CanvasItem
-	# property: one RenderingServer call, no re-shape, no re-sort. The base
-	# font_color is white (set in _create_hud) so the product is identical, and it
-	# still stacks correctly with the score-flash tween, which drives modulate.
-	if _hud_score_cap != null:
-		var c_cap: Color = Color.from_hsv(fmod(_hud_rainbow_hue + 0.08, 1.0), _HUD_RAINBOW_SAT * 0.8, 1.0)
-		_hud_score_cap.self_modulate = Color(c_cap.r, c_cap.g, c_cap.b, 0.80)
-	if _hud_score_label != null:
-		_hud_score_label.self_modulate = Color.from_hsv(fmod(_hud_rainbow_hue + 0.14, 1.0), _HUD_RAINBOW_SAT * 0.55, 1.0)
-
-	_update_hud_hp_color()
-
-	if _hud_progress_fill != null:
-		var c_prog: Color = Color.from_hsv(fmod(_hud_rainbow_hue * 0.8 + 0.60, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
-		_hud_progress_fill.color = c_prog
-		if _hud_prog_cap != null:
-			_hud_prog_cap.color = Color(c_prog.r, c_prog.g, c_prog.b, 0.90).lightened(0.35)
+	if _hud == null:
+		return
+	_hud_rainbow_hue = fmod(_hud_rainbow_hue + delta * 0.055, 2.0)
+	_hud.set_chrome_phase(_hud_rainbow_hue)
 
 
 ## HP bar colour — same hue cycle as the score card, same speed (both driven by
 ## _hud_rainbow_hue), running backwards (1.0 - hue instead of hue). Fill and
 ## outline always match (computed once, applied to both).
-func _update_hud_hp_color() -> void:
-	var c: Color = Color.from_hsv(fmod(1.0 - _hud_rainbow_hue, 1.0), _HUD_RAINBOW_SAT, _HUD_RAINBOW_VAL)
-	for i in range(_hud_hp_seg_tracks.size()):
-		var round_l: bool = i == 0
-		var round_r: bool = i == _hud_hp_seg_tracks.size() - 1
-
-		var seg_track: Panel = _hud_hp_seg_tracks[i]
-		if seg_track != null:
-			if i >= _hud_hp_track_sbs.size():
-				var t_sb: StyleBoxFlat = _hud_pill_style_sides(
-					Color(0.05, 0.02, 0.09, 0.90), _hud_hp_bar_h * 0.5, round_l, round_r, c)
-				_hud_hp_track_sbs.append(t_sb)
-				seg_track.add_theme_stylebox_override("panel", t_sb)
-			else:
-				_hud_hp_track_sbs[i].border_color = c
-
-		var seg_fill: Panel = _hud_hp_seg_fills[i] if i < _hud_hp_seg_fills.size() else null
-		if seg_fill != null:
-			if i >= _hud_hp_fill_sbs.size():
-				var f_sb: StyleBoxFlat = _hud_pill_style_sides(
-					c, _hud_hp_bar_h * 0.5, round_l, round_r)
-				_hud_hp_fill_sbs.append(f_sb)
-				seg_fill.add_theme_stylebox_override("panel", f_sb)
-			else:
-				_hud_hp_fill_sbs[i].bg_color = c
-
-	if _hud_hp_pct_label != null:
-		# Same reasoning as _update_hud_rainbow: self_modulate, not a theme override.
-		# The black text outline stays black (black times anything is black) and
-		# keeps its alpha, because this colour is fully opaque.
-		_hud_hp_pct_label.self_modulate = c.lightened(0.35)
+# (HP bar colour is part of the same signature walk — see GameHud.set_chrome_phase.)
 
 
-## Viewport-relative scale for the persistent gameplay HUD, matched to the same
-## 1920×1080 reference and clamp style HowToPlay's cards use, kept slightly
-## tighter so the HUD never grows large enough to crowd the play lanes.
-func _hud_s() -> float:
-	return clampf(minf(_vp_size.x / 1920.0, _vp_size.y / 1080.0), 0.75, 1.3)
+# (Viewport scale now lives in UiStyle.scale_for, shared with the menus.)
 
 
-func _refresh_vp_size() -> void:
-	var vp: Viewport = get_viewport()
-	if vp != null:
-		_vp_size = vp.get_visible_rect().size
+# (Chassis panels are drawn by shaders/hud_plate.gdshader; flat styleboxes that
+# are still needed live in UiStyle.card / UiStyle.pill / UiStyle.pill_sides.)
 
 
-## Rounded card stylebox with a soft built-in glow (StyleBoxFlat's own shadow),
-## used for the score/combo card — replaces the old stacked glow+bg ColorRects.
-func _hud_card_style(border_col: Color) -> StyleBoxFlat:
-	var sf := StyleBoxFlat.new()
-	sf.bg_color     = Color(0.04, 0.02, 0.10, 0.90)
-	sf.border_color = border_col
-	sf.border_width_left = 1; sf.border_width_right  = 1
-	sf.border_width_top  = 1; sf.border_width_bottom = 1
-	sf.corner_radius_top_left     = 10; sf.corner_radius_top_right    = 10
-	sf.corner_radius_bottom_left  = 10; sf.corner_radius_bottom_right = 10
-	sf.shadow_color = Color(border_col.r, border_col.g, border_col.b, 0.35)
-	sf.shadow_size  = 8
-	return sf
+# (The lightning arc survives as the bolt_amount mode of
+# shaders/hud_bar.gdshader, tuning intact.)
 
 
-## Fully-rounded ("pill") stylebox — used for both the HP bar track and its fill,
-## so the fill always reads as a rounded cap rather than a square bar poking out
-## of a rounded frame. border_col is optional (fill panel has no border).
-func _hud_pill_style(fill_col: Color, radius: float, border_col: Color = Color(0, 0, 0, 0)) -> StyleBoxFlat:
-	return _hud_pill_style_sides(fill_col, radius, true, true, border_col)
+## The same chevron pips the HUD draws under the HP bar, as a standalone row for
+## the death card — two readouts of the same number should look like the same
+## thing rather than one being pips and the other the words "2 lives remaining".
+func _make_life_pip_row(remaining: int, total: int, s: float) -> Control:
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", int(8 * s))
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+
+	var bar_shader: Shader = load("res://shaders/hud_bar.gdshader") as Shader
+	for i in maxi(total, 0):
+		var spent: bool = i >= remaining
+		var pip := ColorRect.new()
+		pip.color = Color.WHITE
+		pip.custom_minimum_size = Vector2(46 * s, 12 * s)
+		pip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		var m := ShaderMaterial.new()
+		m.shader = bar_shader
+		m.set_shader_parameter("rect_size",   Vector2(46 * s, 12 * s))
+		m.set_shader_parameter("skew_px",     5.0)
+		m.set_shader_parameter("tick_count",  0.0)
+		m.set_shader_parameter("bolt_amount", 0.0)
+		m.set_shader_parameter("fill_pct",    0.0 if spent else 1.0)
+		m.set_shader_parameter("ghost_pct",   0.0)
+		m.set_shader_parameter("ghost_color", Color(0, 0, 0, 0))
+		m.set_shader_parameter("fill_color",  UiStyle.PINK)
+		m.set_shader_parameter("fill_color2", UiStyle.VIOLET)
+		m.set_shader_parameter("edge_color",  UiStyle.PINK)
+		pip.material = m
+		pip.modulate = Color(1, 1, 1, 0.55) if spent else Color.WHITE
+		row.add_child(pip)
+	return row
 
 
-## Same as _hud_pill_style, but each end's rounding can be switched off. Used by
-## the segmented HP bar: only the FIRST segment rounds its left corners and only
-## the LAST rounds its right corners, with every segment butted flush against
-## its neighbour (no gap) — so the three colours read as one continuous pill-
-## shaped bar with coloured zones, not three separate rounded chips in a row.
-func _hud_pill_style_sides(fill_col: Color, radius: float, round_left: bool, round_right: bool,
-		border_col: Color = Color(0, 0, 0, 0)) -> StyleBoxFlat:
-	var sf := StyleBoxFlat.new()
-	sf.bg_color = fill_col
-	var r: int = int(radius)
-	sf.corner_radius_top_left     = r if round_left  else 0
-	sf.corner_radius_bottom_left  = r if round_left  else 0
-	sf.corner_radius_top_right    = r if round_right else 0
-	sf.corner_radius_bottom_right = r if round_right else 0
-	if border_col.a > 0.0:
-		sf.border_color = border_col
-		sf.border_width_left = 1; sf.border_width_right  = 1
-		sf.border_width_top  = 1; sf.border_width_bottom = 1
-	return sf
-
-
-## Lazily builds (and caches) the shader that draws the flickering electric
-## arcs inside the HP bar filler. A few thin jagged bolts crackle sideways at
-## random intervals, clipped to the fill's own rounded-pill shape via an SDF
-## so they never bleed square corners past the bar's rounded ends.
-func _hud_electric_shader() -> Shader:
-	if _hud_electric_shader_cache != null:
-		return _hud_electric_shader_cache
-	var sh := Shader.new()
-	sh.code = """
-shader_type canvas_item;
-
-uniform float radius = 9.5;
-uniform vec2  rect_size = vec2(216.0, 19.0);
-uniform float seed = 0.0;
-uniform float hp_pct = 1.0;   // drives activity — calm/sparse near death, frantic near full
-
-float sdf_rounded_box(vec2 p, vec2 half_size, float r) {
-	vec2 q = abs(p) - half_size + r;
-	return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-}
-
-float hash1(float n) {
-	return fract(sin(n) * 43758.5453123);
-}
-
-void fragment() {
-	vec2 px = (UV - 0.5) * rect_size;
-	float d = sdf_rounded_box(px, rect_size * 0.5, min(radius, min(rect_size.x, rect_size.y) * 0.5));
-	if (d > 0.0) {
-		discard;
-	}
-
-	vec3  col   = vec3(0.0);
-	float alpha = 0.0;
-
-	// A SINGLE bolt, centered on the bar's mid-height, running left to
-	// right. Activity reacts to HP: near death it's a rare, dim, slow,
-	// nearly-straight ember; near full it's fast, bright, and jagged —
-	// genuinely looks alive vs. barely hanging on.
-	float hp    = clamp(hp_pct, 0.0, 1.0);
-	float speed = mix(1.5, 9.0, hp);          // sluggish -> frantic
-	float t     = TIME * speed;
-
-	// Flicker gate — the bolt only strikes during short random bursts.
-	// Threshold scales with HP: rare embers when low, near-constant arcing
-	// when full.
-	float flick_thresh = mix(0.93, 0.55, hp);
-	float flick = step(flick_thresh, fract(sin(floor(t) * 12.9898 + seed) * 43758.5453));
-
-	if (flick > 0.5) {
-		// Jagged path centered on UV.y = 0.5 (middle of the bar), wobbled by
-		// THREE overlapping sine waves at rising frequency/falling weight —
-		// a hand-drawn zigzag instead of one smooth curve, like a real
-		// lightning fork. Wobble amplitude grows with HP — calmer and
-		// straighter when weak, wild when strong.
-		float wob_amp = mix(0.05, 0.20, hp);
-		float wob = sin(UV.x * 14.0 + t * 3.0 + seed)       * wob_amp
-				  + sin(UV.x * 33.0 - t * 5.0 + seed * 2.0) * wob_amp * 0.55
-				  + sin(UV.x * 71.0 + t * 8.0 + seed * 3.0) * wob_amp * 0.25;
-		float ly   = clamp(0.5 + wob, 0.0, 1.0);
-		float dist = abs(UV.y - ly);
-
-		// Two-layer bolt — a thick bright core plus a wider soft glow halo —
-		// reads as an actual lightning bolt instead of a flat thin line.
-		float core = smoothstep(0.11, 0.0, dist);
-		float glow = smoothstep(0.24, 0.0, dist) * 0.5;
-
-		float bright  = mix(0.35, 1.0, hp);   // dimmer ember when low HP
-		vec3  boltcol = vec3(0.85, 0.94, 1.0);
-		col   += boltcol * (core + glow) * bright;
-		alpha += (core + glow) * bright;
-	}
-
-	alpha = clamp(alpha, 0.0, 0.9);
-	COLOR = vec4(col, alpha);
-}
-"""
-	_hud_electric_shader_cache = sh
-	return sh
+## Pushes the current life count to the HUD's pips. Called wherever
+## Run.song_lives changes while a level is still on screen.
+func _sync_hud_lives() -> void:
+	if _hud != null:
+		_hud.set_lives(Run.song_lives, GameConfig.lives_per_song)
 
 
 func _hud_flash_color(col: Color, duration: float) -> void:
-	if _hud_flash == null:
-		return
-	_hud_flash.color = col
-	var ftw := create_tween()
-	ftw.tween_property(_hud_flash, "color", Color(col.r, col.g, col.b, 0.0), duration)
+	if _hud != null:
+		_hud.flash(col, duration)
 
 
 ## Brief dev toast — a small label that fades in/out over the HUD canvas.
@@ -7202,10 +6641,8 @@ func _on_gate_scored(success: bool) -> void:
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
 		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.14), 0.30)   # softened — this fires on every hit
 		# Combo label bounce
-		if _hud_combo_label != null and _combo >= 2:
-			var ctw := create_tween()
-			ctw.tween_property(_hud_combo_label, "modulate", Color(1.5, 1.3, 0.4, 1.0), 0.05)
-			ctw.tween_property(_hud_combo_label, "modulate", Color(1.0, 1.0, 1.0, 1.0), 0.14)
+		if _hud != null and _combo >= 2:
+			_hud.combo_flash(Color(1.5, 1.3, 0.4, 1.0), 0.05, 0.14)
 		# Streak milestones
 		const MILESTONES: Array[int] = [10, 25, 50, 100, 200]
 		if _combo in MILESTONES:
@@ -7226,10 +6663,8 @@ func _on_gate_scored(success: bool) -> void:
 		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.30), 0.40)   # softened — was washing out the lanes on miss
 		_shake_camera()
 		# Combo label flash red then vanish
-		if _hud_combo_label != null:
-			var ctw := create_tween()
-			ctw.tween_property(_hud_combo_label, "modulate", Color(1.0, 0.15, 0.15, 1.0), 0.05)
-			ctw.tween_property(_hud_combo_label, "modulate", Color(1.0, 1.0, 1.0, 1.0), 0.20)
+		if _hud != null:
+			_hud.combo_flash(Color(1.0, 0.15, 0.15, 1.0), 0.05, 0.20)
 		if _sfx_miss != null:
 			_sfx_miss.stop()
 			_sfx_miss.play()
@@ -7282,208 +6717,135 @@ func _trigger_death() -> void:
 
 	music.stop()
 
-	# ── 3-lives system ────────────────────────────────────────────────────────
+	# ── 3-lives system ──────────────────────────────────────────────────────
 	Run.song_lives -= 1
+	_sync_hud_lives()
 	var lives_exhausted: bool = (Run.song_lives <= 0)
 	if lives_exhausted:
-		# All tries used — roll a fresh seed (never-before-seen) and give 3 new lives
+		# All tries used — roll a fresh seed (never-before-seen) and refill lives
 		_runner_rng.randomize()
 		while Save.is_seed_used(Run.current_song_key, _runner_rng.seed):
 			_runner_rng.randomize()
 		Run.run_seed   = _runner_rng.seed
-		Run.song_lives = 3
+		Run.song_lives = GameConfig.lives_per_song
 		Save.mark_seed_used(Run.current_song_key, Run.run_seed)
+	_sync_hud_lives()
 
 	# Big red death flash
 	_hud_flash_color(Color(1.00, 0.05, 0.05, 0.75), 0.15)
 
-	if _hud_flash == null:
-		return
-	var root: Control = _hud_flash.get_parent() as Control
+	var root: Control = _overlay_root()
 	if root == null:
 		return
 
-	# ── Phase 1: fade to solid black ────────────────────────────────────────
+	var s: float = UiStyle.scale_for(_vp())
+
+	# ── Phase 1: fade to solid black ────────────────────────────────
 	var blackout := ColorRect.new()
-	blackout.color         = Color(0.00, 0.00, 0.00, 1.0)
-	blackout.anchor_right  = 1.0; blackout.anchor_bottom = 1.0
-	blackout.mouse_filter  = Control.MOUSE_FILTER_IGNORE
-	blackout.modulate.a    = 0.0
+	blackout.color        = Color(0.02, 0.01, 0.04, 1.0)
+	blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	blackout.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	blackout.modulate.a   = 0.0
 	root.add_child(blackout)
 
-	# ── Phase 2: UI elements — built now, revealed after blackout ───────────
-	# Title: "FAILED" or "OUT OF TRIES"
-	var fail_label := Label.new()
-	fail_label.text = "OUT OF TRIES" if lives_exhausted else "FAILED"
-	fail_label.anchor_left   = 0.5; fail_label.anchor_right  = 0.5
-	fail_label.anchor_top    = 0.5; fail_label.anchor_bottom = 0.5
-	fail_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	fail_label.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	fail_label.offset_left   = -300; fail_label.offset_right  = 300
-	fail_label.offset_top    = -160; fail_label.offset_bottom = -60
-	fail_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	fail_label.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
-	fail_label.add_theme_color_override("font_color",
-		Color(1.00, 0.55, 0.05, 1.0) if lives_exhausted else Color(1.00, 0.18, 0.28, 1.0))
-	fail_label.add_theme_font_size_override("font_size", 72 if lives_exhausted else 80)
-	fail_label.modulate.a  = 0.0
-	fail_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(fail_label)
+	# ── Phase 2: the card, built now and revealed once the blackout lands ───
+	var card := PlatePanel.create(int(36 * s), UiStyle.DANGER, 28.0 * s)
+	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	card.custom_minimum_size = Vector2(600 * s, 0)
+	card.modulate.a = 0.0
+	root.add_child(card)
 
-	# Score readout
-	var score_label := Label.new()
-	score_label.text = "score  %d" % _score
-	score_label.anchor_left   = 0.5; score_label.anchor_right  = 0.5
-	score_label.anchor_top    = 0.5; score_label.anchor_bottom = 0.5
-	score_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	score_label.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	score_label.offset_left  = -200; score_label.offset_right  = 200
-	score_label.offset_top   = -50;  score_label.offset_bottom = -8
-	score_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_label.add_theme_color_override("font_color", Color(0.85, 0.75, 1.00, 0.90))
-	score_label.add_theme_font_size_override("font_size", 22)
-	score_label.modulate.a  = 0.0
-	score_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(score_label)
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", int(6 * s))
+	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(vbox)
 
-	# Sub-message: lives remaining  OR  new-seed notice
-	var sub_label := Label.new()
+	var title_col: Color = Color(1.00, 0.62, 0.12) if lives_exhausted else UiStyle.DANGER
+	var title: Label = UiStyle.label(
+		"OUT OF TRIES" if lives_exhausted else "FAILED",
+		UiStyle.display(900, 3.0), int((52 if lives_exhausted else 64) * s), Color.WHITE)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.self_modulate = title_col
+	vbox.add_child(title)
+
+	var score_cap: Label = UiStyle.label("SCORE", UiStyle.caption(4.0), int(11 * s), Color.WHITE)
+	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	score_cap.self_modulate = Color(0.70, 0.62, 0.88, 0.80)
+	vbox.add_child(score_cap)
+
+	var score_lbl: Label = UiStyle.label(
+		UiStyle.group_digits(_score), UiStyle.display(800), int(34 * s), Color.WHITE)
+	score_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	score_lbl.self_modulate = UiStyle.signature_color(0.30)
+	vbox.add_child(score_lbl)
+
+	# Lives remaining, as the same pips the HUD uses — so the two readouts of the
+	# same number look like the same thing.
 	if lives_exhausted:
-		sub_label.text = "All 3 tries used — a brand new route has been generated!"
+		var note: Label = UiStyle.label(
+			"ALL TRIES USED — A BRAND NEW ROUTE HAS BEEN GENERATED",
+			UiStyle.caption(1.5), int(11 * s), Color.WHITE)
+		note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		note.self_modulate = Color(1.00, 0.78, 0.24, 0.95)
+		vbox.add_child(note)
 	else:
-		var lv: int = Run.song_lives
-		sub_label.text = "%d %s remaining" % [lv, "life" if lv == 1 else "lives"]
-	sub_label.anchor_left   = 0.5; sub_label.anchor_right  = 0.5
-	sub_label.anchor_top    = 0.5; sub_label.anchor_bottom = 0.5
-	sub_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	sub_label.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	sub_label.offset_left  = -260; sub_label.offset_right  = 260
-	sub_label.offset_top   = -4;   sub_label.offset_bottom = 20
-	sub_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	sub_label.add_theme_color_override("font_color",
-		Color(1.00, 0.78, 0.20, 0.95) if lives_exhausted else Color(0.45, 0.92, 0.55, 0.90))
-	sub_label.add_theme_font_size_override("font_size", 15)
-	sub_label.modulate.a  = 0.0
-	sub_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(sub_label)
+		vbox.add_child(_make_life_pip_row(Run.song_lives, GameConfig.lives_per_song, s))
 
-	# Divider line (shifted down to leave room for sub_label)
-	var divider := ColorRect.new()
-	divider.color = Color(0.55, 0.20, 0.90, 0.60)
-	divider.anchor_left   = 0.5; divider.anchor_right  = 0.5
-	divider.anchor_top    = 0.5; divider.anchor_bottom = 0.5
-	divider.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	divider.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	divider.offset_left  = -180; divider.offset_right  = 180
-	divider.offset_top   = 28;   divider.offset_bottom = 30
-	divider.modulate.a   = 0.0
-	divider.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(divider)
+	var rule := ColorRect.new()
+	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.50)
+	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
+	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vbox.add_child(rule)
 
-	# Option helper — panel + label
-	var _make_option: Callable = func(label_text: String, y_top: float, y_bot: float) -> Control:
-		var panel := Panel.new()
-		panel.anchor_left   = 0.5; panel.anchor_right  = 0.5
-		panel.anchor_top    = 0.5; panel.anchor_bottom = 0.5
-		panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
-		panel.grow_vertical   = Control.GROW_DIRECTION_BOTH
-		panel.offset_left  = -170; panel.offset_right  = 170
-		panel.offset_top   = y_top; panel.offset_bottom = y_bot
-		panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var sb := StyleBoxFlat.new()
-		sb.bg_color     = Color(0.10, 0.04, 0.20, 1.0)
-		sb.border_color = Color(0.55, 0.18, 0.90, 1.0)
-		sb.border_width_left = 2; sb.border_width_right  = 2
-		sb.border_width_top  = 2; sb.border_width_bottom = 2
-		sb.corner_radius_top_left     = 8; sb.corner_radius_top_right    = 8
-		sb.corner_radius_bottom_left  = 8; sb.corner_radius_bottom_right = 8
-		sb.content_margin_left  = 16; sb.content_margin_right  = 16
-		sb.content_margin_top   = 10; sb.content_margin_bottom = 10
-		panel.add_theme_stylebox_override("panel", sb)
-		var lbl := Label.new()
-		lbl.text = label_text
-		lbl.anchor_right  = 1.0; lbl.anchor_bottom = 1.0
-		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		lbl.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
-		lbl.add_theme_color_override("font_color", Color(0.70, 0.55, 1.00, 1.0))
-		lbl.add_theme_font_size_override("font_size", 26)
-		lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		panel.add_child(lbl)
-		panel.modulate.a = 0.0
-		return panel
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, 10 * s)
+	vbox.add_child(gap)
 
-	var retry_text: String = "▶  PLAY NEW SEED" if lives_exhausted else "▶  RETRY"
-	var retry_node   := _make_option.call(retry_text, 50, 102) as Control
-	var songsel_node := _make_option.call("↩  SONG SELECT", 116, 168) as Control
-	root.add_child(retry_node)
-	root.add_child(songsel_node)
+	var opt_texts: Array[String] = [
+		"▶  PLAY NEW SEED" if lives_exhausted else "▶  RETRY",
+		"↩  SONG SELECT",
+		"⌂  MAIN MENU",
+	]
+	_death_option_nodes.clear()
+	for i in opt_texts.size():
+		var btn := PlateButton.create(opt_texts[i], Callable(), int(19 * s), UiStyle.PINK)
+		btn.focus_mode = Control.FOCUS_NONE   # selection is driven by _death_menu_option
+		btn.custom_minimum_size = Vector2(0, 52 * s)
+		vbox.add_child(btn)
+		_death_option_nodes.append(btn)
+	_death_menu_option = 0
 
-	_death_option_nodes = [retry_node, songsel_node]
-	_death_menu_option  = 0
+	var hint_gap := Control.new()
+	hint_gap.custom_minimum_size = Vector2(0, 8 * s)
+	vbox.add_child(hint_gap)
 
-	# Hint line
-	var hint_label := Label.new()
-	hint_label.text = "↑↓ / D-pad choose  ·  Enter / A confirm"
-	hint_label.anchor_left   = 0.5; hint_label.anchor_right  = 0.5
-	hint_label.anchor_top    = 0.5; hint_label.anchor_bottom = 0.5
-	hint_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	hint_label.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	hint_label.offset_left  = -240; hint_label.offset_right  = 240
-	hint_label.offset_top   = 182;  hint_label.offset_bottom = 210
-	hint_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint_label.add_theme_color_override("font_color", Color(0.50, 0.45, 0.65, 0.80))
-	hint_label.add_theme_font_size_override("font_size", 14)
-	hint_label.modulate.a  = 0.0
-	hint_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	root.add_child(hint_label)
+	var hint: Label = UiStyle.label(
+		"↑↓ / D-PAD CHOOSE  ·  ENTER / A CONFIRM",
+		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
+	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	hint.self_modulate = Color(0.58, 0.52, 0.72, 0.75)
+	vbox.add_child(hint)
 
-	# ── Sequence: fade to black → then reveal UI on top ─────────────────────
+	# ── Sequence: fade to black → reveal the card on top ───────────────
 	var ftw := create_tween()
 	ftw.tween_property(blackout, "modulate:a", 1.0, 0.55)
+	ftw.tween_property(card, "modulate:a", 1.0, 0.32)
 	ftw.tween_callback(func() -> void:
-		var ui_tw := create_tween()
-		ui_tw.parallel().tween_property(fail_label,   "modulate:a", 1.0, 0.20)
-		ui_tw.parallel().tween_property(score_label,  "modulate:a", 1.0, 0.28)
-		ui_tw.parallel().tween_property(sub_label,    "modulate:a", 1.0, 0.30)
-		ui_tw.parallel().tween_property(divider,      "modulate:a", 1.0, 0.32)
-		ui_tw.parallel().tween_property(retry_node,   "modulate:a", 1.0, 0.36)
-		ui_tw.parallel().tween_property(songsel_node, "modulate:a", 1.0, 0.42)
-		ui_tw.parallel().tween_property(hint_label,   "modulate:a", 1.0, 0.50)
-		ui_tw.finished.connect(func() -> void:
-			_death_menu_active = true
-			_death_update_selection()
-		)
+		_death_menu_active = true
+		_death_update_selection()
 	)
 
 
 # Highlight the currently selected death-menu option.
+# Highlight the currently selected death-menu option.
 func _death_update_selection() -> void:
 	for i in range(_death_option_nodes.size()):
-		var panel := _death_option_nodes[i]
-		if panel == null:
-			continue
-		var sb := StyleBoxFlat.new()
-		var is_sel: bool = (i == _death_menu_option)
-		if is_sel:
-			sb.bg_color     = Color(0.32, 0.08, 0.58, 1.0)
-			sb.border_color = Color(1.00, 0.45, 1.00, 1.0)
-		else:
-			sb.bg_color     = Color(0.10, 0.04, 0.20, 1.0)
-			sb.border_color = Color(0.55, 0.18, 0.90, 1.0)
-		sb.border_width_left = 2; sb.border_width_right  = 2
-		sb.border_width_top  = 2; sb.border_width_bottom = 2
-		sb.corner_radius_top_left     = 8; sb.corner_radius_top_right    = 8
-		sb.corner_radius_bottom_left  = 8; sb.corner_radius_bottom_right = 8
-		sb.content_margin_left  = 16; sb.content_margin_right  = 16
-		sb.content_margin_top   = 10; sb.content_margin_bottom = 10
-		panel.add_theme_stylebox_override("panel", sb)
-
-		# Recolour label text
-		var lbl := panel.get_child(0) as Label
-		if lbl != null:
-			lbl.add_theme_color_override("font_color",
-				Color(1.00, 0.55, 1.00, 1.0) if is_sel else Color(0.70, 0.55, 1.00, 1.0))
-			lbl.add_theme_font_size_override("font_size", 30 if is_sel else 26)
+		var btn := _death_option_nodes[i] as PlateButton
+		if btn != null:
+			btn.set_highlight(i == _death_menu_option)
 
 
 func _death_confirm() -> void:
@@ -7493,8 +6855,12 @@ func _death_confirm() -> void:
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
 		1:  # SONG SELECT — reset so the next song picked starts completely fresh
 			Run.run_seed   = 0
-			Run.song_lives = 3
+			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+		2:  # MAIN MENU — same reset; matches what the pause menu already does
+			Run.run_seed   = 0
+			Run.song_lives = GameConfig.lives_per_song
+			get_tree().change_scene_to_file("res://scenes/Main.tscn")
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -7516,16 +6882,21 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	# ── End screen navigation ────────────────────────────────────────────────
 	if _end_screen_active:
-		if event.is_action("ui_left") or event.is_action("ui_right"):
+		var nav_count: int = maxi(_end_nav_labels.size(), 1)
+		if event.is_action("ui_left"):
 			get_viewport().set_input_as_handled()
-			_end_screen_sel = 1 - _end_screen_sel
+			_end_screen_sel = posmod(_end_screen_sel - 1, nav_count)
+			_end_update_nav_highlight()
+		elif event.is_action("ui_right"):
+			get_viewport().set_input_as_handled()
+			_end_screen_sel = posmod(_end_screen_sel + 1, nav_count)
 			_end_update_nav_highlight()
 		elif event.is_action("ui_accept"):
 			get_viewport().set_input_as_handled()
 			_end_confirm()
 		elif event.is_action("ui_cancel"):
 			get_viewport().set_input_as_handled()
-			_end_screen_sel = 1
+			_end_screen_sel = 1   # Esc backs out to song select
 			_end_confirm()
 		return
 
@@ -7547,11 +6918,11 @@ func _unhandled_input(event: InputEvent) -> void:
 	if _paused:
 		if event.is_action("ui_up"):
 			get_viewport().set_input_as_handled()
-			_pause_option = posmod(_pause_option - 1, 5)
+			_pause_option = posmod(_pause_option - 1, _PAUSE_OPTIONS.size())
 			_pause_update_selection()
 		elif event.is_action("ui_down"):
 			get_viewport().set_input_as_handled()
-			_pause_option = posmod(_pause_option + 1, 5)
+			_pause_option = posmod(_pause_option + 1, _PAUSE_OPTIONS.size())
 			_pause_update_selection()
 		elif event.is_action("ui_accept"):
 			get_viewport().set_input_as_handled()
@@ -7586,21 +6957,27 @@ func _make_gate_arch(root: Node3D, cx: float, width: float,
 	var h      := top_y - bot_y
 	var cy     := bot_y + h * 0.5
 
+	# Posts and beam are tubes: hot core, falling off to the edges, so the
+	# portal reads as lit neon rather than three glowing bricks.
+	const ARCH_E: float = 5.5
+
 	# Left post
-	var lp := _make_box_mesh(Vector3(pw, h, pw), bright)
+	var lp := _make_box_mesh(Vector3(pw, h, pw), bright, NeonMat.TUBE, ARCH_E)
 	lp.position = Vector3(cx - width * 0.5 - pw * 0.5, cy, 0.0)
 	root.add_child(lp)
 	# Right post
-	var rp := _make_box_mesh(Vector3(pw, h, pw), bright)
+	var rp := _make_box_mesh(Vector3(pw, h, pw), bright, NeonMat.TUBE, ARCH_E)
 	rp.position = Vector3(cx + width * 0.5 + pw * 0.5, cy, 0.0)
 	root.add_child(rp)
 	# Top beam
-	var tb := _make_box_mesh(Vector3(width + pw * 2.0 + 0.08, pw, pw), bright)
+	var tb := _make_box_mesh(Vector3(width + pw * 2.0 + 0.08, pw, pw), bright, NeonMat.TUBE, ARCH_E)
 	tb.position = Vector3(cx, top_y + pw * 0.5, 0.0)
 	root.add_child(tb)
-	# Corner accent cubes (extra visual pop at the top corners)
+	# Corner caps — brighter and slightly proud of the join, so the frame reads
+	# as assembled hardware rather than three bars that happen to touch.
 	for sx: float in [-1.0, 1.0]:
-		var corner := _make_box_mesh(Vector3(pw * 1.6, pw * 1.6, pw * 1.6), bright)
+		var corner := _make_box_mesh(
+			Vector3(pw * 1.9, pw * 1.9, pw * 1.9), bright.lightened(0.25), NeonMat.TUBE, ARCH_E * 1.4)
 		corner.position = Vector3(cx + sx * (width * 0.5 + pw * 0.5), top_y + pw * 0.5, 0.0)
 		root.add_child(corner)
 
@@ -7620,11 +6997,28 @@ func _make_approach_marks(root: Node3D, cx: float, width: float, tint: Color) ->
 		inst.scale.x            = width / auth_w
 		root.add_child(inst)
 		return
+	# Flat floor pieces are the ideal panel case — the scrolling scanline gives
+	# the "gate ahead" cue actual motion for one extra instruction, no texture.
+	#
+	# One MultiMeshInstance3D rather than three MeshInstance3Ds: the three hash
+	# marks are the same mesh and the same material, and there are three of them
+	# on every gate in the song. Same pattern as _spawn_floor_grid.
 	var bright := tint.darkened(0.05)
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = _shared_box(Vector3(width * 0.80, 0.03, 0.14))
+	mm.instance_count = 3
 	for i: int in 3:
-		var mark := _make_box_mesh(Vector3(width * 0.80, 0.03, 0.14), bright)
-		mark.position = Vector3(cx, 0.015, -(1.2 + float(i) * 1.3))
-		root.add_child(mark)
+		mm.set_instance_transform(i,
+			Transform3D(Basis(), Vector3(cx, 0.015, -(1.2 + float(i) * 1.3))))
+
+	var mmi := MultiMeshInstance3D.new()
+	mmi.multimesh = mm
+	var mark_mat: ShaderMaterial = NeonMat.panel(bright, 3.4)
+	mark_mat.set_shader_parameter("scan_speed", 1.6)
+	mark_mat.set_shader_parameter("scan_scale", 6.0)
+	mmi.material_override = mark_mat
+	root.add_child(mmi)
 
 
 # Glowing safe-lane floor strip — authored Blender "SafeStrip" when present
@@ -7639,7 +7033,8 @@ func _make_safe_strip(safe_x: float, tint: Color) -> Node3D:
 		wrap.add_child(inst)
 		return wrap
 	var strip := _make_box_mesh(
-		Vector3(lane_blocker_width * 0.7, 0.04, gate_depth * 1.2), tint)
+		Vector3(lane_blocker_width * 0.7, 0.04, gate_depth * 1.2), tint, NeonMat.PANEL, 3.0)
+	NeonMat.set_param(strip.material_override, "scan_speed", 1.2)
 	strip.position = Vector3(safe_x, 0.02, 0.0)
 	return strip
 
@@ -7655,9 +7050,7 @@ func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
 
 	# Dark silhouette body — gives the obstacle mass without bleeding emission
 	var body     := MeshInstance3D.new()
-	var bm       := BoxMesh.new()
-	bm.size       = size
-	body.mesh     = bm
+	body.mesh     = _shared_box(size)
 	var body_mat  := StandardMaterial3D.new()
 	body_mat.albedo_color     = Color(0.04, 0.02, 0.08, 1.0)
 	body_mat.emission_enabled = false
@@ -7666,47 +7059,60 @@ func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
 	node.add_child(body)
 
 	# One shared material for every strip on this facade (no per-strip overhead)
-	var win_mat := StandardMaterial3D.new()
-	win_mat.albedo_color               = win_col.darkened(0.25)
-	win_mat.emission_enabled           = true
-	win_mat.emission                   = win_col
-	win_mat.emission_energy_multiplier = 2.0
+	var win_mat: ShaderMaterial = NeonMat.panel(win_col, 2.0)
 
 	# Front-face strips only — one mesh per row, facing the approaching player.
 	# Side faces are intentionally left dark to keep gate mesh counts low.
 	var y_local: float = -size.y * 0.5 + strip_gap
 	while y_local < size.y * 0.5 - strip_h:
 		var sf  := MeshInstance3D.new()
-		var smf := BoxMesh.new()
-		smf.size = Vector3(size.x + 0.02, strip_h, 0.06)
-		sf.mesh  = smf
+		sf.mesh  = _shared_box(Vector3(size.x + 0.02, strip_h, 0.06))
 		sf.material_override = win_mat
 		sf.position = Vector3(0.0, y_local, -size.z * 0.5 - 0.03)
 		node.add_child(sf)
 		y_local += strip_gap
 
 	# Bright rooftop cap — same cap style as city buildings
-	var cap      := _make_box_mesh(Vector3(size.x + 0.06, 0.08, size.z + 0.06), win_col.lightened(0.30))
+	var cap      := _make_box_mesh(Vector3(size.x + 0.06, 0.08, size.z + 0.06),
+		win_col.lightened(0.30), NeonMat.TUBE, 4.5)
 	cap.position  = Vector3(0.0, size.y * 0.5 + 0.04, 0.0)
 	node.add_child(cap)
 
 	return node
 
 
-func _make_box_mesh(size: Vector3, color: Color) -> MeshInstance3D:
-	var mi: MeshInstance3D = MeshInstance3D.new()
-	var bm: BoxMesh = BoxMesh.new()
-	bm.size = size
-	mi.mesh = bm
+## Shared BoxMesh cache, keyed on size to the millimetre.
+##
+## Every part of every gate used to allocate its own BoxMesh, so a level built
+## thousands of byte-identical meshes that the renderer had no way to batch.
+## Nothing mutates a mesh after _make_box_mesh returns (callers only touch
+## transform and material_override), so one instance per distinct size is safe.
+## The dictionary lives on the section node, which is rebuilt per level.
+var _box_mesh_cache: Dictionary = {}
 
-	var mat: StandardMaterial3D = StandardMaterial3D.new()
-	# Standard lit material — albedo carries the colour, emission is a subtle accent only
-	mat.albedo_color    = color
-	mat.metallic        = 0.05
-	mat.roughness       = 0.68
-	mat.emission_enabled = true
-	mat.emission         = color
-	mat.emission_energy_multiplier = 0.35
+func _shared_box(size: Vector3) -> BoxMesh:
+	var key: String = "%d,%d,%d" % [
+		int(round(size.x * 1000.0)), int(round(size.y * 1000.0)), int(round(size.z * 1000.0))]
+	if _box_mesh_cache.has(key):
+		return _box_mesh_cache[key]
+	var bm := BoxMesh.new()
+	bm.size = size
+	_box_mesh_cache[key] = bm
+	return bm
+
+
+## `role` picks the shader: NeonMat.TUBE for bars, posts and beams (hot core,
+## falls off to the edges) or NeonMat.PANEL for flat faces (border, scanlines).
+## Defaults to TUBE because most callers are bars.
+func _make_box_mesh(size: Vector3, color: Color,
+		role: String = NeonMat.TUBE, energy: float = 3.0) -> MeshInstance3D:
+	var mi: MeshInstance3D = MeshInstance3D.new()
+	mi.mesh = _shared_box(size)
+	var mat: ShaderMaterial = NeonMat.make(role, color, energy)
+	# neon_tube derives its core from the bar's long axis in object space, which
+	# it can only know from the box's own dimensions — a BoxMesh's per-face UVs
+	# carry no consistent orientation.
+	mat.set_shader_parameter("box_size", size)
 	mi.material_override = mat
 
 	# store original color so color cycling can preserve shape identity
@@ -8101,26 +7507,43 @@ func _update_city_pulse(delta: float) -> void:
 
 # ── Song progress bar update ──────────────────────────────────────────────────
 func _update_hud_progress(t_s: float) -> void:
-	if _hud_progress_fill == null:
+	if _hud == null:
 		return
-
-	# Derive total length from the last gameplay event + a small buffer
+	# Derive total length from the last gameplay event + a small buffer.
 	if _song_total_duration <= 0.0:
 		_song_total_duration = _song_end_z() / player.forward_speed
-
-	var pct: float = clamp(t_s / _song_total_duration, 0.0, 1.0)
-	var vp_w: float = _vp_size.x
-	_hud_progress_fill.offset_right = vp_w * pct
-
-	# Move the glow cap to the leading edge. (This used to re-resolve the node by
-	# name through get_parent().get_node_or_null("ProgCap") every single frame,
-	# for a node _create_hud already stored in _hud_prog_cap.)
-	if _hud_prog_cap != null:
-		_hud_prog_cap.offset_left  = vp_w * pct - 2.0
-		_hud_prog_cap.offset_right = vp_w * pct + 4.0
+	_hud.set_progress(clampf(t_s / _song_total_duration, 0.0, 1.0))
 
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
+## Single source of truth for the pause menu's entries. _pause_update_selection()
+## and the up/down navigation both used their own hardcoded counts, which is how
+## the fifth option ended up unreachable-looking.
+const _PAUSE_OPTIONS: Array[String] = [
+	"▶  RESUME",
+	"↺  RESTART  (-1 life)",
+	"⌂  MAIN MENU",
+	"⏹  SONG SELECT",
+	"⊙  CALIBRATE AUDIO",
+]
+
+
+## The Control that full-screen overlays parent themselves to. Prefer this over
+## the old `_hud_flash.get_parent()` idiom, which is only still around because
+## seven older call sites use it.
+func _overlay_root() -> Control:
+	if _hud != null:
+		return _hud.overlay_root()
+	if _hud_flash != null:
+		return _hud_flash.get_parent() as Control
+	return null
+
+
+func _vp() -> Vector2:
+	var vp: Viewport = get_viewport()
+	return vp.get_visible_rect().size if vp != null else Vector2(1920, 1080)
+
+
 func _pause_game() -> void:
 	_paused = true
 	self.process_mode   = Node.PROCESS_MODE_ALWAYS  # keep input + HUD alive
@@ -8129,112 +7552,87 @@ func _pause_game() -> void:
 	player.set_physics_process(false)
 	player.set_process(false)
 
-	# Build the pause overlay on the existing HUD CanvasLayer
-	if _hud_flash == null:
-		return
-	var hud_root: Control = _hud_flash.get_parent() as Control
+	# Built on the HUD's own CanvasLayer, so it sits above every readout.
+	var hud_root: Control = _overlay_root()
 	if hud_root == null:
 		return
 
 	_pause_option = 0
+	_pause_buttons.clear()
 
-	# Dark semi-transparent veil
+	var s: float = UiStyle.scale_for(_vp())
+
 	var veil := ColorRect.new()
 	veil.name = "PauseVeil"
 	veil.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	veil.color = Color(0.02, 0.01, 0.08, 0.82)
+	veil.color = Color(0.02, 0.01, 0.07, 0.86)
 	veil.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud_root.add_child(veil)
 	_pause_root = veil
 
-	# Neon border frame (four thin rects)
-	var border_col: Color = Color(0.65, 0.22, 1.00, 0.80)
-	for side in range(4):
-		var b := ColorRect.new()
-		b.color = border_col
-		b.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		match side:
-			0: b.anchor_left=0.25; b.anchor_right=0.75; b.anchor_top=0.30; b.anchor_bottom=0.30; b.offset_bottom=3
-			1: b.anchor_left=0.25; b.anchor_right=0.75; b.anchor_top=0.70; b.anchor_bottom=0.70; b.offset_bottom=3
-			2: b.anchor_left=0.25; b.anchor_right=0.25; b.anchor_top=0.30; b.anchor_bottom=0.70; b.offset_right=3
-			3: b.anchor_left=0.75; b.anchor_right=0.75; b.anchor_top=0.30; b.anchor_bottom=0.70; b.offset_right=3
-		veil.add_child(b)
+	# One centred chassis instead of the old four-loose-border-rects frame.
+	var card := PlatePanel.create(int(34 * s), UiStyle.VIOLET, 26.0 * s)
+	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	card.custom_minimum_size = Vector2(520 * s, 0)
+	veil.add_child(card)
 
-	# "PAUSED" title
-	var title := Label.new()
-	title.text = "PAUSED"
-	title.anchor_left   = 0.5; title.anchor_right  = 0.5
-	title.anchor_top    = 0.5; title.anchor_bottom = 0.5
-	title.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	title.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	title.offset_left  = -160; title.offset_right  = 160
-	title.offset_top   = -110; title.offset_bottom = -60
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", int(10 * s))
+	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(vbox)
+
+	var title: Label = UiStyle.label("PAUSED", UiStyle.caption(7.0), int(34 * s), Color.WHITE)
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
-	title.add_theme_color_override("font_color", Color(0.80, 0.35, 1.00, 1.0))
-	title.add_theme_font_size_override("font_size", 42)
-	title.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	veil.add_child(title)
+	title.self_modulate = UiStyle.signature_color(0.15)
+	vbox.add_child(title)
 
-	# Menu options  (0=RESUME  1=RESTART  2=MAIN MENU  3=SONG SELECT  4=CALIBRATE AUDIO)
-	var opt_labels: Array[String] = ["▶  RESUME", "↺  RESTART  (-1 life)", "⌂  MAIN MENU", "⏹  SONG SELECT", "⊙  CALIBRATE AUDIO"]
-	var opt_ys:     Array[float]  = [-104.0, -52.0, 0.0, 52.0, 104.0]
-	for i in 5:
-		var opt := Label.new()
-		opt.name = "PauseOpt%d" % i
-		opt.text = opt_labels[i]
-		opt.anchor_left   = 0.5; opt.anchor_right  = 0.5
-		opt.anchor_top    = 0.5; opt.anchor_bottom = 0.5
-		opt.grow_horizontal = Control.GROW_DIRECTION_BOTH
-		opt.grow_vertical   = Control.GROW_DIRECTION_BOTH
-		opt.offset_left  = -160; opt.offset_right  = 160
-		opt.offset_top   = opt_ys[i]; opt.offset_bottom = opt_ys[i] + 40
-		opt.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		opt.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
-		opt.add_theme_font_size_override("font_size", 22)
-		opt.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		veil.add_child(opt)
+	var rule := ColorRect.new()
+	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.55)
+	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
+	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vbox.add_child(rule)
 
-	# Hint text
-	var hint := Label.new()
-	hint.text = "ESC / Start  ·  ↑↓ navigate  ·  Enter / A confirm"
-	hint.anchor_left   = 0.5; hint.anchor_right  = 0.5
-	hint.anchor_top    = 0.5; hint.anchor_bottom = 0.5
-	hint.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	hint.offset_left  = -240; hint.offset_right  = 240
-	hint.offset_top   = 112;  hint.offset_bottom = 132
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, 8 * s)
+	vbox.add_child(gap)
+
+	for i in _PAUSE_OPTIONS.size():
+		# RESTART costs a life, so it wears the warning accent rather than the
+		# signature one - the cost should be visible before it is confirmed.
+		var accent: Color = Color(1.00, 0.52, 0.16) if i == 1 else UiStyle.PINK
+		var btn := PlateButton.create(_PAUSE_OPTIONS[i], Callable(), int(19 * s), accent)
+		btn.name = "PauseOpt%d" % i
+		# Selection is driven by _pause_option, not by Godot focus - otherwise
+		# ui_up/ui_down would move both and the highlight would skip entries.
+		btn.focus_mode = Control.FOCUS_NONE
+		btn.custom_minimum_size = Vector2(0, 52 * s)
+		vbox.add_child(btn)
+		_pause_buttons.append(btn)
+
+	var hint_gap := Control.new()
+	hint_gap.custom_minimum_size = Vector2(0, 10 * s)
+	vbox.add_child(hint_gap)
+
+	var hint: Label = UiStyle.label(
+		"ESC / START  ·  ↑↓ NAVIGATE  ·  ENTER / A CONFIRM",
+		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.add_theme_color_override("font_color", Color(0.55, 0.45, 0.65, 0.70))
-	hint.add_theme_font_size_override("font_size", 13)
-	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	veil.add_child(hint)
+	hint.self_modulate = Color(0.62, 0.55, 0.78, 0.75)
+	vbox.add_child(hint)
 
-	# Animate the veil fading in
 	veil.modulate.a = 0.0
-	var ftw := create_tween()
-	ftw.tween_property(veil, "modulate:a", 1.0, 0.18)
+	create_tween().tween_property(veil, "modulate:a", 1.0, 0.18)
 
 	_pause_update_selection()
 
 
 func _pause_update_selection() -> void:
-	if _pause_root == null:
-		return
-	var sel_col:  Color = Color(1.00, 0.95, 0.30, 1.0)   # gold — selected
-	var mute_col: Color = Color(0.60, 0.50, 0.75, 0.75)  # muted — unselected
-	var warn_col: Color = Color(1.00, 0.45, 0.20, 1.0)   # orange — restart warning
-	for i in 4:
-		var opt: Label = _pause_root.get_node_or_null("PauseOpt%d" % i) as Label
-		if opt == null:
-			continue
-		var is_sel: bool = (i == _pause_option)
-		var col: Color
-		if is_sel:
-			col = warn_col if i == 1 else sel_col
-		else:
-			col = mute_col
-		opt.add_theme_color_override("font_color", col)
-		opt.add_theme_font_size_override("font_size", 24 if is_sel else 20)
+	for i in _pause_buttons.size():
+		var btn: PlateButton = _pause_buttons[i]
+		if btn != null:
+			btn.set_highlight(i == _pause_option)
 
 
 func _pause_confirm() -> void:
@@ -8302,29 +7700,24 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 	var gate: Node3D = gate_nodes[idx]
 	var hit_color: Color = Color(0.30, 1.00, 0.40, 1.0) if success else Color(1.00, 0.20, 0.20, 1.0)
 
-	# Grab the gate's original colour BEFORE overwriting it, so the echo uses it
+	# Grab the gate's original colour BEFORE overwriting it, so the echo uses it.
+	# Sourced from _gate_cycle_mats rather than gate.get_children(): every mesh
+	# lives under the "VisRoot" child, so the old direct-children walk found no
+	# MeshInstance3D at all and this whole flash quietly did nothing.
+	var flash_mats: Array[Material] = _gate_cycle_mats[idx] if idx < _gate_cycle_mats.size() else []
 	var gate_color: Color = Color(1.0, 1.0, 1.0, 1.0)
-	for c in gate.get_children():
-		var cmi: MeshInstance3D = c as MeshInstance3D
-		if cmi == null:
-			continue
-		var cmat: StandardMaterial3D = cmi.material_override as StandardMaterial3D
-		if cmat == null:
-			continue
-		gate_color = cmat.albedo_color
+	if not flash_mats.is_empty() and flash_mats[0] != null:
+		gate_color = NeonMat.get_tint(flash_mats[0])
 		gate_color.a = 1.0
-		break   # one sample is enough
 
-	for c in gate.get_children():
-		var mi: MeshInstance3D = c as MeshInstance3D
-		if mi == null:
-			continue
-		var mat: StandardMaterial3D = mi.material_override as StandardMaterial3D
+	for mat: Material in flash_mats:
 		if mat == null:
 			continue
-		mat.albedo_color = hit_color
-		mat.emission = hit_color
-		mat.emission_energy_multiplier = 1.35
+		NeonMat.set_tint(mat, hit_color)
+		# Relative, not absolute. The old code set 1.35 flat, which brightened a
+		# StandardMaterial3D whose base was 0.35 — but the world shaders sit at
+		# 2–5.5, so the same literal would have DIMMED the gate on a clean hit.
+		NeonMat.set_energy(mat, maxf(NeonMat.get_energy(mat) * 1.8, 4.0))
 
 	# Light burst on hit/miss at the gate position
 	var flash := OmniLight3D.new()
@@ -8341,23 +7734,56 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 	if success:
 		_spawn_gate_echo(gate.global_position, gate_color)
 
+## Slot pool for the hit echo.
+##
+## This used to allocate a QuadMesh, a StandardMaterial3D and a MeshInstance3D
+## on every clean hit and free them 0.7 s later — on a 567-gate song that is
+## well over a thousand short-lived resources thrown at the collector during
+## gameplay. Same slot-recycling shape as WorldFxPool: the mesh is built once
+## and shared, each slot keeps its own material for its own colour and fade.
+const _ECHO_SLOTS: int = 8
+var _echo_nodes: Array[MeshInstance3D] = []
+var _echo_mats:  Array[StandardMaterial3D] = []
+var _echo_tws:   Array[Tween] = []
+var _echo_cur:   int = 0
+
+func _build_echo_pool() -> void:
+	var qm := QuadMesh.new()
+	qm.size = Vector2(lane_blocker_width * 1.05, lane_blocker_height * 1.05)
+	for i in range(_ECHO_SLOTS):
+		var mat := StandardMaterial3D.new()
+		mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		mat.blend_mode   = BaseMaterial3D.BLEND_MODE_ADD
+		mat.cull_mode    = BaseMaterial3D.CULL_DISABLED
+		var mi := MeshInstance3D.new()
+		mi.mesh              = qm
+		mi.material_override = mat
+		mi.visible           = false
+		mi.set_meta("no_cycle", true)   # the echo carries the gate's own colour
+		world_fx_root.add_child(mi)
+		_echo_nodes.append(mi)
+		_echo_mats.append(mat)
+		_echo_tws.append(null)
+
+
 func _spawn_gate_echo(gate_world_pos: Vector3, echo_color: Color) -> void:
 	# A translucent ghost of the gate that pulses outward and fades on a clean hit.
 	# Positioned on the player's current lane so it feels personal. Very subtle.
-	var qm := QuadMesh.new()
-	qm.size = Vector2(lane_blocker_width * 1.05, lane_blocker_height * 1.05)
+	if _echo_nodes.is_empty():
+		return
+	var i: int = _echo_cur % _echo_nodes.size()
+	_echo_cur = i + 1
+	# Recycling the oldest echo is always better than allocating mid-song.
+	var old: Tween = _echo_tws[i]
+	if old != null and old.is_valid():
+		old.kill()
 
-	var mat := StandardMaterial3D.new()
-	mat.shading_mode   = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.transparency   = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.blend_mode     = BaseMaterial3D.BLEND_MODE_ADD
-	mat.cull_mode      = BaseMaterial3D.CULL_DISABLED
-	mat.albedo_color   = Color(echo_color.r, echo_color.g, echo_color.b, 0.10)
-	qm.surface_set_material(0, mat)
-
-	var mi := MeshInstance3D.new()
-	mi.mesh = qm
-	world_fx_root.add_child(mi)   # must be in tree before global_position is valid
+	var mi:  MeshInstance3D      = _echo_nodes[i]
+	var mat: StandardMaterial3D  = _echo_mats[i]
+	mat.albedo_color = Color(echo_color.r, echo_color.g, echo_color.b, 0.10)
+	mi.scale   = Vector3.ONE
+	mi.visible = true
 
 	# Place at gate world position, offset laterally to the player's current lane
 	var lane_lateral: float = player.lane_xs[player.current_lane]
@@ -8375,7 +7801,8 @@ func _spawn_gate_echo(gate_world_pos: Vector3, echo_color: Color) -> void:
 	tw.tween_property(mat, "albedo_color",
 			Color(echo_color.r, echo_color.g, echo_color.b, 0.0), 0.70
 		).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
-	tw.chain().tween_callback(mi.queue_free)
+	tw.chain().tween_callback(func() -> void: mi.visible = false)
+	_echo_tws[i] = tw
 
 
 func _run_world_events(t_s: float) -> void:
@@ -8787,7 +8214,6 @@ func _burst_sparks(vit: float, _col: Color) -> void:
 	_spark_ambient_mat.initial_velocity_max = lerpf(5.0, 16.0, vit)
 
 
-
 # ── 3D Speed streaks ──────────────────────────────────────────────────────────
 # Elongated particles that fly past the player in world space, attached to the
 # player so they always surround them. Appear at x10 combo, full intensity x50.
@@ -9067,7 +8493,8 @@ func _on_music_finished() -> void:
 		)
 
 	# Reset song lives for next attempt (they earned a clean slate by clearing)
-	Run.song_lives = 3
+	Run.song_lives = GameConfig.lives_per_song
+	_sync_hud_lives()
 
 	# Results panel slides in after the CLEAR! animation settles
 	var panel_timer := get_tree().create_timer(1.30)
@@ -9354,91 +8781,24 @@ func _spawn_finish_orb_burst() -> void:
 
 # ── End-screen results panel ─────────────────────────────────────────────────
 func _spawn_results_panel() -> void:
-	if _hud_flash == null:
-		return
-	var hud_root: Control = _hud_flash.get_parent() as Control
+	var hud_root: Control = _overlay_root()
 	if hud_root == null:
 		return
 
-	# ── Perfect-run bonus: ×1.5 on score when zero misses ─────────────────────
+	var s: float = UiStyle.scale_for(_vp())
+
+	# Perfect-run bonus: x1.5 on score when zero misses
 	var is_perfect: bool = (_gates_hit > 0 and _gates_missed == 0)
 	if is_perfect:
 		_score = int(float(_score) * 1.5)
 
-	# Save high score and find out if it's a new record
+	# Save high score and find out if it is a new record
 	var is_new_hs: bool = Save.save_high_score(Run.current_song_key, _score, _max_combo)
 	var hs: Dictionary = Save.get_high_score(Run.current_song_key)
 
-	# ── Full-screen dark backdrop ─────────────────────────────────────────────
-	var overlay := ColorRect.new()
-	overlay.color = Color(0.00, 0.00, 0.04, 0.92)
-	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	overlay.modulate.a   = 0.0
-	hud_root.add_child(overlay)
-
-	# ── Full-screen card ──────────────────────────────────────────────────────
-	var card := PanelContainer.new()
-	card.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
-
-	var card_style := StyleBoxFlat.new()
-	card_style.bg_color = Color(0.0, 0.0, 0.0, 0.0)   # transparent — overlay provides bg
-	card_style.content_margin_left   = 80.0; card_style.content_margin_right  = 80.0
-	card_style.content_margin_top    = 48.0; card_style.content_margin_bottom = 48.0
-	card.add_theme_stylebox_override("panel", card_style)
-	card.modulate.a = 0.0
-	hud_root.add_child(card)
-
-	# CenterContainer fills the card and vertically centres its child
-	var center := CenterContainer.new()
-	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	card.add_child(center)
-
-	var vbox := VBoxContainer.new()
-	vbox.alignment = BoxContainer.ALIGNMENT_CENTER
-	vbox.add_theme_constant_override("separation", 12)
-	vbox.custom_minimum_size = Vector2(680.0, 0.0)
-	center.add_child(vbox)
-
-	# ── PERFECT! badge (top, above score) ─────────────────────────────────────
-	if is_perfect:
-		var perf_lbl := Label.new()
-		perf_lbl.text = "✦  PERFECT  ✦"
-		perf_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		perf_lbl.add_theme_font_size_override("font_size", 28)
-		perf_lbl.add_theme_color_override("font_color", Color(0.40, 1.00, 0.60))
-		perf_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		vbox.add_child(perf_lbl)
-		var ptw := create_tween().set_loops()
-		ptw.tween_property(perf_lbl, "modulate", Color(1.2, 1.2, 1.0), 0.70)
-		ptw.tween_property(perf_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.70)
-
-	# ── Score ─────────────────────────────────────────────────────────────────
-	var score_val := Label.new()
-	score_val.text = "%d" % _score
-	score_val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_val.add_theme_font_size_override("font_size", 96)
-	score_val.add_theme_color_override("font_color", Color(1.00, 0.95, 0.30))
-	score_val.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(score_val)
-
-	var score_cap := Label.new()
-	if is_perfect:
-		score_cap.text = "SCORE  ( ×1.5 PERFECT BONUS APPLIED )"
-	else:
-		score_cap.text = "SCORE"
-	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_cap.add_theme_font_size_override("font_size", 14)
-	score_cap.add_theme_color_override("font_color",
-		Color(0.35, 0.90, 0.55) if is_perfect else Color(0.55, 0.50, 0.72))
-	score_cap.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(score_cap)
-
-	# ── Letter grade ─────────────────────────────────────────────────────────
-	var total_for_grade: int = _gates_hit + _gates_missed
-	var acc: float = float(_gates_hit) / float(max(1, total_for_grade))
+	# Letter grade
+	var total_notes: int = _gates_hit + _gates_missed
+	var acc: float = float(_gates_hit) / float(maxi(1, total_notes))
 	var grade: String
 	var grade_col: Color
 	if _gates_missed == 0 and _gates_hit > 0:
@@ -9454,123 +8814,151 @@ func _spawn_results_panel() -> void:
 	else:
 		grade = "F";  grade_col = Color(1.00, 0.30, 0.30)   # red
 
-	var grade_lbl := Label.new()
-	grade_lbl.text = grade
+	# Backdrop
+	var overlay := ColorRect.new()
+	overlay.color = Color(0.015, 0.008, 0.045, 0.94)
+	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.modulate.a   = 0.0
+	hud_root.add_child(overlay)
+
+	# Card — accent follows the grade, so an S run and an F run do not look alike
+	var card := PlatePanel.create(int(38 * s), grade_col, 32.0 * s)
+	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
+	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	card.custom_minimum_size = Vector2(840 * s, 0)
+	card.modulate.a = 0.0
+	hud_root.add_child(card)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", int(4 * s))
+	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(vbox)
+
+	if is_perfect:
+		var perf: Label = UiStyle.label("\u2726  PERFECT  \u2726", UiStyle.caption(6.0), int(22 * s), Color.WHITE)
+		perf.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		perf.self_modulate = Color(0.40, 1.00, 0.60)
+		vbox.add_child(perf)
+		var ptw := perf.create_tween().set_loops()
+		ptw.tween_property(perf, "modulate", Color(1.25, 1.25, 1.0), 0.70)
+		ptw.tween_property(perf, "modulate", Color(1.0, 1.0, 1.0), 0.70)
+
+	var score_cap: Label = UiStyle.label(
+		"SCORE  \u00b7  \u00d71.5 PERFECT BONUS" if is_perfect else "SCORE",
+		UiStyle.caption(5.0), int(11 * s), Color.WHITE)
+	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	score_cap.self_modulate = Color(0.40, 0.95, 0.60) if is_perfect else Color(0.65, 0.58, 0.85, 0.85)
+	vbox.add_child(score_cap)
+
+	var score_val: Label = UiStyle.label(
+		UiStyle.group_digits(_score), UiStyle.display(800), int(72 * s), Color.WHITE)
+	score_val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	score_val.self_modulate = Color(1.00, 0.95, 0.42)
+	vbox.add_child(score_val)
+
+	# Grade on its own chip
+	var grade_row := HBoxContainer.new()
+	grade_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	grade_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vbox.add_child(grade_row)
+
+	var grade_chip := PlatePanel.create(int(10 * s), grade_col, 18.0 * s)
+	grade_chip.custom_minimum_size = Vector2(150 * s, 0)
+	grade_row.add_child(grade_chip)
+
+	var grade_box := VBoxContainer.new()
+	grade_box.add_theme_constant_override("separation", 0)
+	grade_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	grade_chip.content.add_child(grade_box)
+
+	var grade_lbl: Label = UiStyle.label(grade, UiStyle.display(900), int(58 * s), Color.WHITE)
 	grade_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	grade_lbl.add_theme_font_size_override("font_size", 86)
-	grade_lbl.add_theme_color_override("font_color", grade_col)
-	grade_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(grade_lbl)
+	grade_lbl.self_modulate = grade_col
+	grade_box.add_child(grade_lbl)
+
+	var acc_lbl: Label = UiStyle.label("%.1f%%" % (acc * 100.0), UiStyle.display(700), int(15 * s), Color.WHITE)
+	acc_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	acc_lbl.self_modulate = grade_col.lightened(0.20)
+	grade_box.add_child(acc_lbl)
+
 	if grade == "S":
-		var gtw := create_tween().set_loops()
-		gtw.tween_property(grade_lbl, "modulate", Color(1.4, 1.3, 0.6), 0.60)
+		var gtw := grade_lbl.create_tween().set_loops()
+		gtw.tween_property(grade_lbl, "modulate", Color(1.45, 1.35, 0.65), 0.60)
 		gtw.tween_property(grade_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.60)
 
-	var acc_lbl := Label.new()
-	acc_lbl.text = "%.1f%%" % (acc * 100.0)
-	acc_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	acc_lbl.add_theme_font_size_override("font_size", 15)
-	acc_lbl.add_theme_color_override("font_color", grade_col.darkened(0.18))
-	acc_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(acc_lbl)
-
-	# ── New high score badge ───────────────────────────────────────────────────
+	# Record line
 	if is_new_hs:
-		var hs_lbl := Label.new()
-		hs_lbl.text = "★  NEW HIGH SCORE  ★"
+		var hs_lbl: Label = UiStyle.label("\u2605  NEW HIGH SCORE  \u2605", UiStyle.caption(5.0), int(17 * s), Color.WHITE)
 		hs_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		hs_lbl.add_theme_font_size_override("font_size", 22)
-		hs_lbl.add_theme_color_override("font_color", Color(1.00, 0.38, 0.68))
-		hs_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		hs_lbl.self_modulate = Color(1.00, 0.38, 0.68)
 		vbox.add_child(hs_lbl)
-		var htw := create_tween().set_loops()
-		htw.tween_property(hs_lbl, "modulate", Color(1.3, 0.9, 1.3), 0.55)
+		var htw := hs_lbl.create_tween().set_loops()
+		htw.tween_property(hs_lbl, "modulate", Color(1.35, 0.9, 1.35), 0.55)
 		htw.tween_property(hs_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.55)
 	else:
-		var prev_lbl := Label.new()
-		prev_lbl.text = "Best: %d" % hs.score
-		prev_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		prev_lbl.add_theme_font_size_override("font_size", 15)
-		prev_lbl.add_theme_color_override("font_color", Color(0.52, 0.48, 0.68))
-		prev_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		vbox.add_child(prev_lbl)
+		var prev: Label = UiStyle.label(
+			"BEST  %s" % UiStyle.group_digits(int(hs.get("score", 0))),
+			UiStyle.caption(3.0), int(12 * s), Color.WHITE)
+		prev.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		prev.self_modulate = Color(0.58, 0.52, 0.75, 0.85)
+		vbox.add_child(prev)
 
-	# ── Separator ─────────────────────────────────────────────────────────────
-	var sep1 := HSeparator.new()
-	sep1.add_theme_color_override("separator_color", Color(0.35, 0.14, 0.58, 0.55))
-	vbox.add_child(sep1)
+	vbox.add_child(_results_rule(s))
 
-	# ── Combo stats row ───────────────────────────────────────────────────────
-	var combo_row := HBoxContainer.new()
-	combo_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	combo_row.add_theme_constant_override("separation", 80)
-	vbox.add_child(combo_row)
+	# Stats row
+	var stat_row := HBoxContainer.new()
+	stat_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	stat_row.add_theme_constant_override("separation", int(70 * s))
+	stat_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	vbox.add_child(stat_row)
 
-	for pair in [["BEST COMBO", str(_max_combo)], ["LAST COMBO", str(_combo)]]:
+	var miss_col: Color = UiStyle.DANGER if _gates_missed > 0 else Color(0.50, 0.46, 0.68)
+	var stats: Array = [
+		["BEST COMBO", "\u00d7%d" % _max_combo, UiStyle.CYAN],
+		["HIT", str(_gates_hit), Color(0.40, 1.00, 0.55)],
+		["MISSED", str(_gates_missed), miss_col],
+	]
+	for st in stats:
 		var col := VBoxContainer.new()
-		col.alignment = BoxContainer.ALIGNMENT_CENTER
+		col.add_theme_constant_override("separation", 0)
 		col.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var val_lbl := Label.new()
-		val_lbl.text = pair[1]
-		val_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		val_lbl.add_theme_font_size_override("font_size", 52)
-		val_lbl.add_theme_color_override("font_color", Color(0.45, 0.85, 1.00))
-		val_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var key_lbl := Label.new()
-		key_lbl.text = pair[0]
-		key_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		key_lbl.add_theme_font_size_override("font_size", 14)
-		key_lbl.add_theme_color_override("font_color", Color(0.50, 0.46, 0.68))
-		key_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		col.add_child(val_lbl)
-		col.add_child(key_lbl)
-		combo_row.add_child(col)
+		var val: Label = UiStyle.label(String(st[1]), UiStyle.display(800), int(40 * s), Color.WHITE)
+		val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		val.self_modulate = st[2]
+		col.add_child(val)
+		var key: Label = UiStyle.label(String(st[0]), UiStyle.caption(3.0), int(10 * s), Color.WHITE)
+		key.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		key.self_modulate = Color(0.58, 0.52, 0.75, 0.85)
+		col.add_child(key)
+		stat_row.add_child(col)
 
-	# ── Notes stats row ───────────────────────────────────────────────────────
-	var total_notes: int = _gates_hit + _gates_missed
-	var notes_lbl := Label.new()
-	notes_lbl.text = "%d hit  /  %d missed  /  %d total" % [_gates_hit, _gates_missed, total_notes]
-	notes_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	notes_lbl.add_theme_font_size_override("font_size", 20)
-	var hit_col: Color
-	if total_notes == 0 or _gates_missed == 0:
-		hit_col = Color(0.30, 1.00, 0.50)
-	elif float(_gates_hit) / float(total_notes) >= 0.90:
-		hit_col = Color(0.65, 1.00, 0.35)
-	elif float(_gates_hit) / float(total_notes) >= 0.70:
-		hit_col = Color(1.00, 0.85, 0.25)
-	else:
-		hit_col = Color(1.00, 0.45, 0.35)
-	notes_lbl.add_theme_color_override("font_color", hit_col)
-	notes_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(notes_lbl)
+	vbox.add_child(_results_rule(s))
 
-	# ── Separator ─────────────────────────────────────────────────────────────
-	var sep2 := HSeparator.new()
-	sep2.add_theme_color_override("separator_color", Color(0.35, 0.14, 0.58, 0.55))
-	vbox.add_child(sep2)
-
-	# ── Navigation buttons ────────────────────────────────────────────────────
+	# Navigation
 	var nav_row := HBoxContainer.new()
 	nav_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	nav_row.add_theme_constant_override("separation", 32)
+	nav_row.add_theme_constant_override("separation", int(16 * s))
+	nav_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	vbox.add_child(nav_row)
 
-	_end_lbl_again  = _make_end_nav_label("▶  PLAY AGAIN")
-	_end_lbl_select = _make_end_nav_label("◀  SONG SELECT")
-	nav_row.add_child(_end_lbl_again)
-	nav_row.add_child(_end_lbl_select)
+	_end_nav_labels.clear()
+	for txt in ["\u25b6  PLAY AGAIN", "\u21a9  SONG SELECT", "\u2302  MAIN MENU"]:
+		var btn := PlateButton.create(txt, Callable(), int(16 * s), UiStyle.PINK)
+		btn.focus_mode = Control.FOCUS_NONE   # selection is driven by _end_screen_sel
+		btn.custom_minimum_size = Vector2(230 * s, 50 * s)
+		nav_row.add_child(btn)
+		_end_nav_labels.append(btn)
 
-	# ── Control hint ──────────────────────────────────────────────────────────
-	var hint := Label.new()
-	hint.text = "◀▶ / D-pad choose   ·   A / Enter confirm"
+	var hint: Label = UiStyle.label(
+		"\u25c0\u25b6 / D-PAD CHOOSE  \u00b7  ENTER / A CONFIRM",
+		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.add_theme_font_size_override("font_size", 14)
-	hint.add_theme_color_override("font_color", Color(0.40, 0.38, 0.58))
-	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	hint.self_modulate = Color(0.55, 0.50, 0.70, 0.75)
 	vbox.add_child(hint)
 
-	# ── Fade in (full-screen, no slide) ──────────────────────────────────────
+	# Fade in
 	var itw := create_tween()
 	itw.parallel().tween_property(overlay, "modulate:a", 1.0, 0.40)
 	itw.parallel().tween_property(card, "modulate:a", 1.0, 0.40)
@@ -9582,52 +8970,24 @@ func _spawn_results_panel() -> void:
 	)
 
 
-func _make_end_nav_label(txt: String) -> Label:
-	var lbl := Label.new()
-	lbl.text = txt
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	lbl.add_theme_font_size_override("font_size", 22)
-	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	# Styled like a pill button via theme stylebox
-	var sb := StyleBoxFlat.new()
-	sb.bg_color     = Color(0.10, 0.08, 0.18, 1.0)
-	sb.border_color = Color(0.40, 0.18, 0.65, 1.0)
-	sb.border_width_left   = 2; sb.border_width_right  = 2
-	sb.border_width_top    = 2; sb.border_width_bottom = 2
-	sb.corner_radius_top_left     = 8; sb.corner_radius_top_right    = 8
-	sb.corner_radius_bottom_left  = 8; sb.corner_radius_bottom_right = 8
-	sb.content_margin_left   = 22.0; sb.content_margin_right  = 22.0
-	sb.content_margin_top    = 10.0; sb.content_margin_bottom = 10.0
-	lbl.add_theme_stylebox_override("normal", sb)
-	lbl.add_theme_color_override("font_color", Color(0.65, 0.58, 0.82))
-	return lbl
+## Thin signature-band rule. Replaces HSeparator, whose theme colour is one flat
+## line with no way to carry the palette.
+func _results_rule(s: float) -> Control:
+	var rule := ColorRect.new()
+	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.50)
+	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
+	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return rule
+
+
+# (Results nav pills are PlateButtons now — see _spawn_results_panel.)
 
 
 func _end_update_nav_highlight() -> void:
-	var active_col:   Color = Color(1.00, 0.42, 0.72, 1.0)
-	var inactive_col: Color = Color(0.58, 0.52, 0.76, 1.0)
-	var active_bg:   Color = Color(0.44, 0.10, 0.70, 1.0)
-	var active_bdr:  Color = Color(0.80, 0.38, 1.00, 1.0)
-	var inactive_bg:  Color = Color(0.10, 0.08, 0.18, 1.0)
-	var inactive_bdr: Color = Color(0.40, 0.18, 0.65, 1.0)
-
-	var labels: Array = [_end_lbl_again, _end_lbl_select]
-	for i in labels.size():
-		var lbl: Label = labels[i] as Label
-		if lbl == null:
-			continue
-		var active: bool = (i == _end_screen_sel)
-		lbl.add_theme_color_override("font_color", active_col if active else inactive_col)
-		var sb := StyleBoxFlat.new()
-		sb.bg_color     = active_bg  if active else inactive_bg
-		sb.border_color = active_bdr if active else inactive_bdr
-		sb.border_width_left   = 2; sb.border_width_right  = 2
-		sb.border_width_top    = 2; sb.border_width_bottom = 2
-		sb.corner_radius_top_left     = 8; sb.corner_radius_top_right    = 8
-		sb.corner_radius_bottom_left  = 8; sb.corner_radius_bottom_right = 8
-		sb.content_margin_left   = 22.0; sb.content_margin_right  = 22.0
-		sb.content_margin_top    = 10.0; sb.content_margin_bottom = 10.0
-		lbl.add_theme_stylebox_override("normal", sb)
+	for i in _end_nav_labels.size():
+		var btn := _end_nav_labels[i]
+		if btn != null:
+			btn.set_highlight(i == _end_screen_sel)
 
 
 func _end_confirm() -> void:
@@ -9637,8 +8997,12 @@ func _end_confirm() -> void:
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
 		1:  # Song Select
 			Run.run_seed   = 0
-			Run.song_lives = 3
+			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+		2:  # Main Menu
+			Run.run_seed   = 0
+			Run.song_lives = GameConfig.lives_per_song
+			get_tree().change_scene_to_file("res://scenes/Main.tscn")
 
 
 # Record where the floor void begins.  The scene's single flat floor is hidden
@@ -10156,22 +9520,29 @@ func _spawn_track_decorations() -> void:
 ## a flat array instead of re-walking the node tree. Same matching rule as the
 ## old per-frame walk: only mi.material_override entries are tracked — authored
 ## Blender-piece meshes use surface materials and are unaffected either way.
-func _collect_cycle_mats(node: Node3D) -> Array[StandardMaterial3D]:
+func _collect_cycle_mats(node: Node3D) -> Array[Material]:
 	var vis: Node3D = node.get_node_or_null("VisRoot") as Node3D
 	if vis == null:
 		vis = node
-	var out: Array[StandardMaterial3D] = []
+	var out: Array[Material] = []
 	var stack: Array[Node] = [vis]
 	while not stack.is_empty():
 		var n: Node = stack.pop_back()
-		if n is MeshInstance3D:
-			var mi: MeshInstance3D = n as MeshInstance3D
+		# GeometryInstance3D, not MeshInstance3D: the approach marks are a
+		# MultiMeshInstance3D, which is a sibling class — checking the narrower
+		# type would drop them out of the colour cycle without any error.
+		if n is GeometryInstance3D:
+			var mi: GeometryInstance3D = n as GeometryInstance3D
 			# Structural "body" meshes (e.g. the dark silhouette box in
 			# _make_bldg_facade) are tagged no_cycle so they NEVER get
 			# recolored — they're meant to stay a fixed dark neutral always,
 			# cycle on or off, static or random.
-			if not mi.get_meta("no_cycle", false) and mi.material_override is StandardMaterial3D:
-				out.append(mi.material_override as StandardMaterial3D)
+			# Material, not StandardMaterial3D: the gates wear ShaderMaterials
+			# now, and the old check silently dropped them from the cycle — no
+			# error, the gate just quietly stopped recolouring. Writes go
+			# through NeonMat, which handles both families.
+			if not mi.get_meta("no_cycle", false) and mi.material_override != null:
+				out.append(mi.material_override)
 		for c in n.get_children():
 			stack.append(c)
 	return out
@@ -10251,7 +9622,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 			if not gate.visible:
 				continue
 			if i < _gate_cycle_mats.size() and color_cycle_enabled:
-				for mat: StandardMaterial3D in _gate_cycle_mats[i]:
+				for mat: Material in _gate_cycle_mats[i]:
 					# Random mode only: override BOTH the base surface color
 					# AND emission. The gates' actual visible "identity"
 					# color (the window-strip trim) is emission-driven — its
@@ -10260,21 +9631,18 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 					# excluded via the no_cycle mesh tag in
 					# _collect_cycle_mats, so this never bleeds onto parts
 					# that are meant to stay a fixed dark neutral.
-					mat.albedo_color = mat.albedo_color.lerp(live_col, kgate)
-					if mat.emission_enabled:
-						mat.emission = mat.emission.lerp(live_col, kgate)
+					NeonMat.lerp_tint(mat, live_col, kgate)
 
 	# ── Grind rail ───────────────────────────────────────────────────────────
 	if GameConfig.color_cycle_affects_rail and color_cycle_enabled:
-		for rmat: StandardMaterial3D in _grind_rail_mats:
+		for rmat: Material in _grind_rail_mats:
 			if rmat == null:
 				continue
 			# The rail is an inherently glow-strip look (authored with a
 			# strong emission to begin with), so unlike gates, tint both
 			# albedo AND emission together here — otherwise the surface and
 			# its own glow would drift out of sync and look like a bug.
-			rmat.albedo_color = rmat.albedo_color.lerp(live_col, kgate)
-			rmat.emission     = rmat.emission.lerp(live_col, kgate)
+			NeonMat.lerp_tint(rmat, live_col, kgate)
 
 	# ── Floor ────────────────────────────────────────────────────────────────
 	if _floor_material != null:

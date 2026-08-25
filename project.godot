@@ -86,7 +86,6 @@ ui_accept={
 
 [rendering]
 
-driver/threads/thread_model=2
 textures/vram_compression/import_s3tc_bptc=true
 textures/vram_compression/import_etc2_astc=true
 lights_and_shadows/directional_shadow/size=2048

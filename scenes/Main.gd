@@ -27,11 +27,11 @@ func _ready() -> void:
 
 # ── Responsive helpers ─────────────────────────────────────────────────────────
 
-## UI scale factor relative to 1920×1080 reference.
-## All hardcoded pixel sizes are multiplied by this value.
+## UI scale factor relative to the 1920×1080 reference. Shared with the HUD and
+## every other screen — this used to be a third private copy of the same formula.
 func _ui_s() -> float:
 	var vp := get_viewport().get_visible_rect().size if get_viewport() else Vector2(1920, 1080)
-	return clampf(minf(vp.x / 1920.0, vp.y / 1080.0), 0.5, 2.0)
+	return UiStyle.scale_for(vp)
 
 
 ## Width for panel cards — 40 % of viewport width, clamped to a scaled range.
@@ -74,16 +74,14 @@ func _panel_bg(color: Color) -> Array:
 	return [bg, wrapper]
 
 
-## Shared StyleBoxFlat for every panel card.
-func _panel_style() -> StyleBoxFlat:
-	var ps := StyleBoxFlat.new()
-	ps.bg_color           = Color(0.04, 0.03, 0.12, 0.97)
-	ps.border_color       = Color(0.50, 0.15, 0.75, 1.0)
-	ps.border_width_left  = 2;  ps.border_width_right  = 2
-	ps.border_width_top   = 2;  ps.border_width_bottom = 2
-	ps.corner_radius_top_left     = 12;  ps.corner_radius_top_right    = 12
-	ps.corner_radius_bottom_left  = 12;  ps.corner_radius_bottom_right = 12
-	return ps
+## Thin signature-band rule. HSeparator's theme colour is one flat line with no
+## way to carry the palette.
+func _rule(s: float = 1.0) -> Control:
+	var r := ColorRect.new()
+	r.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.45)
+	r.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
+	r.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	return r
 
 
 # ── UI construction ────────────────────────────────────────────────────────────
@@ -99,12 +97,24 @@ func _build_ui() -> void:
 	bg.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_COVERED
 	add_child(bg)
 
-	# Dark tint overlay (mouse events pass through so buttons underneath still work)
-	var overlay := ColorRect.new()
-	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	overlay.color = Color(0.02, 0.01, 0.08, 0.0)
-	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	add_child(overlay)
+	# Scrim behind the menu column. The background art is bright on the left,
+	# which is exactly where the plates sit — without this their neon edges and
+	# glow have nothing to read against. Fades out to the right so the artwork
+	# is still the artwork. (Mouse events pass through.)
+	var scrim := TextureRect.new()
+	scrim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	scrim.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	scrim.stretch_mode = TextureRect.STRETCH_SCALE
+	var sgrad := Gradient.new()
+	sgrad.set_color(0, Color(0.015, 0.008, 0.045, 0.94))
+	sgrad.set_color(1, Color(0.015, 0.008, 0.045, 0.0))
+	var stex := GradientTexture2D.new()
+	stex.gradient  = sgrad
+	stex.fill_from = Vector2(0.0, 0.0)
+	stex.fill_to   = Vector2(0.42, 0.0)
+	stex.width = 256; stex.height = 8
+	scrim.texture = stex
+	add_child(scrim)
 
 	# Left-aligned layout: scaled left pad + vertically-centred menu column
 	var outer := HBoxContainer.new()
@@ -123,11 +133,13 @@ func _build_ui() -> void:
 	outer.add_child(vert_center)
 
 	var menu_box := VBoxContainer.new()
-	menu_box.custom_minimum_size = Vector2(320.0 * s, 0)
-	menu_box.add_theme_constant_override("separation", int(14 * s))
+	menu_box.custom_minimum_size = Vector2(340.0 * s, 0)
+	menu_box.add_theme_constant_override("separation", int(12 * s))
 	vert_center.add_child(menu_box)
 	_menu_box = menu_box
 
+	# No wordmark here: the background art already carries the title and the
+	# author credit, so a second one just competes with it.
 	var new_btn := _menu_btn("NEW GAME", _on_new_game, s)
 	menu_box.add_child(new_btn)
 	new_btn.grab_focus()
@@ -145,8 +157,9 @@ func _build_ui() -> void:
 	ver.text = "v0.01"
 	ver.offset_left = -60.0 * s
 	ver.offset_top  = -30.0 * s
-	ver.add_theme_font_size_override("font_size", int(13 * s))
-	ver.add_theme_color_override("font_color", Color(0.40, 0.35, 0.55, 0.70))
+	ver.add_theme_font_override("font", UiStyle.display(600, 2.0))
+	ver.add_theme_font_size_override("font_size", int(12 * s))
+	ver.add_theme_color_override("font_color", Color(0.45, 0.40, 0.62, 0.75))
 	add_child(ver)
 
 	# Panels (hidden until triggered)
@@ -161,8 +174,8 @@ func _build_ui() -> void:
 
 # ── Button factory ─────────────────────────────────────────────────────────────
 
-func _menu_btn(text: String, callback: Callable, s: float = 1.0) -> Button:
-	var btn := Button.new()
+func _menu_btn(text: String, callback: Callable, s: float = 1.0) -> PlateButton:
+	var btn := PlateButton.new()
 	btn.text = text
 	btn.custom_minimum_size = Vector2(320.0 * s, 56.0 * s)
 	btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -171,35 +184,13 @@ func _menu_btn(text: String, callback: Callable, s: float = 1.0) -> Button:
 	return btn
 
 
+## PlateButton brings its own chassis, font and state colours; all that is left
+## here is sizing. Kept as a function so the ~10 call sites stay unchanged.
 func _style_btn(btn: Button, s: float = 1.0) -> void:
-	var mk := func(bg: Color, brd: Color) -> StyleBoxFlat:
-		var sf := StyleBoxFlat.new()
-		sf.bg_color     = bg
-		sf.border_color = brd
-		sf.border_width_left   = 2
-		sf.border_width_right  = 2
-		sf.border_width_top    = 2
-		sf.border_width_bottom = 2
-		sf.corner_radius_top_left     = int(8 * s)
-		sf.corner_radius_top_right    = int(8 * s)
-		sf.corner_radius_bottom_left  = int(8 * s)
-		sf.corner_radius_bottom_right = int(8 * s)
-		sf.content_margin_left   = int(24 * s)
-		sf.content_margin_right  = int(24 * s)
-		sf.content_margin_top    = int(12 * s)
-		sf.content_margin_bottom = int(12 * s)
-		return sf
-
-	btn.add_theme_stylebox_override("normal",   mk.call(Color(0.06, 0.03, 0.14, 0.88), Color(0.55, 0.15, 0.80, 1.0)))
-	btn.add_theme_stylebox_override("hover",    mk.call(Color(0.22, 0.08, 0.40, 0.95), Color(1.00, 0.45, 0.85, 1.0)))
-	btn.add_theme_stylebox_override("pressed",  mk.call(Color(0.45, 0.10, 0.72, 1.00), Color(1.00, 0.70, 1.00, 1.0)))
-	btn.add_theme_stylebox_override("disabled", mk.call(Color(0.04, 0.02, 0.08, 0.50), Color(0.22, 0.10, 0.32, 0.40)))
-	btn.add_theme_stylebox_override("focus",    mk.call(Color(0.06, 0.03, 0.14, 0.88), Color(1.00, 0.65, 1.00, 1.0)))
-	btn.add_theme_color_override("font_color",          Color(0.92, 0.78, 1.00, 1.0))
-	btn.add_theme_color_override("font_hover_color",    Color(1.00, 0.65, 0.90, 1.0))
-	btn.add_theme_color_override("font_pressed_color",  Color(1.00, 1.00, 1.00, 1.0))
-	btn.add_theme_color_override("font_disabled_color", Color(0.38, 0.32, 0.50, 0.55))
-	btn.add_theme_font_size_override("font_size", int(22 * s))
+	btn.add_theme_font_size_override("font_size", int(19 * s))
+	var pb := btn as PlateButton
+	if pb != null:
+		pb.set_padding(22.0 * s, 11.0 * s)
 
 
 # ── Options panel ──────────────────────────────────────────────────────────────
@@ -210,30 +201,24 @@ func _build_options_panel() -> Control:
 	var bg:      Control = arr[0]
 	var wrapper: Control = arr[1]
 
-	var panel := PanelContainer.new()
+	var panel := PlatePanel.create(int(42 * s), UiStyle.VIOLET, 26.0 * s)
 	panel.custom_minimum_size = Vector2(_panel_w(), 0)
-	panel.add_theme_stylebox_override("panel", _panel_style())
 	wrapper.add_child(panel)
-
-	var margin := MarginContainer.new()
-	margin.add_theme_constant_override("margin_left",   int(44 * s))
-	margin.add_theme_constant_override("margin_right",  int(44 * s))
-	margin.add_theme_constant_override("margin_top",    int(36 * s))
-	margin.add_theme_constant_override("margin_bottom", int(36 * s))
-	panel.add_child(margin)
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", int(16 * s))
-	margin.add_child(vbox)
+	panel.content.add_child(vbox)
 
 	# Title
 	var ttl := Label.new()
 	ttl.text = "OPTIONS"
 	ttl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	ttl.add_theme_font_size_override("font_size", int(32 * s))
-	ttl.add_theme_color_override("font_color", Color(1.0, 0.4, 0.7, 1.0))
+	ttl.add_theme_font_override("font", UiStyle.caption(7.0))
+	ttl.add_theme_font_size_override("font_size", int(26 * s))
+	ttl.add_theme_color_override("font_color", Color.WHITE)
+	ttl.self_modulate = UiStyle.signature_color(0.1)
 	vbox.add_child(ttl)
-	vbox.add_child(HSeparator.new())
+	vbox.add_child(_rule(s))
 
 	# ── AUDIO ─────────────────────────────────────────────────────────────────
 	_opt_section(vbox, "AUDIO", s)
@@ -265,6 +250,7 @@ func _build_options_panel() -> Control:
 
 	var fps_row := _opt_row(vbox, "Max FPS", s)
 	var fps_opt := OptionButton.new()
+	UiStyle.style_option(fps_opt, s)
 	fps_opt.add_item("30");  fps_opt.add_item("60")
 	fps_opt.add_item("120"); fps_opt.add_item("Unlimited")
 	var fps_vals: Array[int] = [30, 60, 120, 0]
@@ -275,6 +261,7 @@ func _build_options_panel() -> Control:
 
 	var quality_row := _opt_row(vbox, "Quality", s)
 	var quality_opt := OptionButton.new()
+	UiStyle.style_option(quality_opt, s)
 	var quality_ids: Array[String] = GraphicsQuality.TIERS   # ["low","medium","high","ultra"]
 	for qid: String in quality_ids:
 		quality_opt.add_item(qid.capitalize())
@@ -300,14 +287,14 @@ func _build_options_panel() -> Control:
 	btn_row.add_theme_constant_override("separation", int(20 * s))
 	vbox.add_child(btn_row)
 
-	var save_btn := Button.new()
+	var save_btn := PlateButton.new()
 	save_btn.text = "SAVE & BACK"
 	save_btn.custom_minimum_size = Vector2(int(170 * s), int(48 * s))
 	_style_btn(save_btn, s)
 	save_btn.pressed.connect(_on_save_back)
 	btn_row.add_child(save_btn)
 
-	var back_btn := Button.new()
+	var back_btn := PlateButton.new()
 	back_btn.text = "BACK"
 	back_btn.custom_minimum_size = Vector2(int(170 * s), int(48 * s))
 	_style_btn(back_btn, s)
@@ -319,7 +306,7 @@ func _build_options_panel() -> Control:
 	nav_gap.custom_minimum_size = Vector2(0, int(4 * s))
 	vbox.add_child(nav_gap)
 
-	var nav_btn := Button.new()
+	var nav_btn := PlateButton.new()
 	nav_btn.text = "GAMEPLAY  &  APPEARANCE  →"
 	nav_btn.custom_minimum_size = Vector2(int(360 * s), int(46 * s))
 	nav_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -327,7 +314,7 @@ func _build_options_panel() -> Control:
 	nav_btn.pressed.connect(_on_show_gameplay)
 	vbox.add_child(nav_btn)
 
-	var controls_btn := Button.new()
+	var controls_btn := PlateButton.new()
 	controls_btn.text = "CONTROLS  →"
 	controls_btn.custom_minimum_size = Vector2(int(360 * s), int(46 * s))
 	controls_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -335,7 +322,7 @@ func _build_options_panel() -> Control:
 	controls_btn.pressed.connect(_on_show_controls)
 	vbox.add_child(controls_btn)
 
-	var htp_btn := Button.new()
+	var htp_btn := PlateButton.new()
 	htp_btn.text = "HOW TO PLAY  →"
 	htp_btn.custom_minimum_size = Vector2(int(360 * s), int(46 * s))
 	htp_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
@@ -350,12 +337,10 @@ func _build_options_panel() -> Control:
 
 func _opt_section(parent: Node, text: String, s: float = 1.0) -> void:
 	var gap := Control.new()
-	gap.custom_minimum_size = Vector2(0, int(2 * s))
+	gap.custom_minimum_size = Vector2(0, int(8 * s))
 	parent.add_child(gap)
-	var lbl := Label.new()
-	lbl.text = text
-	lbl.add_theme_font_size_override("font_size", int(15 * s))
-	lbl.add_theme_color_override("font_color", Color(0.65, 0.42, 0.92, 1.0))
+	var lbl: Label = UiStyle.label(text, UiStyle.caption(5.0), int(13 * s), Color.WHITE)
+	lbl.self_modulate = Color(0.72, 0.50, 1.00)
 	parent.add_child(lbl)
 
 
@@ -364,12 +349,9 @@ func _opt_row(parent: Node, label_text: String, s: float = 1.0) -> HBoxContainer
 	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_theme_constant_override("separation", int(12 * s))
 	parent.add_child(row)
-	var lbl := Label.new()
-	lbl.text = label_text
+	var lbl: Label = UiStyle.label(label_text, UiStyle.body(), int(16 * s), UiStyle.TEXT_DIM)
 	lbl.custom_minimum_size = Vector2(210.0 * s, 0)
 	lbl.vertical_alignment  = VERTICAL_ALIGNMENT_CENTER
-	lbl.add_theme_font_size_override("font_size", int(17 * s))
-	lbl.add_theme_color_override("font_color", Color(0.88, 0.88, 0.96, 1.0))
 	row.add_child(lbl)
 	return row
 
@@ -385,10 +367,12 @@ func _opt_slider(parent: Node, label_text: String,
 	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	slider.custom_minimum_size   = Vector2(160.0 * s, 0)
 	slider.value_changed.connect(on_change)
+	UiStyle.style_slider(slider, s)
 	val_lbl.custom_minimum_size  = Vector2(70.0 * s, 0)
 	val_lbl.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
-	val_lbl.add_theme_font_size_override("font_size", int(15 * s))
-	val_lbl.add_theme_color_override("font_color", Color(0.72, 0.72, 0.88, 1.0))
+	val_lbl.add_theme_font_override("font", UiStyle.display(700))
+	val_lbl.add_theme_font_size_override("font_size", int(14 * s))
+	val_lbl.add_theme_color_override("font_color", UiStyle.CYAN)
 	row.add_child(slider)
 	row.add_child(val_lbl)
 
@@ -397,9 +381,20 @@ func _opt_toggle(parent: Node, label_text: String,
 		init_state: bool, on_toggle: Callable,
 		s: float = 1.0) -> void:
 	var row := _opt_row(parent, label_text, s)
-	var chk := CheckButton.new()
+	var chk := PlateButton.new()
+	chk.toggle_mode = true
 	chk.button_pressed = init_state
-	chk.toggled.connect(on_toggle)
+	chk.custom_minimum_size = Vector2(96 * s, 0)
+	chk.add_theme_font_size_override("font_size", int(13 * s))
+	chk.set_padding(14.0 * s, 7.0 * s)
+	var apply := func(on: bool) -> void:
+		chk.text = "ON" if on else "OFF"
+		chk.set_accent(UiStyle.CYAN if on else UiStyle.VIOLET)
+		chk.set_highlight(on)
+	apply.call(init_state)
+	chk.toggled.connect(func(on: bool) -> void:
+		apply.call(on)
+		on_toggle.call(on))
 	row.add_child(chk)
 
 
@@ -422,21 +417,13 @@ func _build_gameplay_panel() -> Control:
 	var bg:      Control = arr[0]
 	var wrapper: Control = arr[1]
 
-	var panel := PanelContainer.new()
+	var panel := PlatePanel.create(int(42 * s), UiStyle.VIOLET, 26.0 * s)
 	panel.custom_minimum_size = Vector2(_panel_w(), 0)
-	panel.add_theme_stylebox_override("panel", _panel_style())
 	wrapper.add_child(panel)
-
-	var margin := MarginContainer.new()
-	margin.add_theme_constant_override("margin_left",   int(44 * s))
-	margin.add_theme_constant_override("margin_right",  int(44 * s))
-	margin.add_theme_constant_override("margin_top",    int(36 * s))
-	margin.add_theme_constant_override("margin_bottom", int(36 * s))
-	panel.add_child(margin)
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", int(16 * s))
-	margin.add_child(vbox)
+	panel.content.add_child(vbox)
 
 	# Title
 	var ttl := Label.new()
@@ -521,6 +508,7 @@ func _build_gameplay_panel() -> Control:
 
 	var shape_row := _opt_row(vbox, "Shape", s)
 	var shape_opt := OptionButton.new()
+	UiStyle.style_option(shape_opt, s)
 	var halo_shape_ids: Array[String] = [
 		"circle", "triangle", "square", "pentagon",
 		"hexagon", "star", "diamond", "cross", "heart",
@@ -559,14 +547,14 @@ func _build_gameplay_panel() -> Control:
 	btn_row.add_theme_constant_override("separation", int(20 * s))
 	vbox.add_child(btn_row)
 
-	var reset_btn := Button.new()
+	var reset_btn := PlateButton.new()
 	reset_btn.text = "RESET DEFAULTS"
 	reset_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
 	_style_btn(reset_btn, s)
 	reset_btn.pressed.connect(_on_gameplay_reset)
 	btn_row.add_child(reset_btn)
 
-	var back_btn := Button.new()
+	var back_btn := PlateButton.new()
 	back_btn.text = "← BACK"
 	back_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
 	_style_btn(back_btn, s)
@@ -587,30 +575,24 @@ func _build_controls_panel() -> Control:
 	var bg:      Control = arr[0]
 	var wrapper: Control = arr[1]
 
-	var panel := PanelContainer.new()
+	var panel := PlatePanel.create(int(42 * s), UiStyle.VIOLET, 26.0 * s)
 	panel.custom_minimum_size = Vector2(_panel_w(), 0)
-	panel.add_theme_stylebox_override("panel", _panel_style())
 	wrapper.add_child(panel)
-
-	var margin := MarginContainer.new()
-	margin.add_theme_constant_override("margin_left",   int(44 * s))
-	margin.add_theme_constant_override("margin_right",  int(44 * s))
-	margin.add_theme_constant_override("margin_top",    int(36 * s))
-	margin.add_theme_constant_override("margin_bottom", int(36 * s))
-	panel.add_child(margin)
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", int(16 * s))
-	margin.add_child(vbox)
+	panel.content.add_child(vbox)
 
 	# Title
 	var ttl := Label.new()
 	ttl.text = "CONTROLS"
 	ttl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	ttl.add_theme_font_size_override("font_size", int(32 * s))
-	ttl.add_theme_color_override("font_color", Color(1.0, 0.4, 0.7, 1.0))
+	ttl.add_theme_font_override("font", UiStyle.caption(7.0))
+	ttl.add_theme_font_size_override("font_size", int(26 * s))
+	ttl.add_theme_color_override("font_color", Color.WHITE)
+	ttl.self_modulate = UiStyle.signature_color(0.1)
 	vbox.add_child(ttl)
-	vbox.add_child(HSeparator.new())
+	vbox.add_child(_rule(s))
 
 	var note := Label.new()
 	note.text = "Click a key or button, then press the new one. Escape cancels. Changes apply immediately and How To Play updates to match."
@@ -624,14 +606,14 @@ func _build_controls_panel() -> Control:
 	for action: String in GameConfig.REBINDABLE_ACTIONS:
 		var row := _opt_row(vbox, GameConfig.ACTION_LABELS.get(action, action), s)
 
-		var key_btn := Button.new()
+		var key_btn := PlateButton.new()
 		key_btn.custom_minimum_size = Vector2(int(120 * s), int(36 * s))
 		key_btn.text = GameConfig.key_name(action)
 		_style_btn(key_btn, s)
 		key_btn.pressed.connect(func() -> void: _start_bind_capture(action, "key", key_btn))
 		row.add_child(key_btn)
 
-		var joy_btn := Button.new()
+		var joy_btn := PlateButton.new()
 		joy_btn.custom_minimum_size = Vector2(int(140 * s), int(36 * s))
 		joy_btn.text = GameConfig.joy_button_name(action)
 		_style_btn(joy_btn, s)
@@ -655,14 +637,14 @@ func _build_controls_panel() -> Control:
 	btn_row.add_theme_constant_override("separation", int(20 * s))
 	vbox.add_child(btn_row)
 
-	var reset_btn := Button.new()
+	var reset_btn := PlateButton.new()
 	reset_btn.text = "RESET DEFAULTS"
 	reset_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
 	_style_btn(reset_btn, s)
 	reset_btn.pressed.connect(_on_controls_reset)
 	btn_row.add_child(reset_btn)
 
-	var back_btn := Button.new()
+	var back_btn := PlateButton.new()
 	back_btn.text = "← BACK"
 	back_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
 	_style_btn(back_btn, s)
@@ -736,30 +718,24 @@ func _build_howtoplay_panel() -> Control:
 	var bg:      Control = arr[0]
 	var wrapper: Control = arr[1]
 
-	var panel := PanelContainer.new()
+	var panel := PlatePanel.create(int(50 * s), UiStyle.VIOLET, 30.0 * s)
 	panel.custom_minimum_size = Vector2(_panel_w_wide(), 0)
-	panel.add_theme_stylebox_override("panel", _panel_style())
 	wrapper.add_child(panel)
-
-	var margin := MarginContainer.new()
-	margin.add_theme_constant_override("margin_left",   int(52 * s))
-	margin.add_theme_constant_override("margin_right",  int(52 * s))
-	margin.add_theme_constant_override("margin_top",    int(40 * s))
-	margin.add_theme_constant_override("margin_bottom", int(40 * s))
-	panel.add_child(margin)
 
 	var vbox := VBoxContainer.new()
 	vbox.add_theme_constant_override("separation", int(18 * s))
-	margin.add_child(vbox)
+	panel.content.add_child(vbox)
 
 	# Title
 	var ttl := Label.new()
 	ttl.text = "HOW TO PLAY"
 	ttl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	ttl.add_theme_font_size_override("font_size", int(32 * s))
-	ttl.add_theme_color_override("font_color", Color(1.0, 0.4, 0.7, 1.0))
+	ttl.add_theme_font_override("font", UiStyle.caption(7.0))
+	ttl.add_theme_font_size_override("font_size", int(26 * s))
+	ttl.add_theme_color_override("font_color", Color.WHITE)
+	ttl.self_modulate = UiStyle.signature_color(0.1)
 	vbox.add_child(ttl)
-	vbox.add_child(HSeparator.new())
+	vbox.add_child(_rule(s))
 
 	# Controls — both columns always visible
 	_htp_section(vbox, "CONTROLS", s)
@@ -806,7 +782,7 @@ func _build_howtoplay_panel() -> Control:
 	vbox.add_child(sc)
 	_htp_row(sc, "Gate hit",             "+500 pts × combo multiplier",              s)
 	_htp_row(sc, "Combo multiplier",     "×2 at 10 streak  ·  ×3 at 20  ·  ×4 at 30", s)
-	_htp_row(sc, "Health (starts 50 %)", "+2 % per hit    –2 % per miss    → 0 % = fail", s)
+	_htp_row(sc, "Health (starts 25 %)", "+2 % per hit    –2 % per miss    → 0 % = fail", s)
 	_htp_row(sc, "Letter grade",         "S / A / B / C / D / F  based on accuracy %", s)
 
 	# Back button
@@ -814,7 +790,7 @@ func _build_howtoplay_panel() -> Control:
 	sp.custom_minimum_size = Vector2(0, int(6 * s))
 	vbox.add_child(sp)
 
-	var back_btn := Button.new()
+	var back_btn := PlateButton.new()
 	back_btn.text = "← BACK"
 	back_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
 	back_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER

@@ -1,118 +1,201 @@
 extends Control
 
-@onready var list: ItemList         = $Layout/SongList
-@onready var info: Label            = $Layout/Info
-@onready var btn_tutorial: Button   = $Layout/ModeRow/BtnTutorial
-@onready var btn_seeded:   Button   = $Layout/ModeRow/BtnSeeded
-@onready var btn_random:   Button   = $Layout/ModeRow/BtnRandom
+## Song select.
+##
+## The list used to be a Godot ItemList — one flat stylebox, one font, one line
+## of text per row. No amount of theming makes that stop reading as a file
+## listing, so it is a column of chamfered PlatePanel cards now, each showing
+## the song's own best score and combo in the same typography the HUD uses.
 
 # Set this in the Inspector to the scene that should run the level
 @export_file("*.tscn") var level_scene_path: String = "res://scenes/GameScene.tscn"
 
+const MODES: Array[String] = ["tutorial_fixed", "song_seeded", "run_random"]
+const MODE_LABELS: Array[String] = ["TUTORIAL", "SEEDED", "RANDOM"]
+const MODE_BLURBS: Array[String] = [
+	"FIXED LAYOUT  ·  LEARN THE MECHANICS",
+	"SAME LAYOUT EVERY RUN",
+	"NEW LAYOUT EVERY RUN",
+]
+
 # Each entry: {"key": String, "title": String, "song_path": String}
 var beatmaps: Array[Dictionary] = []
+
 var _current_mode: String = "run_random"
+var _sel_idx: int = 0
+
+var _s: float = 1.0
+var _list_box: VBoxContainer = null
+var _scroller: ScrollContainer = null
+var _cards: Array[PlatePanel] = []
+var _mode_buttons: Array[PlateButton] = []
+var _info: Label = null
+
 
 func _ready() -> void:
-	# Restore saved mode from Run autoload
+	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+
 	var saved_mode: String = str(Run.get("runner_pattern_mode")).strip_edges()
 	if saved_mode != "" and saved_mode != "null" and saved_mode != "Null":
 		_current_mode = saved_mode
 
 	_ensure_menu_input_map()
-	_apply_theme()
+	_s = UiStyle.scale_for(get_viewport().get_visible_rect().size)
+	_build_ui()
 	_load_beatmaps()
 	_update_mode_buttons()
+	_select(0)
 
-	btn_tutorial.pressed.connect(func() -> void: _set_mode("tutorial_fixed"))
-	btn_seeded.pressed.connect(func() -> void:   _set_mode("song_seeded"))
-	btn_random.pressed.connect(func() -> void:   _set_mode("run_random"))
 
-	list.item_activated.connect(Callable(self, "_on_item_activated"))
-	list.grab_focus()
+# ── UI construction ──────────────────────────────────────────────────────────
 
-	if list.item_count > 0:
-		list.select(0)
-		list.ensure_current_is_visible()
-		_update_info_text()
+func _build_ui() -> void:
+	var s: float = _s
+
+	var bg := ColorRect.new()
+	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	bg.color = UiStyle.INK_DEEP
+	add_child(bg)
+
+	# A soft signature-band wash so the screen is not a flat rectangle of ink.
+	var wash := ColorRect.new()
+	wash.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	wash.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var grad := Gradient.new()
+	grad.set_color(0, Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.18))
+	grad.set_color(1, Color(0, 0, 0, 0))
+	var tex := GradientTexture2D.new()
+	tex.gradient  = grad
+	tex.fill      = GradientTexture2D.FILL_RADIAL
+	tex.fill_from = Vector2(0.5, 0.32)
+	tex.fill_to   = Vector2(1.05, 0.32)
+	tex.width = 256; tex.height = 256
+	var wash_tex := TextureRect.new()
+	wash_tex.texture = tex
+	wash_tex.stretch_mode = TextureRect.STRETCH_SCALE
+	wash_tex.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	wash_tex.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(wash_tex)
+
+	var margin := MarginContainer.new()
+	margin.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	margin.add_theme_constant_override("margin_left",   int(120 * s))
+	margin.add_theme_constant_override("margin_right",  int(120 * s))
+	margin.add_theme_constant_override("margin_top",    int(44 * s))
+	margin.add_theme_constant_override("margin_bottom", int(40 * s))
+	add_child(margin)
+
+	var col := VBoxContainer.new()
+	col.add_theme_constant_override("separation", int(16 * s))
+	margin.add_child(col)
+
+	var title: Label = UiStyle.label("SELECT A SONG", UiStyle.caption(9.0), int(34 * s), Color.WHITE)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.self_modulate = UiStyle.signature_color(0.1)
+	col.add_child(title)
+
+	var sub: Label = UiStyle.label("ECHOES IN MY BLOOD", UiStyle.caption(4.0), int(12 * s), Color.WHITE)
+	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sub.self_modulate = Color(0.60, 0.54, 0.78, 0.85)
+	col.add_child(sub)
+
+	# ── Song cards ───────────────────────────────────────────────────────────
+	_scroller = ScrollContainer.new()
+	_scroller.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_scroller.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	col.add_child(_scroller)
+
+	_list_box = VBoxContainer.new()
+	_list_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	# Fill the scroller and centre within it, so a short list sits in the middle
+	# of the screen instead of clinging to the top with a gap underneath. The
+	# VBox minimum still grows with content, so a long list scrolls as normal.
+	_list_box.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_list_box.alignment = BoxContainer.ALIGNMENT_CENTER
+	_list_box.add_theme_constant_override("separation", int(10 * s))
+	_scroller.add_child(_list_box)
+
+	# ── Mode row ─────────────────────────────────────────────────────────────
+	var mode_row := HBoxContainer.new()
+	mode_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	mode_row.add_theme_constant_override("separation", int(12 * s))
+	col.add_child(mode_row)
+
+	_mode_buttons.clear()
+	for i in MODES.size():
+		var idx: int = i
+		var btn := PlateButton.create(MODE_LABELS[i], func() -> void: _set_mode(MODES[idx]),
+			int(15 * s), UiStyle.PINK)
+		btn.custom_minimum_size = Vector2(200 * s, 48 * s)
+		mode_row.add_child(btn)
+		_mode_buttons.append(btn)
+
+	_info = UiStyle.label("", UiStyle.caption(2.0), int(11 * s), Color.WHITE)
+	_info.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_info.self_modulate = Color(0.56, 0.50, 0.72, 0.85)
+	col.add_child(_info)
+
+	# ── Back ─────────────────────────────────────────────────────────────────
+	# Esc used to be the only way out of this screen, and it called quit().
+	var back_row := HBoxContainer.new()
+	back_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	col.add_child(back_row)
+
+	var back := PlateButton.create("↩  BACK", _go_back, int(14 * s), UiStyle.VIOLET)
+	back.custom_minimum_size = Vector2(220 * s, 44 * s)
+	back_row.add_child(back)
+
+
+## One song card: title, plus best score and combo when the song has been played.
+func _make_card(title: String, key: String) -> PlatePanel:
+	var s: float = _s
+	var card := PlatePanel.create(int(18 * s), UiStyle.VIOLET, 18.0 * s)
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", int(2 * s))
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(box)
+
+	var name_lbl: Label = UiStyle.label(title.to_upper(), UiStyle.caption(3.5), int(20 * s), Color.WHITE)
+	name_lbl.self_modulate = Color(1.00, 0.88, 1.00)
+	box.add_child(name_lbl)
+
+	var hs: Dictionary = Save.get_high_score(key)
+	var hs_score: int = int(hs.get("score", 0))
+	var hs_combo: int = int(hs.get("combo", 0))
+	var stat_text: String
+	var stat_col: Color
+	if hs_score > 0:
+		stat_text = "BEST  %s   ×%d" % [UiStyle.group_digits(hs_score), hs_combo]
+		stat_col  = UiStyle.CYAN
 	else:
-		info.text = "No beatmaps found in res://data/beatmaps"
+		stat_text = "NOT YET PLAYED"
+		stat_col  = Color(0.52, 0.47, 0.65)
+	var stat_lbl: Label = UiStyle.label(stat_text, UiStyle.display(700), int(14 * s), Color.WHITE)
+	stat_lbl.self_modulate = stat_col
+	box.add_child(stat_lbl)
+
+	return card
 
 
-# ── Theme ───────────────────────────────────────────────────────────────────
+# ── Selection ────────────────────────────────────────────────────────────────
 
-func _apply_theme() -> void:
-	# Song list background panel
-	var list_bg := StyleBoxFlat.new()
-	list_bg.bg_color              = Color(0.07, 0.07, 0.11, 1.0)
-	list_bg.border_width_left     = 2
-	list_bg.border_width_right    = 2
-	list_bg.border_width_top      = 2
-	list_bg.border_width_bottom   = 2
-	list_bg.border_color          = Color(0.28, 0.12, 0.48, 1.0)
-	list_bg.corner_radius_top_left     = 7
-	list_bg.corner_radius_top_right    = 7
-	list_bg.corner_radius_bottom_left  = 7
-	list_bg.corner_radius_bottom_right = 7
-	list.add_theme_stylebox_override("panel", list_bg)
-	list.add_theme_color_override("font_color",          Color(0.88, 0.88, 0.92, 1.0))
-	list.add_theme_color_override("font_selected_color", Color(1.0, 0.40, 0.70, 1.0))
-	list.add_theme_color_override("font_hovered_color",  Color(0.95, 0.65, 0.85, 1.0))
-
-	# Selected item highlight
-	var sel_box := StyleBoxFlat.new()
-	sel_box.bg_color = Color(0.22, 0.08, 0.38, 1.0)
-	sel_box.corner_radius_top_left     = 5
-	sel_box.corner_radius_top_right    = 5
-	sel_box.corner_radius_bottom_left  = 5
-	sel_box.corner_radius_bottom_right = 5
-	list.add_theme_stylebox_override("selected",       sel_box)
-	list.add_theme_stylebox_override("selected_focus", sel_box)
-
-	# Initial button style (will be refreshed by _update_mode_buttons)
-	for btn: Button in [btn_tutorial, btn_seeded, btn_random]:
-		_style_button(btn, false)
+func _select(idx: int) -> void:
+	if _cards.is_empty():
+		return
+	_sel_idx = clampi(idx, 0, _cards.size() - 1)
+	for i in _cards.size():
+		_cards[i].set_selected(i == _sel_idx)
+	if _scroller != null:
+		_scroller.ensure_control_visible(_cards[_sel_idx])
+	_update_info_text()
 
 
-func _style_button(btn: Button, active: bool) -> void:
-	var sb := StyleBoxFlat.new()
-	if active:
-		sb.bg_color     = Color(0.48, 0.10, 0.72, 1.0)
-		sb.border_color = Color(0.80, 0.40, 1.00, 1.0)
-	else:
-		sb.bg_color     = Color(0.10, 0.08, 0.16, 1.0)
-		sb.border_color = Color(0.32, 0.18, 0.52, 1.0)
-
-	sb.border_width_left     = 2
-	sb.border_width_right    = 2
-	sb.border_width_top      = 2
-	sb.border_width_bottom   = 2
-	sb.corner_radius_top_left     = 6
-	sb.corner_radius_top_right    = 6
-	sb.corner_radius_bottom_left  = 6
-	sb.corner_radius_bottom_right = 6
-	sb.content_margin_left   = 20.0
-	sb.content_margin_right  = 20.0
-	sb.content_margin_top    = 9.0
-	sb.content_margin_bottom = 9.0
-	btn.add_theme_stylebox_override("normal", sb)
-
-	var hover_sb: StyleBoxFlat = sb.duplicate() as StyleBoxFlat
-	hover_sb.bg_color = sb.bg_color.lightened(0.12)
-	btn.add_theme_stylebox_override("hover", hover_sb)
-
-	var press_sb: StyleBoxFlat = sb.duplicate() as StyleBoxFlat
-	press_sb.bg_color = Color(0.60, 0.16, 0.90, 1.0)
-	btn.add_theme_stylebox_override("pressed", press_sb)
-
-	# Disabled state (same as normal to avoid default gray)
-	btn.add_theme_stylebox_override("disabled", sb)
-
-	var font_col: Color = Color(1.0, 0.45, 0.72, 1.0) if active else Color(0.62, 0.52, 0.80, 1.0)
-	btn.add_theme_color_override("font_color",         font_col)
-	btn.add_theme_color_override("font_hover_color",   Color(1.0, 0.68, 0.88, 1.0))
-	btn.add_theme_color_override("font_pressed_color", Color(1.0, 1.0, 1.0, 1.0))
-	btn.add_theme_font_size_override("font_size", 15)
+func _navigate_list(delta: int) -> void:
+	if _cards.is_empty():
+		return
+	_select(posmod(_sel_idx + delta, _cards.size()))
 
 
 # ── Mode management ──────────────────────────────────────────────────────────
@@ -121,38 +204,42 @@ func _set_mode(mode: String) -> void:
 	_current_mode = mode
 	Run.set("runner_pattern_mode", mode)
 	_update_mode_buttons()
-	list.grab_focus()
 
 
 func _update_mode_buttons() -> void:
-	_style_button(btn_tutorial, _current_mode == "tutorial_fixed")
-	_style_button(btn_seeded,   _current_mode == "song_seeded")
-	_style_button(btn_random,   _current_mode == "run_random")
-
-	if list.item_count > 0:
-		_update_info_text()
+	for i in _mode_buttons.size():
+		var active: bool = MODES[i] == _current_mode
+		_mode_buttons[i].set_accent(UiStyle.CYAN if active else UiStyle.VIOLET)
+		_mode_buttons[i].set_highlight(active)
+	_update_info_text()
 
 
 func _update_info_text() -> void:
-	var mode_label: String
-	match _current_mode:
-		"tutorial_fixed": mode_label = "Tutorial  —  fixed layout, learn the mechanics"
-		"song_seeded":    mode_label = "Seeded  —  same layout every run"
-		"run_random":     mode_label = "Random  —  new layout every run"
-		_:                mode_label = _current_mode
+	if _info == null:
+		return
+	var idx: int = MODES.find(_current_mode)
+	var blurb: String = MODE_BLURBS[idx] if idx >= 0 else _current_mode
+	_info.text = "%s     ↑↓ CHOOSE  ·  ENTER / A START  ·  LB/RB OR Q/E MODE  ·  ESC / B BACK" % blurb
 
-	info.text = "%s   |   ↑↓/D-pad choose  ·  Enter/A start  ·  LB/RB or Q/E mode  ·  Esc/B quit" % mode_label
+
+func _cycle_mode(delta: int) -> void:
+	var idx: int = MODES.find(_current_mode)
+	if idx == -1:
+		idx = 0
+	_set_mode(MODES[posmod(idx + delta, MODES.size())])
 
 
 # ── Beatmap loading ──────────────────────────────────────────────────────────
 
 func _load_beatmaps() -> void:
 	beatmaps.clear()
-	list.clear()
+	for c in _list_box.get_children():
+		c.queue_free()
+	_cards.clear()
 
 	var dir: DirAccess = DirAccess.open("res://data/beatmaps")
 	if dir == null:
-		info.text = "Folder not found: res://data/beatmaps"
+		_info.text = "FOLDER NOT FOUND: res://data/beatmaps"
 		return
 
 	dir.list_dir_begin()
@@ -182,59 +269,56 @@ func _load_beatmaps() -> void:
 							title = file_name
 
 			beatmaps.append({"key": key, "title": title, "song_path": song_path})
-			var hs: Dictionary = Save.get_high_score(key)
-			var hs_score: int = int(hs.get("score", 0))
-			var hs_combo: int = int(hs.get("combo", 0))
-			var display_title: String
-			if hs_score > 0:
-				display_title = "%s   |   ★ %d   (x%d)" % [title, hs_score, hs_combo]
-			else:
-				display_title = title
-			list.add_item(display_title)
+
+			var card := _make_card(title, key)
+			_list_box.add_child(card)
+			# Cards are clickable as well as keyboard-navigable; PlatePanel
+			# ignores the mouse by default so this has to be re-enabled.
+			card.mouse_filter = Control.MOUSE_FILTER_STOP
+			var idx: int = _cards.size()
+			card.gui_input.connect(func(ev: InputEvent) -> void:
+				var mb := ev as InputEventMouseButton
+				if mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
+					if idx == _sel_idx:
+						_start_selected()
+					else:
+						_select(idx))
+			_cards.append(card)
 
 		entry_name = dir.get_next()
 	dir.list_dir_end()
 
+	if _cards.is_empty():
+		_info.text = "NO BEATMAPS FOUND IN res://data/beatmaps"
+
 
 # ── Input ────────────────────────────────────────────────────────────────────
-
-func _on_item_activated(_index: int) -> void:
-	_start_selected()
 
 func _just_pressed(event: InputEvent, action: String) -> bool:
 	return event.is_action(action) and event.is_pressed() and not event.is_echo()
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if event is InputEventJoypadButton and event.is_pressed():
-		print("Joypad button: ", event.button_index, " | is ui_accept: ", event.is_action("ui_accept"))
 	# ── Keyboard-only shortcuts ──────────────────────────────────────────────
 	var key_event := event as InputEventKey
 	if key_event != null and key_event.pressed and not key_event.echo:
 		if key_event.physical_keycode == KEY_H and key_event.ctrl_pressed and key_event.alt_pressed:
 			get_viewport().set_input_as_handled()
 			Save.clear_all_high_scores()
-			_load_beatmaps()   # refresh list to remove ★ entries
-			if list.item_count > 0:
-				list.select(0)
-				list.ensure_current_is_visible()
-			info.text = "[DEV] All high scores cleared."
+			_load_beatmaps()   # rebuild cards so the best-score lines clear
+			_select(0)
+			_info.text = "[DEV] ALL HIGH SCORES CLEARED."
 			return
 		match key_event.physical_keycode:
 			KEY_Q:
 				get_viewport().set_input_as_handled()
 				_cycle_mode(-1)
 				return
-			KEY_W:
-				get_viewport().set_input_as_handled()
-				_set_mode("song_seeded")
-				return
 			KEY_E:
 				get_viewport().set_input_as_handled()
 				_cycle_mode(1)
 				return
 
-	# ── Shared actions ───────────────────────────────────────────────────────
 	if not (event is InputEventKey or event is InputEventJoypadButton or event is InputEventMouseButton):
 		return
 
@@ -243,8 +327,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		_start_selected()
 
 	elif _just_pressed(event, "ui_cancel"):
+		# Back to the main menu. This used to call get_tree().quit(), so pressing
+		# Esc on the song list killed the game outright — every other screen
+		# treats Esc as "back".
 		get_viewport().set_input_as_handled()
-		get_tree().quit()
+		_go_back()
 
 	elif _just_pressed(event, "ui_up"):
 		get_viewport().set_input_as_handled()
@@ -261,28 +348,6 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif _just_pressed(event, "menu_mode_next"):
 		get_viewport().set_input_as_handled()
 		_cycle_mode(1)
-
-
-# Navigate the song list by delta (+1 / -1), keeping it clamped and in view.
-func _navigate_list(delta: int) -> void:
-	if list.item_count == 0:
-		return
-	var selected: PackedInt32Array = list.get_selected_items()
-	var cur: int = selected[0] if selected.size() > 0 else 0
-	var next: int = clamp(cur + delta, 0, list.item_count - 1)
-	list.select(next)
-	list.ensure_current_is_visible()
-	_update_info_text()
-
-
-# Cycle between modes in order: tutorial → seeded → random (wraps).
-func _cycle_mode(delta: int) -> void:
-	var modes: Array[String] = ["tutorial_fixed", "song_seeded", "run_random"]
-	var idx: int = modes.find(_current_mode)
-	if idx == -1:
-		idx = 0
-	idx = (idx + delta + modes.size()) % modes.size()
-	_set_mode(modes[idx])
 
 
 # Register gamepad bindings for menu-specific actions.
@@ -306,24 +371,28 @@ func _menu_add_joy_button(action: String, btn: JoyButton) -> void:
 	InputMap.action_add_event(action, ev)
 
 
+# ── Transitions ──────────────────────────────────────────────────────────────
+
+## Leave without starting anything. Also clears the run state, so whatever is
+## picked next starts from a clean slate rather than inheriting the seed and
+## life count of a song the player backed out of.
+func _go_back() -> void:
+	Run.run_seed   = 0
+	Run.song_lives = GameConfig.lives_per_song
+	get_tree().change_scene_to_file("res://scenes/Main.tscn")
+
+
 func _start_selected() -> void:
-	if list.item_count == 0:
-		info.text = "No beatmaps to start."
+	if beatmaps.is_empty():
+		_info.text = "NO BEATMAPS TO START."
+		return
+	if _sel_idx < 0 or _sel_idx >= beatmaps.size():
 		return
 
-	var selected: PackedInt32Array = list.get_selected_items()
-	if selected.size() == 0:
-		info.text = "Select a song first with ↑↓."
-		return
-
-	var i: int = selected[0]
-	if i < 0 or i >= beatmaps.size():
-		return
-
-	var data: Dictionary = beatmaps[i]
+	var data: Dictionary = beatmaps[_sel_idx]
 	var key: String = String(data.get("key", ""))
 	if key == "":
-		info.text = "Invalid beatmap key."
+		_info.text = "INVALID BEATMAP KEY."
 		return
 
 	Run.current_song_key = key
@@ -331,11 +400,10 @@ func _start_selected() -> void:
 	Run.run_seed = 0   # clear saved seed so run_random picks a fresh map
 
 	var title: String = String(data.get("title", key))
-	info.text = "Loading: %s …" % title
+	_info.text = "LOADING: %s …" % title.to_upper()
 	print("[SongSelect] key=", key, " mode=", _current_mode, " → ", level_scene_path)
 
 	var err: int = get_tree().change_scene_to_file(level_scene_path)
 	if err != OK:
-		info.text = "Failed to load scene:\n%s\nError code: %d" % [level_scene_path, err]
+		_info.text = "FAILED TO LOAD SCENE: %s (code %d)" % [level_scene_path, err]
 		push_error("[SongSelect] change_scene_to_file failed: code=%d path=%s" % [err, level_scene_path])
-	
