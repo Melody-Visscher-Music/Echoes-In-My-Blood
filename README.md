@@ -269,9 +269,5 @@ This is told as DLC specifically so it doesn't soften Xevia during the main game
 - lyrical system
 - Audio Calibration (for wired vs bluetooth latency sync - Fully Automated now)
 
----
-
-<iframe frameborder="0" src="https://itch.io/embed/4938190?bg_color=222222&amp;fg_color=eeeeee&amp;link_color=ee5bfa&amp;border_color=8910fa" width="552" height="167"><a href="https://melody-visscher.itch.io/echoes-in-my-blood">ECHOES IN MY BLOOD by Melody Visscher</a></iframe>
-
 
 End of Document
