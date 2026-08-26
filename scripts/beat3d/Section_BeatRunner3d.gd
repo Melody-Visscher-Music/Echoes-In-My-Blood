@@ -213,6 +213,11 @@ var _pylon_pole_mesh:  BoxMesh    = null
 var _pylon_brace_mesh: BoxMesh    = null
 var _pylon_beam_mesh:  BoxMesh    = null
 var _pylon_glow_mesh:  SphereMesh = null
+
+## How much geometry each gate facade gets (see _make_bldg_facade).
+## 0 = body + strips + cap only, 1 = adds corner pillars, plinth and crown,
+## 2 = adds the vertical spine and side-face strips. Read once in _ready.
+var _gate_detail: int = 2
 var _pylon_pole_mat:   StandardMaterial3D = null
 var _pylon_brace_mat:  StandardMaterial3D = null
 var _pylon_beam_mat:   StandardMaterial3D = null
@@ -562,6 +567,7 @@ func _ready() -> void:
 	# Pull the tier's CPU-cost knobs before anything spawns — decoration density
 	# is baked in at build time, so these have to be read before the spawners run.
 	_deco_interval        = 1.0 / maxf(1.0, float(GraphicsQuality.get_setting("deco_update_hz", 30)))
+	_gate_detail          = clampi(int(GraphicsQuality.get_setting("gate_detail", 2)), 0, 2)
 	# Phase-stagger so the four visual passes fire on different frames.
 	for _ti in range(_TICK_COUNT):
 		_tick_accum[_ti] = _deco_interval * (float(_ti) / float(_TICK_COUNT))
@@ -3386,6 +3392,18 @@ func _vis_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 			tint.lightened(0.08), 0.10, 0.90)
 		root.add_child(tower)
 
+	# Angled kick-plate across the foot of the barrier. A hurdle whose face runs
+	# straight down to the floor reads as a wall; a ramped foot reads as
+	# something built to be cleared, and the tilt catches light the flat face
+	# cannot. Purely visual — it sits inside the existing footprint.
+	var kick := _make_box_mesh(
+		Vector3(tw * 0.98, jump_hurdle_height * 0.42, 0.07),
+		bright, NeonMat.PANEL, 2.4)
+	kick.position   = Vector3(0.0, jump_hurdle_height * 0.16,
+		-gate_depth * 0.5 - jump_hurdle_height * 0.10)
+	kick.rotation.x = deg_to_rad(-26.0)
+	root.add_child(kick)
+
 	# Neon arch framing the airspace the player clears on a good jump.
 	# Sits just above the barrier top — clear landmark that says "jump through here".
 	_make_gate_arch(root, 0.0, tw, jump_hurdle_height, jump_hurdle_height + 2.0, tint)
@@ -3460,6 +3478,31 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 		Vector3(tw + 0.06, 0.10, gate_depth + 0.06), bright)
 	bar.position = Vector3(0.0, clearance_y, 0.0)
 	root.add_child(bar)
+
+	# Hanging supports dropping from the slab to the limbo bar. The overhang used
+	# to float with nothing tying it to the bar beneath it; these give the gap an
+	# actual structure and make the clearance line read as engineered.
+	var hang_mat: ShaderMaterial = NeonMat.tube(bright, 3.0)
+	var hang_size := Vector3(0.07, clearance_y * 0.30, 0.07)
+	hang_mat.set_shader_parameter("box_size", hang_size)
+	var hang_mesh: BoxMesh = _shared_box(hang_size)
+	for hx: float in [-0.62, -0.21, 0.21, 0.62]:
+		var hang := MeshInstance3D.new()
+		hang.mesh = hang_mesh
+		hang.material_override = hang_mat
+		hang.position = Vector3(hx * tw * 0.5, clearance_y + hang_size.y * 0.5, 0.0)
+		root.add_child(hang)
+
+	# Hazard teeth along the underside of the slab — the surface the player is
+	# ducking beneath, and previously the one blank face in the whole gate.
+	var tooth_mat: ShaderMaterial = NeonMat.panel(bright, 2.2)
+	var tooth_mesh: BoxMesh = _shared_box(Vector3(tw * 0.055, 0.05, gate_depth * 0.5))
+	for ti in range(-4, 5):
+		var tooth := MeshInstance3D.new()
+		tooth.mesh = tooth_mesh
+		tooth.material_override = tooth_mat
+		tooth.position = Vector3(float(ti) * tw * 0.10, clearance_y + 0.055, 0.0)
+		root.add_child(tooth)
 
 	# Downward-pointing indicator below the limbo bar — "duck here" signal
 	for side: float in [-1.0, 0.0, 1.0]:
@@ -5686,7 +5729,7 @@ func _update_wj_slide(delta: float) -> void:
 		_health_pct = clampf(_health_pct - 0.08, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health()
-		_hud_flash_color(Color(1.00, 0.85, 0.10, 0.60), 0.35)   # electric yellow flash
+		_hud_flash_color(Color(1.00, 0.85, 0.10, 0.30), 0.35)   # electric yellow flash
 		_shake_camera()
 
 
@@ -5841,7 +5884,7 @@ func _finalize_charge(t_s: float) -> void:
 	if fill >= _CHARGE_MIN_FILL:
 		_charge_mult_timer = lerpf(_CHARGE_MULT_MIN_S, _CHARGE_MULT_MAX_S, clampf(fill, 0.0, 1.0))
 		_charge_mult_total = _charge_mult_timer
-		_hud_flash_color(Color(0.30, 0.85, 1.00, 0.40), 0.55)
+		_hud_flash_color(Color(0.30, 0.85, 1.00, 0.26), 0.55)
 		_show_grind_banner("⚡  ×%d  OVERDRIVE  (%.1fs)" % [_CHARGE_MULT_VALUE, _charge_mult_timer],
 			Color(0.40, 0.90, 1.00))
 		_shake_camera()
@@ -6470,7 +6513,7 @@ func _activate_wj_bonus() -> void:
 	if _hud != null:
 		_hud.set_wall_jump(true, 1.0)
 	# Gold screen flash to signal the bonus
-	_hud_flash_color(Color(1.00, 0.80, 0.10, 0.30), 0.50)
+	_hud_flash_color(Color(1.00, 0.80, 0.10, 0.22), 0.50)
 
 
 func _update_hud_score() -> void:
@@ -6641,7 +6684,7 @@ func _on_gate_scored(success: bool) -> void:
 		_world_vitality = clamp(_world_vitality + 0.07, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
-		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.14), 0.30)   # softened — this fires on every hit
+		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.08), 0.26)   # every single hit — keep it barely-there
 		# Combo label bounce
 		if _hud != null and _combo >= 2:
 			_hud.combo_flash(Color(1.5, 1.3, 0.4, 1.0), 0.05, 0.14)
@@ -6662,7 +6705,7 @@ func _on_gate_scored(success: bool) -> void:
 		_health_pct = clamp(_health_pct - 0.10, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health()
-		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.30), 0.40)   # softened — was washing out the lanes on miss
+		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.17), 0.34)   # fires on every miss — must not blind
 		_shake_camera()
 		# Combo label flash red then vanish
 		if _hud != null:
@@ -7019,19 +7062,41 @@ func _make_safe_strip(safe_x: float, tint: Color) -> Node3D:
 
 
 # ── Building-facade helper ────────────────────────────────────────────────────
-# Returns a Node3D containing a dark silhouette body, horizontal neon window
-# strips (front-face only), and a bright rooftop cap — the same visual language
-# as the city skyscrapers.  Positioned at `pos` relative to the caller's root.
+# The shared body of every lane blocker, jump barrier, slide overhang and
+# flanking tower. Improving this one function reaches all of them at once, which
+# is why the geometry work concentrates here.
+#
+# It used to be a dark box with horizontal strips on the front face and a bright
+# cap — literally a black cube with coloured stripes, and worse, one that only
+# read as anything from dead ahead: the sides were bare, so a facade flattened
+# out the moment it entered peripheral vision.
+#
+# What actually breaks the cube read, in order of how much each contributes:
+#   • CORNER PILLARS. Four lit vertical edges describe the volume from every
+#     angle, so the shape survives being passed at speed. Biggest single win.
+#   • A SETBACK CROWN. An inset upper block under the cap gives a stepped
+#     silhouette instead of one flat top line.
+#   • A PLINTH. A short base block grounds it rather than letting it float.
+#   • A CENTRE SPINE and SIDE STRIPS, which break the horizontal banding and
+#     stop the sides being dead.
+#
+# The outer bound never exceeds `size` on X — the pillars sit flush with the
+# body's own corners and the crown insets inward — so nothing here implies a
+# bigger obstacle than the gameplay footprint the player is judging.
 func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
 		strip_h: float = 0.12, strip_gap: float = 0.45) -> Node3D:
 	var node     := Node3D.new()
 	node.position = pos
 
+	var detail: int = _gate_detail
+	var half_y: float = size.y * 0.5
+	var front_z: float = -size.z * 0.5
+
 	# Dark silhouette body — gives the obstacle mass without bleeding emission
 	var body     := MeshInstance3D.new()
 	body.mesh     = _shared_box(size)
 	var body_mat  := StandardMaterial3D.new()
-	body_mat.albedo_color     = Color(0.04, 0.02, 0.08, 1.0)
+	body_mat.albedo_color     = Color(0.045, 0.025, 0.09, 1.0)
 	body_mat.emission_enabled = false
 	body.material_override    = body_mat
 	body.set_meta("no_cycle", true)   # never recolored by the color cycle system
@@ -7040,21 +7105,88 @@ func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
 	# One shared material for every strip on this facade (no per-strip overhead)
 	var win_mat: ShaderMaterial = NeonMat.panel(win_col, 2.0)
 
-	# Front-face strips only — one mesh per row, facing the approaching player.
-	# Side faces are intentionally left dark to keep gate mesh counts low.
-	var y_local: float = -size.y * 0.5 + strip_gap
-	while y_local < size.y * 0.5 - strip_h:
+	# Front-face strips — one mesh per row, facing the approaching player. Inset
+	# from the full width so the corner pillars below frame them rather than
+	# colliding with them.
+	var strip_w: float = size.x - (0.16 if detail > 0 else -0.02)
+	var y_local: float = -half_y + strip_gap
+	while y_local < half_y - strip_h:
 		var sf  := MeshInstance3D.new()
-		sf.mesh  = _shared_box(Vector3(size.x + 0.02, strip_h, 0.06))
+		sf.mesh  = _shared_box(Vector3(strip_w, strip_h, 0.06))
 		sf.material_override = win_mat
-		sf.position = Vector3(0.0, y_local, -size.z * 0.5 - 0.03)
+		sf.position = Vector3(0.0, y_local, front_z - 0.03)
 		node.add_child(sf)
+
+		# Matching stubs on the left/right faces, so the facade still reads as a
+		# solid object once it is beside the player instead of in front of them.
+		if detail > 1:
+			for sx: float in [-1.0, 1.0]:
+				var ss := MeshInstance3D.new()
+				ss.mesh = _shared_box(Vector3(0.05, strip_h, size.z * 0.55))
+				ss.material_override = win_mat
+				ss.position = Vector3(sx * (size.x * 0.5 + 0.02), y_local, 0.0)
+				node.add_child(ss)
+
 		y_local += strip_gap
 
+	if detail > 0:
+		# ── Corner pillars ──────────────────────────────────────────────────
+		# One material and one mesh shared by all four: neon_tube needs box_size
+		# to find its core axis, and identical dimensions mean identical
+		# uniforms, so this stays a single draw setup.
+		var pillar_size := Vector3(0.075, size.y * 0.99, 0.075)
+		var pillar_mat: ShaderMaterial = NeonMat.tube(win_col.lightened(0.18), 3.2)
+		pillar_mat.set_shader_parameter("box_size", pillar_size)
+		var pillar_mesh: BoxMesh = _shared_box(pillar_size)
+		for px: float in [-1.0, 1.0]:
+			for pz: float in [-1.0, 1.0]:
+				var pil := MeshInstance3D.new()
+				pil.mesh = pillar_mesh
+				pil.material_override = pillar_mat
+				pil.position = Vector3(px * (size.x * 0.5 - 0.03), 0.0,
+					pz * (size.z * 0.5 - 0.03))
+				node.add_child(pil)
+
+		# ── Base plinth ─────────────────────────────────────────────────────
+		var plinth := MeshInstance3D.new()
+		plinth.mesh = _shared_box(Vector3(size.x * 0.99, 0.14, size.z * 1.05))
+		plinth.material_override = body_mat
+		plinth.position = Vector3(0.0, -half_y + 0.07, 0.0)
+		plinth.set_meta("no_cycle", true)
+		node.add_child(plinth)
+
+	# ── Vertical spine ──────────────────────────────────────────────────────
+	# Only on facades tall enough to have a middle worth breaking up.
+	if detail > 1 and size.y > 0.9:
+		var spine := MeshInstance3D.new()
+		spine.mesh = _shared_box(Vector3(0.10, size.y * 0.72, 0.05))
+		spine.material_override = win_mat
+		spine.position = Vector3(0.0, 0.0, front_z - 0.05)
+		node.add_child(spine)
+
+	# ── Setback crown + cap ─────────────────────────────────────────────────
+	# Short facades (jump hurdles, slide overhangs) skip the setback: on those
+	# the cap IS the readable edge and insetting it would soften the very line
+	# the player is judging their clearance against.
+	var cap_w: float = size.x + 0.06
+	var cap_d: float = size.z + 0.06
+	var cap_y: float = half_y + 0.04
+	if detail > 0 and size.y > 1.6:
+		var crown_h: float = size.y * 0.09
+		var crown := MeshInstance3D.new()
+		crown.mesh = _shared_box(Vector3(size.x * 0.76, crown_h, size.z * 0.80))
+		crown.material_override = body_mat
+		crown.position = Vector3(0.0, half_y + crown_h * 0.5, 0.0)
+		crown.set_meta("no_cycle", true)
+		node.add_child(crown)
+		cap_w = size.x * 0.76 + 0.06
+		cap_d = size.z * 0.80 + 0.06
+		cap_y = half_y + crown_h + 0.04
+
 	# Bright rooftop cap — same cap style as city buildings
-	var cap      := _make_box_mesh(Vector3(size.x + 0.06, 0.08, size.z + 0.06),
+	var cap := _make_box_mesh(Vector3(cap_w, 0.08, cap_d),
 		win_col.lightened(0.30), NeonMat.TUBE, 4.5)
-	cap.position  = Vector3(0.0, size.y * 0.5 + 0.04, 0.0)
+	cap.position = Vector3(0.0, cap_y, 0.0)
 	node.add_child(cap)
 
 	return node
@@ -7192,7 +7324,7 @@ func _setup_world_environment() -> void:
 	# which was over the top.
 	env.glow_enabled    = true
 	env.glow_normalized = true
-	env.glow_intensity  = 1.35
+	env.glow_intensity  = 1.22
 	env.glow_strength   = 1.10
 	env.glow_bloom      = 0.05
 	# SCREEN, which is the middle ground between the two modes already tried.
@@ -7226,9 +7358,9 @@ func _setup_world_environment() -> void:
 	env.set_glow_level(0, 0.0)    # level 1 - tightest, off
 	env.set_glow_level(1, 0.20)   # level 2
 	env.set_glow_level(2, 1.0)    # level 3 - on by default
-	env.set_glow_level(3, 0.38)   # level 4
+	env.set_glow_level(3, 0.32)   # level 4
 	env.set_glow_level(4, 1.0)    # level 5 - on by default
-	env.set_glow_level(5, 0.22)   # level 6 - widens the halo
+	env.set_glow_level(5, 0.16)   # level 6 - widens the halo
 	env.set_glow_level(6, 0.0)    # level 7 - widest, off (this one smears)
 
 	# Subtle depth fog — keeps the far end hazy
