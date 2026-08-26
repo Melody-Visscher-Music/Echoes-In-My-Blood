@@ -227,6 +227,30 @@ static func style_slider(sl: HSlider, s: float = 1.0) -> void:
 	sl.add_theme_stylebox_override("grabber", knob)
 	sl.add_theme_stylebox_override("grabber_highlight", knob)
 
+	# Focus feedback. A mouse user always knows which slider they grabbed; a
+	# keyboard or gamepad user had nothing at all to go on, because Slider's
+	# focus stylebox is empty in the default theme and the knob never changed.
+	# Repaint the track and the fill instead — that reads at a glance.
+	var track_focus := StyleBoxFlat.new()
+	track_focus.bg_color = Color(0.13, 0.07, 0.22, 1.0)
+	track_focus.border_color = CYAN
+	track_focus.border_width_top = 1; track_focus.border_width_bottom = 1
+	track_focus.border_width_left = 1; track_focus.border_width_right = 1
+	track_focus.content_margin_top = 4.0 * s; track_focus.content_margin_bottom = 4.0 * s
+
+	var fill_focus := StyleBoxFlat.new()
+	fill_focus.bg_color = CYAN
+	fill_focus.content_margin_top = 4.0 * s; fill_focus.content_margin_bottom = 4.0 * s
+
+	sl.focus_entered.connect(func() -> void:
+		sl.add_theme_stylebox_override("slider", track_focus)
+		sl.add_theme_stylebox_override("grabber_area", fill_focus)
+		sl.add_theme_stylebox_override("grabber_area_highlight", fill_focus))
+	sl.focus_exited.connect(func() -> void:
+		sl.add_theme_stylebox_override("slider", track)
+		sl.add_theme_stylebox_override("grabber_area", fill)
+		sl.add_theme_stylebox_override("grabber_area_highlight", fill))
+
 
 static func style_option(ob: OptionButton, s: float = 1.0) -> void:
 	var mk := func(bg: Color, border: Color) -> StyleBoxFlat:

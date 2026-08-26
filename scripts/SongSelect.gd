@@ -31,6 +31,11 @@ var _cards: Array[PlatePanel] = []
 var _mode_buttons: Array[PlateButton] = []
 var _info: Label = null
 
+# Left stick. The card list reads discrete key/D-pad events in _unhandled_input;
+# a stick never produces those, so it is polled per frame instead.
+var _stick_v := MenuNav.AxisRepeat.new()
+var _stick_h := MenuNav.AxisRepeat.new()
+
 
 func _ready() -> void:
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -127,6 +132,12 @@ func _build_ui() -> void:
 		var btn := PlateButton.create(MODE_LABELS[i], func() -> void: _set_mode(MODES[idx]),
 			int(15 * s), UiStyle.PINK)
 		btn.custom_minimum_size = Vector2(200 * s, 48 * s)
+		# The song list drives its own selection index, so nothing on this screen
+		# may take Godot focus: one mouse click on a mode pill used to park focus
+		# here and up/down stopped moving through the songs entirely.
+		# Mouse still works (PlateButton keeps hover + pressed); keyboard and
+		# gamepad reach the modes with left/right, Q/E or LB/RB.
+		btn.focus_mode = Control.FOCUS_NONE
 		mode_row.add_child(btn)
 		_mode_buttons.append(btn)
 
@@ -143,6 +154,7 @@ func _build_ui() -> void:
 
 	var back := PlateButton.create("↩  BACK", _go_back, int(14 * s), UiStyle.VIOLET)
 	back.custom_minimum_size = Vector2(220 * s, 44 * s)
+	back.focus_mode = Control.FOCUS_NONE   # clickable; Esc / B is the key+pad route
 	back_row.add_child(back)
 
 
@@ -198,6 +210,15 @@ func _navigate_list(delta: int) -> void:
 	_select(posmod(_sel_idx + delta, _cards.size()))
 
 
+func _process(delta: float) -> void:
+	var v: int = _stick_v.step(MenuNav.stick(JOY_AXIS_LEFT_Y), delta)
+	if v != 0:
+		_navigate_list(v)
+	var h: int = _stick_h.step(MenuNav.stick(JOY_AXIS_LEFT_X), delta)
+	if h != 0:
+		_cycle_mode(h)
+
+
 # ── Mode management ──────────────────────────────────────────────────────────
 
 func _set_mode(mode: String) -> void:
@@ -219,7 +240,7 @@ func _update_info_text() -> void:
 		return
 	var idx: int = MODES.find(_current_mode)
 	var blurb: String = MODE_BLURBS[idx] if idx >= 0 else _current_mode
-	_info.text = "%s     ↑↓ CHOOSE  ·  ENTER / A START  ·  LB/RB OR Q/E MODE  ·  ESC / B BACK" % blurb
+	_info.text = "%s     ↑↓ CHOOSE  ·  ENTER / A START  ·  ←→ / LB-RB / Q-E MODE  ·  ESC / B BACK" % blurb
 
 
 func _cycle_mode(delta: int) -> void:
@@ -276,6 +297,10 @@ func _load_beatmaps() -> void:
 			# ignores the mouse by default so this has to be re-enabled.
 			card.mouse_filter = Control.MOUSE_FILTER_STOP
 			var idx: int = _cards.size()
+			# Hovering moves the selection so the mouse and the keyboard agree on
+			# what "selected" means — otherwise the lit card and the card you are
+			# about to click could be two different songs.
+			card.mouse_entered.connect(func() -> void: _select(idx))
 			card.gui_input.connect(func(ev: InputEvent) -> void:
 				var mb := ev as InputEventMouseButton
 				if mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
@@ -341,11 +366,11 @@ func _unhandled_input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 		_navigate_list(1)
 
-	elif _just_pressed(event, "menu_mode_prev"):
+	elif _just_pressed(event, "ui_left") or _just_pressed(event, "menu_mode_prev"):
 		get_viewport().set_input_as_handled()
 		_cycle_mode(-1)
 
-	elif _just_pressed(event, "menu_mode_next"):
+	elif _just_pressed(event, "ui_right") or _just_pressed(event, "menu_mode_next"):
 		get_viewport().set_input_as_handled()
 		_cycle_mode(1)
 

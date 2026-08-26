@@ -10,6 +10,17 @@ var _is_gamepad: bool = false
 var _scroller:   ScrollContainer  # the page's scroll view
 var _confirm_cb: CheckBox         # "I've read this" — locked until scrolled to bottom
 var _play_btn:   Button           # Continue/SELECT SONG — locked until checkbox is checked
+var _back_btn:   Button           # ← BACK
+
+# ── Reader navigation ────────────────────────────────────────────────────────
+# This page is mostly prose with three controls glued to the bottom, so the two
+# axes are split: up/down always scrolls the page (there was previously no way
+# at all to read it without a mouse wheel) and left/right steps through the
+# controls. Up/down is swallowed in `_input`, ahead of the GUI, so a focused
+# button can never eat it and turn a scroll into a focus jump.
+const SCROLL_SPEED: float = 1100.0   # px/sec at full deflection
+
+var _nav_hint: Label = null
 
 
 func _ready() -> void:
@@ -34,6 +45,52 @@ func _input(event: InputEvent) -> void:
 		if _is_gamepad:
 			_is_gamepad = false
 			_apply_device()
+
+	# Up/down belong to the page, not to focus traversal — claim them before the
+	# GUI sees them. The actual movement happens in _process so holding the key
+	# or the stick scrolls smoothly instead of one nudge per keypress.
+	if event.is_action("ui_up") or event.is_action("ui_down"):
+		get_viewport().set_input_as_handled()
+		return
+
+	if event.is_action_pressed("ui_left"):
+		get_viewport().set_input_as_handled()
+		_cycle_nav(-1)
+	elif event.is_action_pressed("ui_right"):
+		get_viewport().set_input_as_handled()
+		_cycle_nav(1)
+
+
+func _process(delta: float) -> void:
+	if _scroller == null:
+		return
+	var dir: float = Input.get_axis("ui_up", "ui_down")
+	if absf(dir) > 0.05:
+		_scroller.scroll_vertical += int(dir * SCROLL_SPEED * delta)
+
+
+## The bottom controls in a ring: checkbox → back → select song → checkbox.
+## Skips whatever is still locked, so it never parks focus somewhere dead.
+func _nav_controls() -> Array[Control]:
+	var out: Array[Control] = []
+	for c: Control in [_confirm_cb, _back_btn, _play_btn]:
+		if c != null and not MenuNav.is_disabled(c):
+			out.append(c)
+	return out
+
+
+func _cycle_nav(delta: int) -> void:
+	var ring := _nav_controls()
+	if ring.is_empty():
+		return
+	var vp := get_viewport()
+	var cur: Control = vp.gui_get_focus_owner() if vp != null else null
+	var idx: int = ring.find(cur)
+	var target: Control = ring[0] if idx == -1 else ring[posmod(idx + delta, ring.size())]
+	target.grab_focus()
+	# follow_focus stays off (it would scroll to the bottom on the very first
+	# frame and hand out the read-confirmation for free), so scroll by hand.
+	_scroller.ensure_control_visible(target)
 
 
 func _detect_initial_device() -> void:
@@ -224,6 +281,9 @@ func _build_ui() -> void:
 	_confirm_cb = CheckBox.new()
 	_confirm_cb.text = "I've read through the tutorial"
 	_confirm_cb.disabled = true   # unlocked once the page has been scrolled to the bottom
+	# A disabled Button keeps its focus mode in Godot, so focus traversal would
+	# happily park on a control that cannot be activated. Locked means unfocusable.
+	_confirm_cb.focus_mode = Control.FOCUS_NONE
 	_confirm_cb.add_theme_font_size_override("font_size", int(15 * s))
 	_confirm_cb.toggled.connect(func(_pressed: bool) -> void: _update_continue_btn())
 	confirm_row.add_child(_confirm_cb)
@@ -241,16 +301,26 @@ func _build_ui() -> void:
 	back_btn.pressed.connect(func() -> void:
 		get_tree().change_scene_to_file("res://scenes/Main.tscn"))
 	btn_row.add_child(back_btn)
+	_back_btn = back_btn
 
 	var play_btn := PlateButton.new()
 	play_btn.text = "SELECT SONG →"
 	play_btn.custom_minimum_size = Vector2(int(220 * s), int(52 * s))
 	_style_btn(play_btn, s)
 	play_btn.disabled = true   # unlocked once the confirm checkbox is checked
+	play_btn.focus_mode = Control.FOCUS_NONE
 	play_btn.pressed.connect(func() -> void:
 		get_tree().change_scene_to_file("res://scenes/SongSelect.tscn"))
 	btn_row.add_child(play_btn)
 	_play_btn = play_btn
+
+	# Nothing on this screen announces that the page even scrolls, which is how
+	# a gamepad player ends up staring at a locked checkbox with no way forward.
+	_nav_hint = UiStyle.label("", UiStyle.caption(2.0), int(11 * s), Color.WHITE)
+	_nav_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_nav_hint.self_modulate = Color(0.58, 0.52, 0.72, 0.85)
+	vbox.add_child(_nav_hint)
+
 	back_btn.call_deferred("grab_focus")   # play_btn starts disabled, so focus BACK instead
 
 
@@ -327,7 +397,8 @@ func _update_scroll_gate() -> void:
 	var nothing_to_scroll: bool = vbar.max_value <= vbar.page + 0.5
 	var reached_bottom: bool    = vbar.value >= vbar.max_value - vbar.page - 1.0
 	if nothing_to_scroll or reached_bottom:
-		_confirm_cb.disabled = false
+		_confirm_cb.disabled   = false
+		_confirm_cb.focus_mode = Control.FOCUS_ALL
 	_update_continue_btn()
 
 
@@ -335,4 +406,15 @@ func _update_scroll_gate() -> void:
 func _update_continue_btn() -> void:
 	if _play_btn == null:
 		return
-	_play_btn.disabled = _confirm_cb == null or not _confirm_cb.button_pressed
+	_play_btn.disabled   = _confirm_cb == null or not _confirm_cb.button_pressed
+	_play_btn.focus_mode = Control.FOCUS_NONE if _play_btn.disabled else Control.FOCUS_ALL
+	_update_nav_hint()
+
+
+func _update_nav_hint() -> void:
+	if _nav_hint == null:
+		return
+	if _confirm_cb != null and _confirm_cb.disabled:
+		_nav_hint.text = "↑↓ / STICK  SCROLL TO THE BOTTOM TO UNLOCK  ·  MOUSE WHEEL WORKS TOO"
+	else:
+		_nav_hint.text = "↑↓ SCROLL  ·  ←→ CHOOSE  ·  ENTER / A CONFIRM  ·  ESC / B BACK"

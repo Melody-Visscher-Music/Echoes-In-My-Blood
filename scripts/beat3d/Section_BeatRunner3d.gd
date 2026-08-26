@@ -161,6 +161,12 @@ var _pause_root:   Control      = null
 var _pause_option: int          = 0       # 0 = RESUME, 1 = RESTART, 2 = MAIN MENU, 3 = SONG SELECT
 var _pause_buttons: Array[PlateButton] = []   # index matches _PAUSE_OPTIONS
 
+# Left stick for the pause / death / results overlays. Those read discrete
+# key and D-pad events in _unhandled_input; a stick emits motion events that
+# never look like a press, so it is polled per frame instead.
+var _menu_stick_v := MenuNav.AxisRepeat.new()
+var _menu_stick_h := MenuNav.AxisRepeat.new()
+
 # ── Gate spawn animation ──────────────────────────────────────────────────────
 var _gate_animated: Array[bool] = []      # true once the gate's intro tween has fired
 
@@ -733,6 +739,11 @@ func _loading_step(text: String, frac: float) -> void:
 
 
 func _process(delta: float) -> void:
+	# Overlay navigation first: the pause menu is up while the rest of this
+	# function is short-circuited, and the results screen appears after the
+	# song clock has stopped mattering.
+	_menu_stick_poll(delta)
+
 	# HUD "echoes" rainbow chrome — always animating, independent of countdown/pause/song
 	# state, so the colour drift never visibly stutters or freezes. The hue moves
 	# 0.055 per second, i.e. one full loop every ~18 s, so stepping it a few dozen
@@ -6840,12 +6851,22 @@ func _trigger_death() -> void:
 		_death_option_nodes.append(btn)
 	_death_menu_option = 0
 
+	# Mouse rides the same selection index. Gated on _death_menu_active so a
+	# click landing during the fade-to-black cannot pick an entry that is not
+	# on screen yet.
+	MenuNav.wire_pointer(_death_option_nodes,
+		func(i: int) -> void:
+			_death_menu_option = i
+			_death_update_selection(),
+		_death_confirm,
+		func() -> bool: return _death_menu_active)
+
 	var hint_gap := Control.new()
 	hint_gap.custom_minimum_size = Vector2(0, 8 * s)
 	vbox.add_child(hint_gap)
 
 	var hint: Label = UiStyle.label(
-		"↑↓ / D-PAD CHOOSE  ·  ENTER / A CONFIRM",
+		"↑↓ / D-PAD CHOOSE  ·  CLICK OR ENTER / A CONFIRM",
 		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.self_modulate = Color(0.58, 0.52, 0.72, 0.75)
@@ -6938,7 +6959,12 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	# ── Pause menu navigation ─────────────────────────────────────────────────
 	if _paused:
-		if event.is_action("ui_up"):
+		# Gamepad B backs out of the pause menu the way it backs out of every
+		# other screen. (Esc never reaches here — the toggle above claims it.)
+		if event.is_action("ui_cancel"):
+			get_viewport().set_input_as_handled()
+			_resume_game()
+		elif event.is_action("ui_up"):
 			get_viewport().set_input_as_handled()
 			_pause_option = posmod(_pause_option - 1, _PAUSE_OPTIONS.size())
 			_pause_update_selection()
@@ -7807,12 +7833,22 @@ func _pause_game() -> void:
 		vbox.add_child(btn)
 		_pause_buttons.append(btn)
 
+	# The overlay drives its own selection index, which left it with no mouse
+	# support whatsoever — the entries lit up on hover and did nothing on click.
+	# Route hover and click through the same index the keys and the pad use.
+	MenuNav.wire_pointer(_pause_buttons,
+		func(i: int) -> void:
+			_pause_option = i
+			_pause_update_selection(),
+		_pause_confirm,
+		func() -> bool: return _paused)
+
 	var hint_gap := Control.new()
 	hint_gap.custom_minimum_size = Vector2(0, 10 * s)
 	vbox.add_child(hint_gap)
 
 	var hint: Label = UiStyle.label(
-		"ESC / START  ·  ↑↓ NAVIGATE  ·  ENTER / A CONFIRM",
+		"ESC / START / B  ·  ↑↓ NAVIGATE  ·  CLICK OR ENTER / A CONFIRM",
 		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.self_modulate = Color(0.62, 0.55, 0.78, 0.75)
@@ -7822,6 +7858,25 @@ func _pause_game() -> void:
 	create_tween().tween_property(veil, "modulate:a", 1.0, 0.18)
 
 	_pause_update_selection()
+
+
+## Analog-stick navigation for whichever overlay is currently up.
+func _menu_stick_poll(delta: float) -> void:
+	var v: int = _menu_stick_v.step(MenuNav.stick(JOY_AXIS_LEFT_Y), delta)
+	var h: int = _menu_stick_h.step(MenuNav.stick(JOY_AXIS_LEFT_X), delta)
+
+	if _end_screen_active:
+		if h != 0 and not _end_nav_labels.is_empty():
+			_end_screen_sel = posmod(_end_screen_sel + h, _end_nav_labels.size())
+			_end_update_nav_highlight()
+	elif _paused:
+		if v != 0:
+			_pause_option = posmod(_pause_option + v, _PAUSE_OPTIONS.size())
+			_pause_update_selection()
+	elif _death_menu_active:
+		if v != 0 and not _death_option_nodes.is_empty():
+			_death_menu_option = posmod(_death_menu_option + v, _death_option_nodes.size())
+			_death_update_selection()
 
 
 func _pause_update_selection() -> void:
@@ -9176,8 +9231,15 @@ func _spawn_results_panel() -> void:
 		nav_row.add_child(btn)
 		_end_nav_labels.append(btn)
 
+	MenuNav.wire_pointer(_end_nav_labels,
+		func(i: int) -> void:
+			_end_screen_sel = i
+			_end_update_nav_highlight(),
+		_end_confirm,
+		func() -> bool: return _end_screen_active)
+
 	var hint: Label = UiStyle.label(
-		"\u25c0\u25b6 / D-PAD CHOOSE  \u00b7  ENTER / A CONFIRM",
+		"\u25c0\u25b6 / D-PAD CHOOSE  \u00b7  CLICK OR ENTER / A CONFIRM",
 		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.self_modulate = Color(0.55, 0.50, 0.70, 0.75)

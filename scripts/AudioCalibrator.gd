@@ -68,6 +68,10 @@ var _tap_lbl:    Label     = null
 var _avg_lbl:    Label     = null
 var _hint:       Label     = null
 var _measure_nodes: Array[Label] = []
+## Phase-specific buttons. The calibrator was keyboard/gamepad only — every
+## action lived behind a bracketed key hint and a mouse could do nothing but
+## tap during the test itself.
+var _btn_row:    HBoxContainer = null
 
 
 func _ready() -> void:
@@ -152,6 +156,11 @@ func _enter_idle() -> void:
 		_body.text = "Tap in sync with what you HEAR — not what you see.\nWorks best with headphones on and eyes closed."
 
 	_hint.text    = "[ENTER]  Calibrate     [R]  Reset to 0     [ESC]  Close"
+	_set_buttons([
+		["CALIBRATE",   _enter_running, UiStyle.CYAN],
+		["RESET TO 0",  _do_reset,      UiStyle.VIOLET],
+		["CLOSE",       _do_cancel,     UiStyle.VIOLET],
+	])
 	_set_circle_color(Color(0.35, 0.20, 0.70, 1.0))
 
 
@@ -172,7 +181,8 @@ func _enter_running() -> void:
 	_count_lbl.text = "0 / %d" % COLLECT_N
 	_tap_lbl.text   = ""
 	_avg_lbl.text   = ""
-	_hint.text      = "[ESC]  Cancel"
+	_hint.text      = "[ESC]  Cancel     ·     tap with any key, pad button or a click"
+	_set_buttons([["CANCEL", _enter_idle, UiStyle.VIOLET]])
 
 
 func _enter_done() -> void:
@@ -192,6 +202,10 @@ func _enter_done() -> void:
 	if _inconsistent:
 		_body.text += "\n⚠  Inconsistent taps — consider redoing calibration"
 	_hint.text      = "[ENTER]  Save & close     [ESC]  Discard"
+	_set_buttons([
+		["SAVE & CLOSE", _do_save,   UiStyle.CYAN],
+		["DISCARD",      _enter_idle, UiStyle.VIOLET],
+	])
 
 
 # ── Update loop ───────────────────────────────────────────────────────────────
@@ -228,10 +242,14 @@ func _process(delta: float) -> void:
 func _input(event: InputEvent) -> void:
 	var pressed: bool = _is_press(event)
 
+	# Outside the tap test the mouse belongs to the on-card buttons: consuming
+	# clicks here would leave them unclickable.
+	var is_mouse: bool = event is InputEventMouseButton
+
 	match _phase:
 
 		Phase.IDLE:
-			if not pressed:
+			if not pressed or is_mouse:
 				return
 			get_viewport().set_input_as_handled()
 			if event.is_action_pressed("ui_cancel"):
@@ -251,11 +269,13 @@ func _input(event: InputEvent) -> void:
 				return
 			if not pressed or _beat_count <= WARMUP_N:
 				return
+			if is_mouse and _over_buttons(event):
+				return   # that click is CANCEL, not a tap
 			get_viewport().set_input_as_handled()
 			_record_tap()
 
 		Phase.DONE:
-			if not pressed:
+			if not pressed or is_mouse:
 				return
 			get_viewport().set_input_as_handled()
 			if event.is_action_pressed("ui_cancel"):
@@ -444,9 +464,42 @@ func _build_ui() -> void:
 	col.add_child(_avg_lbl)
 	_measure_nodes.append(_avg_lbl)
 
+	_btn_row = HBoxContainer.new()
+	_btn_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	_btn_row.add_theme_constant_override("separation", 14)
+	col.add_child(_btn_row)
+
 	_hint = _lbl("", 11, Color(0.55, 0.50, 0.68), UiStyle.caption(2.0))
 	_hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	col.add_child(_hint)
+
+
+## Swaps the button row for the current phase. Each spec is
+## [label, on_pressed, accent].
+func _set_buttons(specs: Array) -> void:
+	if _btn_row == null:
+		return
+	for c in _btn_row.get_children():
+		_btn_row.remove_child(c)
+		c.queue_free()
+	for spec: Array in specs:
+		var b := PlateButton.create(String(spec[0]), spec[1], 14, spec[2])
+		b.custom_minimum_size = Vector2(190, 44)
+		b.set_padding(16.0, 9.0)
+		# The phase machine already answers ui_accept and ui_cancel directly, so
+		# a focusable button here would be a second, competing way to fire the
+		# same action — and would steal Enter from the tap test.
+		b.focus_mode = Control.FOCUS_NONE
+		_btn_row.add_child(b)
+
+
+## True when a click landed on the button row. During the tap test every click
+## counts as a tap, which would otherwise make CANCEL impossible to press.
+func _over_buttons(event: InputEvent) -> bool:
+	if _btn_row == null or not _btn_row.is_visible_in_tree():
+		return false
+	var mb := event as InputEventMouseButton
+	return mb != null and _btn_row.get_global_rect().has_point(mb.position)
 
 
 ## The pulse used to drive ColorRect.color, which the plate shader ignores — it

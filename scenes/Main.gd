@@ -17,6 +17,11 @@ var _awaiting_bind: Dictionary = {}
 var _dev_unlocked: bool = false
 var _mapper_btn: Button = null
 
+# Where keyboard/gamepad focus should go when a panel closes. Pushed on the way
+# in, popped on the way out — hiding a Control silently drops the focus owner,
+# and without this the menu came back with nothing selected and up/down dead.
+var _focus_stack: Array[Control] = []
+
 
 func _ready() -> void:
 	Save.load_from_disk(0)
@@ -60,6 +65,9 @@ func _panel_bg(color: Color) -> Array:
 	var scroller := ScrollContainer.new()
 	scroller.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	scroller.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	# Options panels are taller than the screen on small windows. Without this
+	# a gamepad could move focus onto a row that stayed scrolled out of sight.
+	scroller.follow_focus = true
 	bg.add_child(scroller)
 
 	# CenterContainer must be at least as tall as the viewport so the card
@@ -170,6 +178,54 @@ func _build_ui() -> void:
 	_howtoplay_panel = _build_howtoplay_panel()
 	_howtoplay_panel.visible = false
 	add_child(_howtoplay_panel)
+
+	_rewrap_menu.call_deferred()
+
+
+# ── Focus plumbing ─────────────────────────────────────────────────────────────
+# Every panel here is shown by flipping `visible`, and hiding the Control that
+# owns focus leaves the viewport with no focus owner at all — which is what made
+# the keyboard and the gamepad go dead the moment OPTIONS opened. Each open
+# pushes the caller's button, each back pops it.
+
+func _rewrap_menu() -> void:
+	if _menu_box != null:
+		MenuNav.wrap_column(_menu_box.get_children())
+
+
+## Deferred so it runs after the panel is in the tree and laid out — grabbing
+## focus on a node that is not inside the tree yet is a silent no-op.
+func _focus_panel(root: Node) -> void:
+	MenuNav.focus_first(root)
+
+
+## The picker's R/G/B sliders are internal children, so the ordinary walk cannot
+## see them. Landing on the first one makes left/right adjust the channel.
+func _focus_picker(picker: Node) -> void:
+	MenuNav.focus_first(picker, true)
+
+
+func _push_focus() -> void:
+	var vp := get_viewport()
+	_focus_stack.append(vp.gui_get_focus_owner() if vp != null else null)
+
+
+func _pop_focus(fallback: Node) -> void:
+	var prev: Control = null
+	if not _focus_stack.is_empty():
+		prev = _focus_stack.pop_back()
+	if _can_focus(prev):
+		prev.grab_focus()
+	else:
+		MenuNav.focus_first(fallback)
+
+
+## The remembered control may have been freed by a panel rebuild, hidden, or
+## disabled since it was pushed.
+func _can_focus(c: Control) -> bool:
+	if not is_instance_valid(c) or not c.is_visible_in_tree():
+		return false
+	return c.focus_mode == Control.FOCUS_ALL and not MenuNav.is_disabled(c)
 
 
 # ── Button factory ─────────────────────────────────────────────────────────────
@@ -434,6 +490,16 @@ func _opt_color(parent: Node, label_text: String,
 	cpb.color = init_color
 	cpb.custom_minimum_size = Vector2(int(80 * s), int(34 * s))
 	cpb.color_changed.connect(on_change)
+	# The picker popup opens with no focus owner, so on keyboard or gamepad it
+	# was a dead window you could only close again. Hand focus to its first
+	# slider on open (left/right then adjust it) and back to the swatch on close.
+	var pop: Popup = cpb.get_popup()
+	if pop != null:
+		pop.about_to_popup.connect(func() -> void:
+			_focus_picker.call_deferred(cpb.get_picker()))
+		pop.popup_hide.connect(func() -> void:
+			if cpb.is_inside_tree():
+				cpb.grab_focus())
 	row.add_child(cpb)
 
 
@@ -724,9 +790,11 @@ func _handle_bind_capture(event: InputEvent) -> void:
 			_refresh_bind_button(btn, action, device)
 		return
 
-	# Swallow stray mouse/joy-motion input while capturing so it doesn't leak
-	# through to whatever's behind the panel.
-	if event is InputEventMouseButton or event is InputEventJoypadMotion:
+	# Stick and trigger wobble is not a bind — swallow it so a resting thumb
+	# doesn't scroll the panel out from under the capture. Mouse clicks are
+	# deliberately left alone: clicking another chip retargets the capture and
+	# clicking BACK cancels it, which is the only way out without a keyboard.
+	if event is InputEventJoypadMotion:
 		get_viewport().set_input_as_handled()
 
 
@@ -736,6 +804,7 @@ func _on_controls_reset() -> void:
 	_controls_panel = _build_controls_panel()
 	_controls_panel.visible = true
 	add_child(_controls_panel)
+	_focus_panel.call_deferred(_controls_panel)
 
 
 # ── How To Play panel ─────────────────────────────────────────────────────────
@@ -891,8 +960,10 @@ func _on_continue() -> void:
 	pass  # Not yet implemented
 
 func _on_options() -> void:
+	_push_focus()
 	_center_container.visible = false
 	_options_panel.visible    = true
+	_focus_panel.call_deferred(_options_panel)
 
 func _on_quit() -> void:
 	get_tree().quit()
@@ -908,9 +979,11 @@ func _toggle_dev_mapper_entry() -> void:
 			_mapper_btn = _menu_btn("MAPPER", _on_open_mapper, s)
 			_menu_box.add_child(_mapper_btn)
 			_menu_box.move_child(_mapper_btn, _menu_box.get_child_count() - 2)   # just above QUIT
+			_rewrap_menu()
 	elif _mapper_btn != null:
 		_mapper_btn.queue_free()
 		_mapper_btn = null
+		_rewrap_menu.call_deferred()   # after queue_free actually removes it
 
 func _on_open_mapper() -> void:
 	get_tree().change_scene_to_file("res://tools/ManualMapper.tscn")
@@ -926,31 +999,39 @@ func _on_options_back() -> void:
 		_gameplay_panel.visible = false
 	_howtoplay_panel.visible  = false
 	_center_container.visible = true
+	_pop_focus(_menu_box)
 
 func _on_show_gameplay() -> void:
+	_push_focus()
 	_options_panel.visible = false
 	if _gameplay_panel == null:
 		_gameplay_panel = _build_gameplay_panel()
 		add_child(_gameplay_panel)
 	_gameplay_panel.visible = true
+	_focus_panel.call_deferred(_gameplay_panel)
 
 func _on_gameplay_back() -> void:
 	_gameplay_panel.visible = false
 	_options_panel.visible  = true
+	_pop_focus(_options_panel)
 
 func _on_show_controls() -> void:
+	_push_focus()
 	_options_panel.visible = false
 	if _controls_panel == null:
 		_controls_panel = _build_controls_panel()
 		add_child(_controls_panel)
 	_controls_panel.visible = true
+	_focus_panel.call_deferred(_controls_panel)
 
 func _on_controls_back() -> void:
 	_awaiting_bind = {}
 	_controls_panel.visible = false
 	_options_panel.visible  = true
+	_pop_focus(_options_panel)
 
 func _on_show_howtoplay() -> void:
+	_push_focus()
 	_options_panel.visible = false
 	# Rebuilt on every open so it always reflects the latest control bindings
 	# (the player may have just rebound something in the Controls tab).
@@ -958,10 +1039,12 @@ func _on_show_howtoplay() -> void:
 	_howtoplay_panel = _build_howtoplay_panel()
 	_howtoplay_panel.visible = true
 	add_child(_howtoplay_panel)
+	_focus_panel.call_deferred(_howtoplay_panel)
 
 func _on_howtoplay_back() -> void:
 	_howtoplay_panel.visible = false
 	_options_panel.visible   = true
+	_pop_focus(_options_panel)
 
 func _on_gameplay_reset() -> void:
 	GameConfig.reset_defaults()
@@ -970,6 +1053,20 @@ func _on_gameplay_reset() -> void:
 	_gameplay_panel = _build_gameplay_panel()
 	_gameplay_panel.visible = true
 	add_child(_gameplay_panel)
+	# The old panel (and the focused button on it) is gone — put focus back on
+	# the fresh one or up/down stops responding.
+	_focus_panel.call_deferred(_gameplay_panel)
+
+
+## Rebind capture runs here, ahead of the GUI, because `_unhandled_input` only
+## sees what focus traversal did not eat: arrow keys, Enter and the gamepad face
+## buttons were all being swallowed by the focused rebind button, so those keys
+## could never actually be bound.
+func _input(event: InputEvent) -> void:
+	if _awaiting_bind.is_empty():
+		return
+	_handle_bind_capture(event)
+
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and (event as InputEventKey).pressed and not (event as InputEventKey).is_echo():
@@ -980,7 +1077,6 @@ func _unhandled_input(event: InputEvent) -> void:
 			return
 
 	if not _awaiting_bind.is_empty():
-		_handle_bind_capture(event)
 		return
 	if not event.is_action_pressed("ui_cancel"):
 		return
