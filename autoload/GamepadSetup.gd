@@ -1,13 +1,15 @@
 # res://autoload/GamepadSetup.gd
 extends Node
-# Final mapping:
+# Final mapping — left-to-right across the shoulder buttons and triggers:
 # lane_0 = LB (left shoulder)
-# lane_1 = RT (right trigger)   [UNCHANGED]
-# lane_2 = LT (left trigger)    [UNCHANGED]
+# lane_1 = LT (left trigger)
+# lane_2 = RT (right trigger)
 # lane_3 = RB (right shoulder)
+# (The lane_1/lane_2 comments used to say RT/LT, i.e. the opposite of what the
+#  code below actually binds. The bindings were right; the labels were not.)
 
-const DEADZONE_RT := 0.45
 const DEADZONE_LT := 0.45
+const DEADZONE_RT := 0.45
 
 func _ready() -> void:
 	# Ensure actions exist
@@ -21,15 +23,15 @@ func _ready() -> void:
 	_ensure_button("lane_3", JOY_BUTTON_RIGHT_SHOULDER) # RB -> lane 3
 
 	# --- Triggers stay the same (just ensure they exist) ---
-	_ensure_trigger("lane_1", JOY_AXIS_TRIGGER_LEFT, DEADZONE_LT) # RT
-	_ensure_trigger("lane_2", JOY_AXIS_TRIGGER_RIGHT, DEADZONE_RT) # LT
+	_ensure_trigger("lane_1", JOY_AXIS_TRIGGER_LEFT,  DEADZONE_LT) # LT -> lane 1
+	_ensure_trigger("lane_2", JOY_AXIS_TRIGGER_RIGHT, DEADZONE_RT) # RT -> lane 2
 
 	# Optional: Start -> pause
 	var start_btn := InputEventJoypadButton.new()
 	start_btn.button_index = JOY_BUTTON_START
 	InputMap.action_add_event("rhythm_pause", start_btn)
 
-	print("[GamepadSetup] Shoulders fixed: LB/LT/RT/RB -> lanes 0/1/2/3")
+	print("[GamepadSetup] Shoulders bound: LB/LT/RT/RB -> lanes 0/1/2/3")
 
 func _ensure_button(action: String, btn: int) -> void:
 	for e in InputMap.action_get_events(action):

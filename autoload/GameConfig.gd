@@ -38,7 +38,7 @@ var lives_per_song:      int   = 3
 ## quality tier, which is what keeps a weak machine on 0 unless the player
 ## deliberately asks for more. 0..LASER_COUNT_MAX overrides the tier outright.
 const LASER_COUNT_AUTO: int = -1
-const LASER_COUNT_MAX:  int = 100
+const LASER_COUNT_MAX:  int = 500
 var laser_count:         int   = LASER_COUNT_AUTO
 
 ## Screen-space reflections, ambient occlusion, indirect lighting and SDFGI, per
@@ -48,15 +48,52 @@ var laser_count:         int   = LASER_COUNT_AUTO
 ## ever been played was played without it. Measured at ~35-40 % of the frame
 ## rate on ultra, so switching it on is the player's call, not a silent upgrade.
 var advanced_lighting:   bool  = false
-var gate_preview_beats:  float = 8.0   # how many beats ahead gates become visible
-var halo_preview_beats:  float = 2.2   # how many beats ahead halo rings spawn
+var gate_preview_beats:  float = 2.5   # how many beats ahead gates become visible
 
 # ── Halo ───────────────────────────────────────────────────────────────────────
-var halo_shape:       String = "circle"  # one of: circle triangle square pentagon hexagon star diamond cross heart
 var halo_size:        float  = 4.2    # radius of the halo ring
 var halo_dual_color:  bool   = true  # second colour on alternating segments
 var halo_color_a:     Color  = Color(1.00, 0.45, 0.70, 1.0)  # primary colour (used when cycle is off)
 var halo_color_b:     Color  = Color(0.45, 0.82, 1.0,  1.0)  # secondary / dual colour
+
+# ── Display & audio output ─────────────────────────────────────────────────────
+## Options > Display and Options > Audio used to write straight to AudioServer /
+## DisplayServer / Engine and nothing else — applied live, never written to disk,
+## never read back. Every launch reset the player's volume to 100 %, dropped them
+## back to the project's window mode and re-read run/max_fps from project.godot.
+## These four live here now so save()/load_from_disk() cover them like everything
+## else; apply_display_and_audio() is what actually pushes them to the servers.
+## Defaults match project.godot (fullscreen, 120 fps) so a first launch is unchanged.
+var master_volume: float = 1.0     # 0.0 – 1.0, linear
+var music_volume:  float = 1.0     # Music bus, relative to Master
+var sfx_volume:    float = 1.0     # SFX bus, relative to Master
+var fullscreen:    bool  = true
+var vsync_enabled: bool  = true
+var max_fps:       int   = 120     # 0 = unlimited
+
+
+## Pushes the four settings above to AudioServer / DisplayServer / Engine.
+## Called from load_from_disk() and from each Options control as it changes.
+func apply_display_and_audio() -> void:
+	_set_bus_volume("Master", master_volume)
+	_set_bus_volume("Music",  music_volume)
+	_set_bus_volume("SFX",    sfx_volume)
+	DisplayServer.window_set_mode(DisplayServer.WINDOW_MODE_FULLSCREEN if fullscreen
+		else DisplayServer.WINDOW_MODE_WINDOWED)
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_ENABLED if vsync_enabled
+		else DisplayServer.VSYNC_DISABLED)
+	Engine.max_fps = max_fps
+
+
+## linear 0..1 onto a named bus. Silently ignores a bus that is not in the
+## layout, so a missing default_bus_layout.tres degrades to "Master only"
+## instead of throwing on every settings change.
+func _set_bus_volume(bus_name: String, linear: float) -> void:
+	var idx: int = AudioServer.get_bus_index(bus_name)
+	if idx < 0:
+		return
+	AudioServer.set_bus_volume_db(idx, linear_to_db(linear) if linear > 0.001 else -80.0)
+
 
 # ── Audio latency (per-device) ─────────────────────────────────────────────────
 ## Per output-device audio offset in milliseconds.
@@ -333,10 +370,14 @@ func save() -> void:
 	cfg.set_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	cfg.set_value("gameplay",   "lives_per_song",       lives_per_song)
 	cfg.set_value("display",    "laser_count",          laser_count)
+	cfg.set_value("display",    "fullscreen",           fullscreen)
+	cfg.set_value("display",    "vsync",                vsync_enabled)
+	cfg.set_value("display",    "max_fps",              max_fps)
+	cfg.set_value("audio",      "master_volume",        master_volume)
+	cfg.set_value("audio",      "music_volume",         music_volume)
+	cfg.set_value("audio",      "sfx_volume",           sfx_volume)
 	cfg.set_value("display",    "advanced_lighting",    advanced_lighting)
 	cfg.set_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
-	cfg.set_value("gameplay",   "halo_preview_beats",   halo_preview_beats)
-	cfg.set_value("halo",       "shape",        halo_shape)
 	cfg.set_value("halo",       "size",         halo_size)
 	cfg.set_value("halo",       "dual_color",   halo_dual_color)
 	cfg.set_value("halo",       "color_a",      halo_color_a)
@@ -374,11 +415,16 @@ func load_from_disk() -> void:
 	wall_jumps_enabled  = cfg.get_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
 	lives_per_song      = cfg.get_value("gameplay",   "lives_per_song",       lives_per_song)
 	advanced_lighting   = bool(cfg.get_value("display", "advanced_lighting", advanced_lighting))
+	fullscreen          = bool(cfg.get_value("display", "fullscreen", fullscreen))
+	vsync_enabled       = bool(cfg.get_value("display", "vsync",      vsync_enabled))
+	max_fps             = maxi(0, int(cfg.get_value("display", "max_fps", max_fps)))
+	master_volume       = clampf(float(cfg.get_value("audio", "master_volume", master_volume)), 0.0, 1.0)
+	music_volume        = clampf(float(cfg.get_value("audio", "music_volume",  music_volume)),  0.0, 1.0)
+	sfx_volume          = clampf(float(cfg.get_value("audio", "sfx_volume",    sfx_volume)),    0.0, 1.0)
+	apply_display_and_audio()   # push the freshly-loaded values to the servers
 	laser_count         = clampi(int(cfg.get_value("display", "laser_count", laser_count)),
 		LASER_COUNT_AUTO, LASER_COUNT_MAX)
 	gate_preview_beats  = cfg.get_value("gameplay",   "gate_preview_beats",   gate_preview_beats)
-	halo_preview_beats  = cfg.get_value("gameplay",   "halo_preview_beats",   halo_preview_beats)
-	halo_shape          = cfg.get_value("halo",  "shape",       halo_shape)
 	halo_size           = cfg.get_value("halo",  "size",        halo_size)
 	halo_dual_color     = cfg.get_value("halo",  "dual_color",  halo_dual_color)
 	halo_color_a        = cfg.get_value("halo",  "color_a",     halo_color_a)
@@ -407,9 +453,13 @@ func reset_defaults() -> void:
 	lives_per_song      = 3
 	laser_count         = LASER_COUNT_AUTO
 	advanced_lighting   = false
+	master_volume       = 1.0
+	music_volume        = 1.0
+	sfx_volume          = 1.0
+	fullscreen          = true
+	vsync_enabled       = true
+	max_fps             = 120
 	gate_preview_beats  = 2.5
-	halo_preview_beats  = 2.2
-	halo_shape          = "circle"
 	halo_size           = 4.2
 	halo_dual_color     = true
 	halo_color_a        = Color(1.00, 0.45, 0.70, 1.0)

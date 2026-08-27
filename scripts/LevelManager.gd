@@ -48,9 +48,12 @@ func _load_next() -> void:
 		_current.connect("section_finished", Callable(self, "_on_section_finished"))
 
 
+## Section_BeatRunner3d does NOT emit `section_finished` — it owns its own
+## lives, death screen and results panel end-to-end, so this never actually
+## fires today. Kept (and kept harmless) for the section types that will:
+## a failed section just re-loads, since the per-song lives that used to be
+## spent here now live in Run.song_lives and are spent by the Section itself.
 func _on_section_finished(passed: bool) -> void:
 	if passed:
 		Run.on_section_clear("generic")
-	else:
-		Run.lose_life()
 	_load_next()

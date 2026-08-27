@@ -270,7 +270,12 @@ func _load_beatmaps() -> void:
 			var key: String = entry_name.substr(0, entry_name.length() - 5)
 			var json_path: String = "res://data/beatmaps/%s" % entry_name
 
-			var title: String = key
+			# Title is ALWAYS the beatmap key with underscores turned back into
+			# spaces. It used to fall back to the audio filename, which put
+			# "This Is Me v2 (for shits and giggles)" in front of players, and it
+			# disagreed with the in-level countdown (which already derived its
+			# title from the key) — so the same song had two different names.
+			var title: String = key.replace("_", " ")
 			var song_path: String = ""
 
 			var f: FileAccess = FileAccess.open(json_path, FileAccess.READ)
@@ -279,15 +284,7 @@ func _load_beatmaps() -> void:
 				f.close()
 				var parsed: Variant = JSON.parse_string(txt)
 				if parsed is Dictionary:
-					var d: Dictionary = parsed
-					song_path = String(d.get("song_path", ""))
-					var explicit_title: String = String(d.get("title", ""))
-					if explicit_title != "":
-						title = explicit_title
-					else:
-						var file_name: String = song_path.get_file().get_basename()
-						if file_name != "":
-							title = file_name
+					song_path = String((parsed as Dictionary).get("song_path", ""))
 
 			beatmaps.append({"key": key, "title": title, "song_path": song_path})
 

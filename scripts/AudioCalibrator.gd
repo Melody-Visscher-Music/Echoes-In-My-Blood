@@ -4,11 +4,22 @@ extends CanvasLayer
 ##  IDLE    → shows current device + saved offset + Bluetooth detection
 ##            [ENTER] start calibration   [R] reset to 0   [ESC] close
 ##
-##  RUNNING → 60 BPM click track; tap any button when you HEAR each click.
-##            Collects 20 taps, discards the 4 highest + 4 lowest outliers,
-##            averages the remaining 12 (trimmed mean).  Shows live per-tap
-##            feedback and a running average so you can see consistency.
+##  PASS 1  → SILENT. The ring flashes on each beat; tap when you SEE it.
+##  PASS 2  → DARK. A click plays on each beat; tap when you HEAR it.
+##            Each pass collects COLLECT_N taps and takes a trimmed mean.
 ##            [ESC] back to idle without saving
+##
+##  WHY TWO PASSES: a single "tap when you hear it" test measures
+##  reaction_time + audio_latency and cannot separate them, so it was banking
+##  ~150–250 ms of human reflex into the saved offset and shifting every gate
+##  in the game by it. Reaction time is present in BOTH passes and identical in
+##  both, so the DIFFERENCE cancels it:
+##      visual_mean = reaction + display_latency
+##      audio_mean  = reaction + audio_latency
+##      offset      = audio_mean - visual_mean = audio latency vs. the screen
+##  which is exactly what _song_time() needs. It can also come out negative now
+##  (audio ahead of video), which the old one-pass version was structurally
+##  incapable of producing.
 ##
 ##  DONE    → shows measured result and consistency rating
 ##            [ENTER] save and close   [ESC] discard and go back
@@ -22,9 +33,9 @@ signal calibration_cancelled
 # ── Config ────────────────────────────────────────────────────────────────────
 const BPM:       float = 60.0
 const INTERVAL:  float = 60.0 / BPM     # 1.000 s — comfortable tapping pace
-const WARMUP_N:  int   = 4              # beats to play before measuring
-const COLLECT_N: int   = 20             # total taps to collect
-const TRIM_N:    int   = 4              # discard this many highest + lowest
+const WARMUP_N:  int   = 4              # beats to run before measuring, per pass
+const COLLECT_N: int   = 14             # taps collected per pass
+const TRIM_N:    int   = 3              # discard this many highest + lowest, per pass
 # Max lag accepted per tap — 88 % of interval covers ~880 ms (worst Bluetooth).
 const MAX_LAG:   float = INTERVAL * 0.88
 
@@ -39,8 +50,14 @@ const BT_HINTS: PackedStringArray = [
 ]
 
 # ── Phase state ───────────────────────────────────────────────────────────────
-enum Phase { IDLE, RUNNING, DONE }
+## VISUAL and AUDIO are the two measurement passes; see the header.
+enum Phase { IDLE, VISUAL, AUDIO, DONE }
 var _phase: Phase = Phase.IDLE
+
+## Trimmed means of each pass, in seconds. Both include the player's reaction
+## time; subtracting one from the other is what removes it.
+var _visual_mean: float = 0.0
+var _audio_mean:  float = 0.0
 
 var _elapsed:    float        = 0.0
 var _next_beat:  float        = 1.0
@@ -153,9 +170,9 @@ func _enter_idle() -> void:
 			+ "Engine buffer: %.0f ms" % suggest.engine_ms
 		)
 	else:
-		_body.text = "Tap in sync with what you HEAR — not what you see.\nWorks best with headphones on and eyes closed."
+		_body.text = "Two quick steps: tap what you SEE, then tap what you HEAR.\nThe gap between them is your audio delay. Headphones on."
 
-	_hint.text    = "[ENTER]  Calibrate     [R]  Reset to 0     [ESC]  Close"
+	_hint.text    = "[ENTER]  Calibrate (2 steps)     [R]  Reset to 0     [ESC]  Close"
 	_set_buttons([
 		["CALIBRATE",   _enter_running, UiStyle.CYAN],
 		["RESET TO 0",  _do_reset,      UiStyle.VIOLET],
@@ -164,8 +181,19 @@ func _enter_idle() -> void:
 	_set_circle_color(Color(0.35, 0.20, 0.70, 1.0))
 
 
+## Starts the visual pass. The audio pass follows automatically once it fills.
 func _enter_running() -> void:
-	_phase      = Phase.RUNNING
+	_visual_mean = 0.0
+	_audio_mean  = 0.0
+	_enter_pass(Phase.VISUAL)
+
+
+## Runs one measurement pass. VISUAL flashes the ring in silence; AUDIO clicks
+## with the ring held still, so each pass has exactly one stimulus to react to.
+## Mixing them would let the player anticipate on the wrong channel and the
+## subtraction in _compute_result() would stop meaning anything.
+func _enter_pass(pass_phase: Phase) -> void:
+	_phase      = pass_phase
 	_elapsed    = 0.0
 	_next_beat  = 1.0
 	_beat_count = 0
@@ -174,15 +202,21 @@ func _enter_running() -> void:
 	_run_start_usec = Time.get_ticks_usec()   # anchor to monotonic clock
 	_set_measure_visible(true)
 
+	var is_audio: bool = (pass_phase == Phase.AUDIO)
 	_title.text     = "GET READY…"
-	_dev_lbl.text   = ""
+	_dev_lbl.text   = "STEP %d OF 2  ·  %s" % [2 if is_audio else 1, "SOUND" if is_audio else "SIGHT"]
 	_saved_lbl.text = ""
-	_body.text      = "Tap any button each time you HEAR the click"
+	_body.text      = ("Eyes anywhere — tap each time you HEAR the click"
+		if is_audio else
+		"Sound off for this step — tap each time you SEE the ring flash")
 	_count_lbl.text = "0 / %d" % COLLECT_N
 	_tap_lbl.text   = ""
 	_avg_lbl.text   = ""
 	_hint.text      = "[ESC]  Cancel     ·     tap with any key, pad button or a click"
 	_set_buttons([["CANCEL", _enter_idle, UiStyle.VIOLET]])
+	# Sight pass = violet ring, sound pass = dim so it reads as "not this one".
+	_set_circle_color(Color(0.35, 0.20, 0.70, 1.0) if not is_audio
+		else Color(0.10, 0.08, 0.16, 1.0))
 
 
 func _enter_done() -> void:
@@ -190,15 +224,20 @@ func _enter_done() -> void:
 	_click.stop()
 	_set_measure_visible(false)
 
-	var sign: String = "+" if _result_ms >= 0.0 else ""
-	var ms:   float  = GameConfig.get_audio_offset_ms()
+	var sgn: String = "+" if _result_ms >= 0.0 else ""
+	var ms:  float  = GameConfig.get_audio_offset_ms()
 	var ms_str: String = ("not calibrated" if ms == 0.0
 		else ("%s%.0f ms" % ["+" if ms >= 0.0 else "", ms]))
 
 	_title.text     = "RESULT"
 	_dev_lbl.text   = ""
 	_saved_lbl.text = "Previously saved:  %s" % ms_str
-	_body.text      = ("Measured offset:  %s%.0f ms" % [sign, _result_ms])
+	# Both pass means are shown, not just the result — the number is a difference,
+	# and seeing where it came from is what makes it believable.
+	_body.text = ("Measured audio latency:  %s%.0f ms\n" % [sgn, _result_ms]
+		+ "sight %.0f ms  ·  sound %.0f ms  — the gap between them is your\n" % [
+			_visual_mean * 1000.0, _audio_mean * 1000.0]
+		+ "headphone delay; your reaction time is in both and cancels out.")
 	if _inconsistent:
 		_body.text += "\n⚠  Inconsistent taps — consider redoing calibration"
 	_hint.text      = "[ENTER]  Save & close     [ESC]  Discard"
@@ -212,18 +251,26 @@ func _enter_done() -> void:
 func _process(delta: float) -> void:
 	_pulse = maxf(0.0, _pulse - delta * 6.0)
 
-	if _phase == Phase.RUNNING:
+	var in_pass: bool  = _phase == Phase.VISUAL or _phase == Phase.AUDIO
+	var is_audio: bool = _phase == Phase.AUDIO
+
+	if in_pass:
 		# Recompute _elapsed from the monotonic clock every frame.
 		# This eliminates the floating-point drift that builds up
-		# when accumulating delta over 20+ beats.
+		# when accumulating delta over many beats.
 		var now_usec := Time.get_ticks_usec()
 		_elapsed = float(now_usec - _run_start_usec) / 1_000_000.0
 
 		if _elapsed >= _next_beat:
 			_next_beat  += INTERVAL
 			_beat_count += 1
-			_click.play()
-			_pulse = 1.0
+			# Exactly one stimulus per pass: the sight pass must stay silent and
+			# the sound pass must stay visually still, or the player reacts to
+			# the wrong channel and the two means stop being comparable.
+			if is_audio:
+				_click.play()
+			else:
+				_pulse = 1.0
 			var measuring := _beat_count > WARMUP_N
 			if measuring:
 				_beat_usec_log.append(now_usec)   # log exact usec for this beat
@@ -231,11 +278,13 @@ func _process(delta: float) -> void:
 			else:
 				_title.text = "GET READY  (%d)" % maxi(0, WARMUP_N - _beat_count + 1)
 
-	# Pulse circle
-	var br: float = 0.12 + _pulse * 0.70
-	_set_circle_color(Color(br * 0.55, br * 0.35, br, 1.0))
-	var sz: float = 140.0 + _pulse * 120.0
-	_circle.custom_minimum_size = Vector2(sz, sz)
+	# Pulse circle — driven only when the ring IS the stimulus, or when idling
+	# on the menu. During the sound pass it holds its dim colour and fixed size.
+	if not is_audio:
+		var br: float = 0.12 + _pulse * 0.70
+		_set_circle_color(Color(br * 0.55, br * 0.35, br, 1.0))
+		var sz: float = 140.0 + _pulse * 120.0
+		_circle.custom_minimum_size = Vector2(sz, sz)
 
 
 # ── Input ─────────────────────────────────────────────────────────────────────
@@ -262,7 +311,7 @@ func _input(event: InputEvent) -> void:
 					(event as InputEventKey).keycode == KEY_SPACE):
 				_enter_running()
 
-		Phase.RUNNING:
+		Phase.VISUAL, Phase.AUDIO:
 			if event.is_action_pressed("ui_cancel"):
 				get_viewport().set_input_as_handled()
 				_enter_idle()
@@ -323,29 +372,54 @@ func _record_tap() -> void:
 		_avg_lbl.text = "Running avg:  %s%d ms" % [avg_sgn, int(raw_avg * 1000.0)]
 
 	if _taps.size() >= COLLECT_N:
-		_compute_result()
-		_enter_done()
+		if _phase == Phase.VISUAL:
+			_visual_mean = _trimmed_mean(_taps)
+			_enter_pass(Phase.AUDIO)
+		else:
+			_audio_mean = _trimmed_mean(_taps)
+			_compute_result()
+			_enter_done()
 
 
 # ── Result math ───────────────────────────────────────────────────────────────
-func _compute_result() -> void:
-	var sorted: Array[float] = _taps.duplicate()
+## Mean of `samples` with the TRIM_N highest and lowest discarded, in seconds.
+## Falls back to a plain mean if there are too few samples to trim.
+func _trimmed_mean(samples: Array[float]) -> float:
+	if samples.is_empty():
+		return 0.0
+	var sorted: Array[float] = samples.duplicate()
 	sorted.sort()
-	var trimmed: Array[float] = sorted.slice(TRIM_N, sorted.size() - TRIM_N)
-
+	var trimmed: Array[float] = sorted
+	if sorted.size() > TRIM_N * 2:
+		trimmed = sorted.slice(TRIM_N, sorted.size() - TRIM_N)
 	var avg: float = 0.0
-	for v: float in trimmed: avg += v
-	avg /= float(trimmed.size())
+	for v: float in trimmed:
+		avg += v
+	return avg / float(trimmed.size())
 
-	# Warn if std-dev of trimmed set > 40 ms
+
+## Population std-dev of the trimmed set, in seconds — the consistency warning.
+func _trimmed_stddev(samples: Array[float]) -> float:
+	if samples.size() < 2:
+		return 0.0
+	var sorted: Array[float] = samples.duplicate()
+	sorted.sort()
+	var trimmed: Array[float] = sorted
+	if sorted.size() > TRIM_N * 2:
+		trimmed = sorted.slice(TRIM_N, sorted.size() - TRIM_N)
+	var avg: float = _trimmed_mean(samples)
 	var variance: float = 0.0
-	for v: float in trimmed: variance += (v - avg) * (v - avg)
-	variance /= float(trimmed.size())
-	_inconsistent = sqrt(variance) > 0.04
+	for v: float in trimmed:
+		variance += (v - avg) * (v - avg)
+	return sqrt(variance / float(trimmed.size()))
 
-	# Positive avg = tapped late = audio is delayed.
-	# Add to song_time() to shift visuals forward to match.
-	_result_ms = avg * 1000.0
+
+## Audio latency = audio pass mean - visual pass mean. Reaction time sits in
+## both terms and cancels, which is the whole reason for the second pass; see
+## the header. A positive result means sound arrives AFTER the picture.
+func _compute_result() -> void:
+	_inconsistent = _trimmed_stddev(_taps) > 0.04
+	_result_ms = (_audio_mean - _visual_mean) * 1000.0
 
 
 # ── Actions ───────────────────────────────────────────────────────────────────
@@ -381,6 +455,7 @@ func _build_click() -> void:
 	wav.data = data; wav.format = AudioStreamWAV.FORMAT_16_BITS
 	wav.mix_rate = sr; wav.stereo = false
 	_click = AudioStreamPlayer.new()
+	_click.bus = "SFX"
 	_click.stream = wav; _click.bus = "Master"
 	_click.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(_click)

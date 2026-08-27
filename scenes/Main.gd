@@ -22,6 +22,12 @@ var _mapper_btn: Button = null
 # and without this the menu came back with nothing selected and up/down dead.
 var _focus_stack: Array[Control] = []
 
+# Set by every Options/Gameplay control that writes to GameConfig, cleared by
+# SAVE & BACK. Backing out with changes pending pops a confirm instead of
+# silently throwing the edits away — GameConfig only reaches disk via save().
+var _settings_dirty: bool = false
+var _confirm_panel: Control = null
+
 
 func _ready() -> void:
 	Save.load_from_disk(0)
@@ -162,7 +168,7 @@ func _build_ui() -> void:
 	# Version label (bottom-right corner)
 	var ver := Label.new()
 	ver.set_anchors_and_offsets_preset(Control.PRESET_BOTTOM_RIGHT)
-	ver.text = "v0.01"
+	ver.text = "v0.03-Beta"
 	ver.offset_left = -60.0 * s
 	ver.offset_top  = -30.0 * s
 	ver.add_theme_font_override("font", UiStyle.display(600, 2.0))
@@ -279,30 +285,67 @@ func _build_options_panel() -> Control:
 	# ── AUDIO ─────────────────────────────────────────────────────────────────
 	_opt_section(vbox, "AUDIO", s)
 
-	var master_init := db_to_linear(AudioServer.get_bus_volume_db(0))
-	var master_val  := Label.new()
-	master_val.text  = "%d%%" % int(master_init * 100)
-	_opt_slider(vbox, "Master Volume", 0.0, 1.0, 0.01, master_init, master_val,
+	# All three write to GameConfig and then re-apply, so they persist. They used
+	# to poke AudioServer directly and were lost on every quit.
+	var master_val := Label.new()
+	master_val.text = "%d%%" % int(GameConfig.master_volume * 100)
+	_opt_slider(vbox, "Master Volume", 0.0, 1.0, 0.01, GameConfig.master_volume, master_val,
 		func(v: float) -> void:
-			AudioServer.set_bus_volume_db(0, linear_to_db(v) if v > 0.001 else -80.0)
-			master_val.text = "%d%%" % int(v * 100), s)
+			GameConfig.master_volume = v
+			GameConfig.apply_display_and_audio()
+			master_val.text = "%d%%" % int(v * 100)
+			_mark_dirty(), s)
+
+	var music_val := Label.new()
+	music_val.text = "%d%%" % int(GameConfig.music_volume * 100)
+	_opt_slider(vbox, "Music Volume", 0.0, 1.0, 0.01, GameConfig.music_volume, music_val,
+		func(v: float) -> void:
+			GameConfig.music_volume = v
+			GameConfig.apply_display_and_audio()
+			music_val.text = "%d%%" % int(v * 100)
+			_mark_dirty(), s)
+
+	var sfx_val := Label.new()
+	sfx_val.text = "%d%%" % int(GameConfig.sfx_volume * 100)
+	_opt_slider(vbox, "SFX Volume", 0.0, 1.0, 0.01, GameConfig.sfx_volume, sfx_val,
+		func(v: float) -> void:
+			GameConfig.sfx_volume = v
+			GameConfig.apply_display_and_audio()
+			sfx_val.text = "%d%%" % int(v * 100)
+			_mark_dirty(), s)
+
+	# Calibration used to be reachable only from the in-game pause menu, so a
+	# player who never paused never found the one setting that makes Bluetooth
+	# playable. It belongs next to the volume sliders.
+	var cal_btn := PlateButton.new()
+	cal_btn.text = "CALIBRATE AUDIO LATENCY"
+	cal_btn.custom_minimum_size = Vector2(int(360 * s), int(46 * s))
+	cal_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_style_btn(cal_btn, s)
+	cal_btn.pressed.connect(_on_calibrate_audio)
+	vbox.add_child(cal_btn)
+
+	var cal_note := Label.new()
+	cal_note.text = "Measures your headphones' audio delay so gates line up with the beat. Worth running once on Bluetooth."
+	cal_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	cal_note.add_theme_font_size_override("font_size", int(12 * s))
+	cal_note.add_theme_color_override("font_color", Color(0.5, 0.5, 0.62, 1.0))
+	vbox.add_child(cal_note)
 
 	# ── DISPLAY ───────────────────────────────────────────────────────────────
 	_opt_section(vbox, "DISPLAY", s)
 
-	var fs_on := DisplayServer.window_get_mode() >= DisplayServer.WINDOW_MODE_FULLSCREEN
-	_opt_toggle(vbox, "Fullscreen", fs_on,
+	_opt_toggle(vbox, "Fullscreen", GameConfig.fullscreen,
 		func(on: bool) -> void:
-			DisplayServer.window_set_mode(
-				DisplayServer.WINDOW_MODE_FULLSCREEN if on
-				else DisplayServer.WINDOW_MODE_WINDOWED), s)
+			GameConfig.fullscreen = on
+			GameConfig.apply_display_and_audio()
+			_mark_dirty(), s)
 
-	var vs_on := DisplayServer.window_get_vsync_mode() != DisplayServer.VSYNC_DISABLED
-	_opt_toggle(vbox, "V-Sync", vs_on,
+	_opt_toggle(vbox, "V-Sync", GameConfig.vsync_enabled,
 		func(on: bool) -> void:
-			DisplayServer.window_set_vsync_mode(
-				DisplayServer.VSYNC_ENABLED if on
-				else DisplayServer.VSYNC_DISABLED), s)
+			GameConfig.vsync_enabled = on
+			GameConfig.apply_display_and_audio()
+			_mark_dirty(), s)
 
 	var fps_row := _opt_row(vbox, "Max FPS", s)
 	var fps_opt := OptionButton.new()
@@ -310,15 +353,18 @@ func _build_options_panel() -> Control:
 	fps_opt.add_item("30");  fps_opt.add_item("60")
 	fps_opt.add_item("120"); fps_opt.add_item("Unlimited")
 	var fps_vals: Array[int] = [30, 60, 120, 0]
-	var fi := fps_vals.find(Engine.max_fps)
-	fps_opt.selected = fi if fi >= 0 else 1
-	fps_opt.item_selected.connect(func(idx: int) -> void: Engine.max_fps = fps_vals[idx])
+	var fi := fps_vals.find(GameConfig.max_fps)
+	fps_opt.selected = fi if fi >= 0 else 2
+	fps_opt.item_selected.connect(func(idx: int) -> void:
+		GameConfig.max_fps = fps_vals[idx]
+		GameConfig.apply_display_and_audio()
+		_mark_dirty())
 	fps_row.add_child(fps_opt)
 
 	var quality_row := _opt_row(vbox, "Quality", s)
 	var quality_opt := OptionButton.new()
 	UiStyle.style_option(quality_opt, s)
-	var quality_ids: Array[String] = GraphicsQuality.TIERS   # ["low","medium","high","ultra"]
+	var quality_ids: Array[String] = GraphicsQuality.TIERS   # ["low","medium","high","ultra","max"]
 	for qid: String in quality_ids:
 		quality_opt.add_item(qid.capitalize())
 	var qi := quality_ids.find(GraphicsQuality.tier)
@@ -341,11 +387,12 @@ func _build_options_panel() -> Control:
 		float(GameConfig.laser_count), laser_val,
 		func(v: float) -> void:
 			GameConfig.laser_count = int(v)
-			laser_val.text = laser_text.call(int(v)),
+			laser_val.text = laser_text.call(int(v))
+			_mark_dirty(),
 		s)
 
 	_opt_toggle(vbox, "Advanced Lighting", GameConfig.advanced_lighting,
-		func(on: bool) -> void: GameConfig.advanced_lighting = on, s)
+		func(on: bool) -> void: GameConfig.advanced_lighting = on; _mark_dirty(), s)
 
 	var adv_note := Label.new()
 	adv_note.text = "Reflections, ambient occlusion and indirect light, following the quality tier. Costs roughly a third of the frame rate on Ultra."
@@ -531,54 +578,55 @@ func _build_gameplay_panel() -> Control:
 	# ── PLAYER APPEARANCE ─────────────────────────────────────────────────────
 	_opt_section(vbox, "PLAYER APPEARANCE", s)
 	_opt_color(vbox, "Jacket Color", GameConfig.jacket_color,
-		func(c: Color) -> void: GameConfig.jacket_color = c, s)
+		func(c: Color) -> void: GameConfig.jacket_color = c; _mark_dirty(), s)
 	_opt_color(vbox, "Fur Color", GameConfig.fur_color,
-		func(c: Color) -> void: GameConfig.fur_color = c, s)
+		func(c: Color) -> void: GameConfig.fur_color = c; _mark_dirty(), s)
 	_opt_color(vbox, "Hair Color", GameConfig.hair_color,
-		func(c: Color) -> void: GameConfig.hair_color = c, s)
+		func(c: Color) -> void: GameConfig.hair_color = c; _mark_dirty(), s)
 
 	# ── LEVEL COLORS ──────────────────────────────────────────────────────────
 	_opt_section(vbox, "LEVEL COLORS", s)
 	_opt_color(vbox, "Left Gate Color  (pink)", GameConfig.level_color_a,
-		func(c: Color) -> void: GameConfig.level_color_a = c, s)
+		func(c: Color) -> void: GameConfig.level_color_a = c; _mark_dirty(), s)
 	_opt_color(vbox, "Right Gate Color  (blue)", GameConfig.level_color_b,
-		func(c: Color) -> void: GameConfig.level_color_b = c, s)
+		func(c: Color) -> void: GameConfig.level_color_b = c; _mark_dirty(), s)
 	_opt_color(vbox, "Jump Gate Color  (green)", GameConfig.level_color_jump,
-		func(c: Color) -> void: GameConfig.level_color_jump = c, s)
+		func(c: Color) -> void: GameConfig.level_color_jump = c; _mark_dirty(), s)
 	_opt_color(vbox, "Slide Gate Color  (teal)", GameConfig.level_color_slide,
-		func(c: Color) -> void: GameConfig.level_color_slide = c, s)
+		func(c: Color) -> void: GameConfig.level_color_slide = c; _mark_dirty(), s)
 	_opt_color(vbox, "Grind Rail Color  (orange)", GameConfig.level_color_rail,
-		func(c: Color) -> void: GameConfig.level_color_rail = c, s)
+		func(c: Color) -> void: GameConfig.level_color_rail = c; _mark_dirty(), s)
 	_opt_color(vbox, "Floor Color", GameConfig.floor_color,
-		func(c: Color) -> void: GameConfig.floor_color = c, s)
+		func(c: Color) -> void: GameConfig.floor_color = c; _mark_dirty(), s)
 	_opt_toggle(vbox, "Color Cycle", GameConfig.color_cycle_enabled,
-		func(on: bool) -> void: GameConfig.color_cycle_enabled = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_enabled = on; _mark_dirty(), s)
 
 	var cycle_speed_val := Label.new()
 	cycle_speed_val.text = "%.1fs" % GameConfig.color_cycle_period_s
 	_opt_slider(vbox, "Color Cycle Speed  (sec/color — lower = faster)",
-		0.1, 5.0, 0.1, GameConfig.color_cycle_period_s, cycle_speed_val,
+		0.2, 5.0, 0.1, GameConfig.color_cycle_period_s, cycle_speed_val,
 		func(v: float) -> void:
 			GameConfig.color_cycle_period_s = v
-			cycle_speed_val.text = "%.1fs" % v, s)
+			cycle_speed_val.text = "%.1fs" % v
+			_mark_dirty(), s)
 
 	# ── CYCLE AFFECTS ─────────────────────────────────────────────────────────
 	_opt_section(vbox, "COLOR CYCLE AFFECTS", s)
 	_opt_toggle(vbox, "Gates",      GameConfig.color_cycle_affects_gates,
-		func(on: bool) -> void: GameConfig.color_cycle_affects_gates  = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_affects_gates  = on; _mark_dirty(), s)
 	_opt_toggle(vbox, "Halos",      GameConfig.color_cycle_affects_halos,
-		func(on: bool) -> void: GameConfig.color_cycle_affects_halos  = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_affects_halos  = on; _mark_dirty(), s)
 	_opt_toggle(vbox, "Floor",      GameConfig.color_cycle_affects_floor,
-		func(on: bool) -> void: GameConfig.color_cycle_affects_floor  = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_affects_floor  = on; _mark_dirty(), s)
 	_opt_toggle(vbox, "World Deco", GameConfig.color_cycle_affects_world,
-		func(on: bool) -> void: GameConfig.color_cycle_affects_world  = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_affects_world  = on; _mark_dirty(), s)
 	_opt_toggle(vbox, "Grind Rail", GameConfig.color_cycle_affects_rail,
-		func(on: bool) -> void: GameConfig.color_cycle_affects_rail   = on, s)
+		func(on: bool) -> void: GameConfig.color_cycle_affects_rail   = on; _mark_dirty(), s)
 
 	# ── GAMEPLAY ──────────────────────────────────────────────────────────────
 	_opt_section(vbox, "GAMEPLAY", s)
 	_opt_toggle(vbox, "Wall Jumps", GameConfig.wall_jumps_enabled,
-		func(on: bool) -> void: GameConfig.wall_jumps_enabled = on, s)
+		func(on: bool) -> void: GameConfig.wall_jumps_enabled = on; _mark_dirty(), s)
 
 	var lives_val := Label.new()
 	lives_val.text = "%d" % GameConfig.lives_per_song
@@ -587,7 +635,8 @@ func _build_gameplay_panel() -> Control:
 		func(v: float) -> void:
 			GameConfig.lives_per_song = int(v)
 			Run.song_lives = int(v)
-			lives_val.text = "%d" % int(v), s)
+			lives_val.text = "%d" % int(v)
+			_mark_dirty(), s)
 
 	var gate_val := Label.new()
 	gate_val.text = "%.1f" % GameConfig.gate_preview_beats
@@ -595,26 +644,15 @@ func _build_gameplay_panel() -> Control:
 		GameConfig.gate_preview_beats, gate_val,
 		func(v: float) -> void:
 			GameConfig.gate_preview_beats = v
-			gate_val.text = "%.1f" % v, s)
+			gate_val.text = "%.1f" % v
+			_mark_dirty(), s)
 
 	# ── HALO ─────────────────────────────────────────────────────────────────
 	_opt_section(vbox, "HALO", s)
 
-	var shape_row := _opt_row(vbox, "Shape", s)
-	var shape_opt := OptionButton.new()
-	UiStyle.style_option(shape_opt, s)
-	var halo_shape_ids: Array[String] = [
-		"circle", "triangle", "square", "pentagon",
-		"hexagon", "star", "diamond", "cross", "heart",
-	]
-	for sid: String in halo_shape_ids:
-		shape_opt.add_item(sid.capitalize())
-	var cur_shape_idx: int = halo_shape_ids.find(GameConfig.halo_shape)
-	shape_opt.selected = cur_shape_idx if cur_shape_idx >= 0 else 5
-	shape_opt.item_selected.connect(func(idx: int) -> void:
-		var _ids := ["circle","triangle","square","pentagon","hexagon","star","diamond","cross","heart"]
-		GameConfig.halo_shape = _ids[idx])
-	shape_row.add_child(shape_opt)
+	# Halo shape picker removed — circle is the only shape that was ever finished,
+	# and the dropdown's fallback selected "Star" while the config still said
+	# "circle", so it reported a shape the game was not drawing.
 
 	var halo_val := Label.new()
 	halo_val.text = "%.1f" % GameConfig.halo_size
@@ -622,14 +660,15 @@ func _build_gameplay_panel() -> Control:
 		GameConfig.halo_size, halo_val,
 		func(v: float) -> void:
 			GameConfig.halo_size = v
-			halo_val.text = "%.1f" % v, s)
+			halo_val.text = "%.1f" % v
+			_mark_dirty(), s)
 
 	_opt_toggle(vbox, "Dual Color", GameConfig.halo_dual_color,
-		func(on: bool) -> void: GameConfig.halo_dual_color = on, s)
+		func(on: bool) -> void: GameConfig.halo_dual_color = on; _mark_dirty(), s)
 	_opt_color(vbox, "Halo Color A", GameConfig.halo_color_a,
-		func(c: Color) -> void: GameConfig.halo_color_a = c, s)
+		func(c: Color) -> void: GameConfig.halo_color_a = c; _mark_dirty(), s)
 	_opt_color(vbox, "Halo Color B", GameConfig.halo_color_b,
-		func(c: Color) -> void: GameConfig.halo_color_b = c, s)
+		func(c: Color) -> void: GameConfig.halo_color_b = c; _mark_dirty(), s)
 
 	# ── Buttons ───────────────────────────────────────────────────────────────
 	var sp := Control.new()
@@ -877,9 +916,9 @@ func _build_howtoplay_panel() -> Control:
 	var sc := VBoxContainer.new()
 	sc.add_theme_constant_override("separation", int(7 * s))
 	vbox.add_child(sc)
-	_htp_row(sc, "Gate hit",             "+500 pts × combo multiplier",              s)
+	_htp_row(sc, "Gate hit",             "+500 pts × combo multiplier  (+1000 in electric zones)", s)
 	_htp_row(sc, "Combo multiplier",     "×2 at 10 streak  ·  ×3 at 20  ·  ×4 at 30", s)
-	_htp_row(sc, "Health (starts 25 %)", "+2 % per hit    –2 % per miss    → 0 % = fail", s)
+	_htp_row(sc, "Health (starts 25 %)", "+1 % per hit    –10 % per miss    → 0 % = fail", s)
 	_htp_row(sc, "Letter grade",         "S / A / B / C / D / F  based on accuracy %", s)
 
 	# Back button
@@ -991,15 +1030,150 @@ func _on_open_mapper() -> void:
 func _on_save_back() -> void:
 	Save.save_to_disk(0)
 	GameConfig.save()
-	_on_options_back()
+	_settings_dirty = false
+	_close_options()
 
+
+## Any control that writes to GameConfig calls this. GameConfig only reaches disk
+## through save(), so without a flag the player could edit half the options page,
+## press Escape, and lose the lot with no indication anything had happened.
+func _mark_dirty() -> void:
+	_settings_dirty = true
+
+
+## Leaving the options tree. With pending edits this asks first; SAVE & BACK
+## clears the flag, so the prompt only ever appears when there is really
+## something to lose.
 func _on_options_back() -> void:
+	if _settings_dirty:
+		_show_unsaved_prompt()
+		return
+	_close_options()
+
+
+## The actual teardown, once the unsaved question (if any) is answered.
+func _close_options() -> void:
 	_options_panel.visible    = false
 	if _gameplay_panel != null:
 		_gameplay_panel.visible = false
+	if _controls_panel != null:
+		_controls_panel.visible = false
 	_howtoplay_panel.visible  = false
 	_center_container.visible = true
 	_pop_focus(_menu_box)
+
+
+## "You have unsaved changes" — Save / Discard / Cancel, built on the same
+## plate kit as everything else rather than a themeless ConfirmationDialog.
+func _show_unsaved_prompt() -> void:
+	if _confirm_panel != null:
+		return
+	var s := _ui_s()
+	var arr := _panel_bg(Color(0.02, 0.01, 0.10, 0.96))
+	_confirm_panel = arr[0]
+	var wrapper: Control = arr[1]
+
+	var panel := PlatePanel.create(int(34 * s), Color(1.00, 0.52, 0.16), 26.0 * s)
+	panel.custom_minimum_size = Vector2(int(560 * s), 0)
+	wrapper.add_child(panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", int(12 * s))
+	panel.content.add_child(vbox)
+
+	var ttl := Label.new()
+	ttl.text = "UNSAVED CHANGES"
+	ttl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	ttl.add_theme_font_override("font", UiStyle.caption(6.0))
+	ttl.add_theme_font_size_override("font_size", int(26 * s))
+	ttl.add_theme_color_override("font_color", Color(1.00, 0.72, 0.30))
+	vbox.add_child(ttl)
+
+	var body := Label.new()
+	body.text = "Your settings changes have not been written to disk yet. Leaving now discards them."
+	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	body.add_theme_font_size_override("font_size", int(14 * s))
+	body.add_theme_color_override("font_color", Color(0.72, 0.68, 0.86))
+	vbox.add_child(body)
+
+	vbox.add_child(_rule(s))
+
+	var row := HBoxContainer.new()
+	row.alignment = BoxContainer.ALIGNMENT_CENTER
+	row.add_theme_constant_override("separation", int(14 * s))
+	vbox.add_child(row)
+
+	var save_btn := PlateButton.new()
+	save_btn.text = "SAVE & LEAVE"
+	save_btn.custom_minimum_size = Vector2(int(190 * s), int(48 * s))
+	_style_btn(save_btn, s)
+	save_btn.pressed.connect(func() -> void:
+		_dismiss_unsaved_prompt()
+		_on_save_back())
+	row.add_child(save_btn)
+
+	var discard_btn := PlateButton.new()
+	discard_btn.text = "DISCARD"
+	discard_btn.custom_minimum_size = Vector2(int(160 * s), int(48 * s))
+	_style_btn(discard_btn, s)
+	discard_btn.pressed.connect(func() -> void:
+		# Re-read from disk so the in-memory config actually goes back to the
+		# saved state — the live values were already mutated on every keystroke.
+		GameConfig.load_from_disk()
+		_settings_dirty = false
+		_rebuild_settings_panels()
+		_dismiss_unsaved_prompt()
+		_close_options())
+	row.add_child(discard_btn)
+
+	var cancel_btn := PlateButton.new()
+	cancel_btn.text = "CANCEL"
+	cancel_btn.custom_minimum_size = Vector2(int(160 * s), int(48 * s))
+	_style_btn(cancel_btn, s)
+	cancel_btn.pressed.connect(_dismiss_unsaved_prompt)
+	row.add_child(cancel_btn)
+
+	add_child(_confirm_panel)
+	_focus_panel.call_deferred(_confirm_panel)
+
+
+func _dismiss_unsaved_prompt() -> void:
+	if _confirm_panel == null:
+		return
+	_confirm_panel.queue_free()
+	_confirm_panel = null
+	_focus_panel.call_deferred(_options_panel)
+
+
+## Throws away the cached settings pages so they rebuild against whatever
+## GameConfig now holds. Used after a DISCARD reloads the saved values.
+func _rebuild_settings_panels() -> void:
+	if _gameplay_panel != null:
+		_gameplay_panel.queue_free()
+		_gameplay_panel = null
+	if _controls_panel != null:
+		_controls_panel.queue_free()
+		_controls_panel = null
+	_options_panel.queue_free()
+	_options_panel = _build_options_panel()
+	_options_panel.visible = false
+	add_child(_options_panel)
+
+
+## Opens the latency calibrator over the main menu. Same component the pause
+## menu uses; Main is not paused, so nothing needs process-mode juggling.
+func _on_calibrate_audio() -> void:
+	if _options_panel != null:
+		_options_panel.visible = false
+	var cal: Node = load("res://scripts/AudioCalibrator.gd").new()
+	var reopen := func(_a: Variant = null) -> void:
+		if _options_panel != null:
+			_options_panel.visible = true
+			_focus_panel.call_deferred(_options_panel)
+	cal.calibration_complete.connect(reopen)
+	cal.calibration_cancelled.connect(reopen)
+	add_child(cal)
 
 func _on_show_gameplay() -> void:
 	_push_focus()
@@ -1048,6 +1222,8 @@ func _on_howtoplay_back() -> void:
 
 func _on_gameplay_reset() -> void:
 	GameConfig.reset_defaults()
+	GameConfig.apply_display_and_audio()
+	_mark_dirty()
 	# Rebuild panel so colour swatches reflect the new values
 	_gameplay_panel.queue_free()
 	_gameplay_panel = _build_gameplay_panel()
@@ -1080,7 +1256,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 	if not event.is_action_pressed("ui_cancel"):
 		return
-	if _howtoplay_panel != null and _howtoplay_panel.visible:
+	if _confirm_panel != null:
+		get_viewport().set_input_as_handled()
+		_dismiss_unsaved_prompt()
+	elif _howtoplay_panel != null and _howtoplay_panel.visible:
 		get_viewport().set_input_as_handled()
 		_on_howtoplay_back()
 	elif _controls_panel != null and _controls_panel.visible:

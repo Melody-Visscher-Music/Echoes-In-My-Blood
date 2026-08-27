@@ -88,12 +88,17 @@ var _judge_index: int = 0
 var _vis_start_idx: int = 0   # lower-bound cursor for visibility loop
 var _world_index: int = 0
 @warning_ignore("unused_private_class_variable")
-var _halo_preview_index: int = 0   # unused; kept to avoid parser errors on old references
 
 var _floor_material: StandardMaterial3D = null
 var _fell: bool = false
 
 # ── HUD / scoring state ───────────────────────────────────────────────────────
+## Combo values that pop a streak banner. Single source of truth: gate hits and
+## grind spark catches both test against this, and _show_streak_milestone()
+## colours against the same numbers. They were three separate literal lists and
+## had already drifted — only ×100 got a colour.
+const STREAK_MILESTONES: Array[int] = [10, 25, 50, 100, 200]
+
 var _score:      int   = 0
 var _combo:      int   = 0
 var _max_combo:  int   = 0   # highest combo reached this run
@@ -121,15 +126,27 @@ var _hud_rainbow_hue:  float     = 0.0   # phase along UiStyle's signature colou
 var _speed_streaks:     GPUParticles3D          = null
 var _speed_streaks_mat: ParticleProcessMaterial = null
 
-# Wall-jump score bonus — doubles the multiplier for a short window after a
-# successful wall-jump landing.  Decayed in _process; reset on section miss.
-var _wj_mult_timer: float = 0.0
-const _WJ_MULT_DURATION: float = 10.0    # seconds the bonus stays active
+# Wall-jump score bonus — doubles the multiplier while the player is CLIMBING.
+#
+# Bound to the climb, not to a clock: on at the first successful wall-jump
+# landing, off the instant the player reaches the top ledge (_wj_climb_top_z).
+# It used to be a flat 10 s timer started at the first landing, which almost
+# always outlived the climb itself — the ×2 was still ticking on the elevated
+# floor, all the way down the descent ramp, and into the ordinary gates after
+# it, so a bonus earned on wall jumps was being spent on normal notes.
+var _wj_mult_active: bool  = false
+## Cosmetic ONLY: eases the HUD label out after the climb ends. Never keeps the
+## multiplier alive — _score_multiplier() reads _wj_mult_active and nothing else.
+var _wj_mult_fade:   float = 0.0
+const _WJ_MULT_FADE_S: float = 0.35
+## Path distance of the top of the climb (= where the elevated floor begins).
+## Set by _spawn_wj_geometry_on_path; -1 when the level has no wall-jump section.
+var _wj_climb_top_z: float = -1.0
 
 # ── Death screen state ───────────────────────────────────────────────────────
 var _death_menu_active: bool = false
-var _death_menu_option: int  = 0          # 0 = RETRY, 1 = SONG SELECT
-var _death_option_nodes: Array[Control]   = []   # [retry_node, songselect_node]
+var _death_menu_option: int  = 0          # 0 = RETRY/NEW SEED, 1 = SONG SELECT, 2 = MAIN MENU
+var _death_option_nodes: Array[Control]   = []   # [retry, song_select, main_menu]
 
 # ── Level start — countdown before music begins ───────────────────────────────
 # All heavy setup (gates, decorations, city) happens in _ready(). We then wait
@@ -138,9 +155,9 @@ var _death_option_nodes: Array[Control]   = []   # [retry_node, songselect_node]
 var _level_started:   bool  = false
 var _countdown_timer: float = 0.0
 const _COUNTDOWN_DURATION: float = 1.5   # seconds of settle time before music starts
-var _countdown_label:  Label  = null       # big center number (3 / 2 / 1 / GO!)
+var _countdown_label:  Label  = null       # big center readout ("GET READY" then "GO!")
 var _countdown_title:  Label  = null       # song name shown during countdown
-var _beatmap_title:    String = ""         # parsed from JSON, shown in countdown
+var _beatmap_title:    String = ""         # beatmap key, underscores → spaces; shown in countdown
 var _warmup_done:      bool   = false      # set true once _warmup_shader_precompile() finishes;
 											# _start_level() will not fire until this is true
 
@@ -321,12 +338,20 @@ var _wj_zone_end_z:      float = -INF
 # Set by _spawn_wall_jump_section; used by _spawn_path_floors to skip only the
 # void rather than all segments past _floor_cutoff_dist.  -1 = no WJ section.
 var _wj_ground_resume_z: float = -1.0
-# Slide rail that replaces descent platforms — free-lateral movement while descending
-var _wj_slide_start_z:   float = -1.0   # path dist where slide begins
-var _wj_slide_end_z:     float = -1.0   # path dist where slide ends
-var _wj_slide_engaged:   bool  = false  # true while player is on the slide
-var _wj_slide_safe_lane: int   = -1     # lane index that is safe (not electrified)
-var _wj_shock_cd:        float = 0.0   # seconds until next shock is allowed
+# The single descent ramp back down to track level after a wall-jump climb.
+var _wj_slide_start_z:   float = -1.0   # path dist where the ramp begins
+var _wj_slide_end_z:     float = -1.0   # path dist where the ramp meets the ground
+var _wj_slide_engaged:   bool  = false  # true while the player is inside the ramp zone
+## Lane the single descent ramp sits in. Chosen per run from _runner_rng while the
+## plan is built (so the plan can place the next phrase's gates against it) and
+## read back by _spawn_wj_geometry_on_path when the ramp is actually spawned.
+##
+## This used to be three ramps — one per lane, one "safe" and two electrified —
+## with the safe one pinned to whichever outer lane the last wall jump threw you
+## at. So its position was never a choice and never a surprise. It is one ramp in
+## one randomly-chosen lane now: everything either side of it is open void, and
+## missing it means the drop, not a shock.
+var _wj_ramp_lane:       int   = -1
 
 # Ambient sky sparks — always drifting, pulses on beat
 var _spark_ambient:     GPUParticles3D          = null
@@ -490,8 +515,8 @@ const _GRIND_TRICK_IDS: Dictionary = {
 # Collision is ALWAYS procedural — authored pieces are visual replacements.
 ## Flip this if imported Blender corner pieces bend the wrong way.
 @export var mirror_turn_pieces: bool = false
-## Flip this if the authored WJ descent slide puts the safe lane on the wrong side.
-@export var mirror_wj_slide: bool = false
+# mirror_wj_slide removed: the descent is one lane-width ramp now, authored (or
+# generated) straight along +Z, so there is no safe-lane side to get backwards.
 var _piece_lib: TrackPieceLibrary = null
 var _authored_arcs: Dictionary = {}   # arc_idx -> true when an authored corner was placed
 var _piece_mat_seen: Dictionary = {}  # src material id -> unique dup (piece pulse lists)
@@ -754,8 +779,13 @@ func _process(delta: float) -> void:
 
 	# ── Countdown phase — wait for engine to settle before starting music ────
 	# (runs even if stream is null so the countdown can still fire and unblock input)
+	# The pause check has to come FIRST: this branch returns, so a _paused test
+	# further down never saw the countdown at all. Pausing on "GET READY" left the
+	# timer running, and _start_level() then fired — playing the music and handing
+	# input back — while the tree was still frozen.
 	if not _level_started:
-		_update_countdown(delta)
+		if not _paused:
+			_update_countdown(delta)
 		return
 
 	if music.stream == null:
@@ -772,11 +802,6 @@ func _process(delta: float) -> void:
 	if dt_pulse > 0.0:
 		_update_city_pulse(dt_pulse)
 		_update_electric_pulse(dt_pulse, t_s)
-
-	# Decay wall-jump bonus timer (runs through pause so the label fades naturally)
-	if _wj_mult_timer > 0.0:
-		_wj_mult_timer = maxf(0.0, _wj_mult_timer - delta)
-		_update_wj_bonus_label()
 
 	# Beat phase decays quickly (full fade in ~0.28 s) — drives beat-sync brightness spikes
 	_beat_phase = maxf(0.0, _beat_phase - delta * 3.6)
@@ -893,6 +918,9 @@ func _process(delta: float) -> void:
 	# gameplay judgement
 	_judge_passed_unhit_gates_by_position()
 
+	# Tell the character where the next gate wants him, so he looks at it.
+	_update_look_ahead()
+
 	# floor now reacts to BEATS
 	_run_floor_beats(t_s)
 
@@ -903,8 +931,12 @@ func _process(delta: float) -> void:
 	_update_grind_system(t_s)
 	# Charge tunnel — drop buildups (free-slide hoop threading → ×100 overdrive)
 	_update_charge_tunnel(t_s, delta)
-	# WJ descent slide — jump lock + shock on wrong lane
+	# WJ descent ramp — jump lock while the player is in the drop zone
 	_update_wj_slide(delta)
+	# WJ ×2 bonus — ends the moment the top of the climb is reached. Has to run
+	# here, after the path-tracking block above, so it tests a _player_path_dist
+	# that is current this frame rather than one frame stale.
+	_update_wj_bonus(delta)
 	_update_lyrics(t_s)
 
 	# Floor glow under each foot strike
@@ -939,12 +971,9 @@ func _spawn_countdown_ui() -> void:
 	root.add_child(bg)
 
 	# Song title
-	var title_text: String = _beatmap_title if _beatmap_title != "" else str(Run.current_song_key).strip_edges()
+	var title_text: String = _beatmap_title if _beatmap_title != "" 		else str(Run.current_song_key).strip_edges().replace("_", " ")
 	if title_text == "" or title_text == "null":
 		title_text = "GET READY"
-	# The fallback is the beatmap key, which is a filename — "echoes_in_my_blood"
-	# should not reach the player with its underscores still in it.
-	title_text = title_text.replace("_", " ")
 	_countdown_title = UiStyle.label(title_text.to_upper(), UiStyle.caption(6.0), int(20 * s), Color.WHITE)
 	_countdown_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_countdown_title.set_anchors_preset(Control.PRESET_CENTER)
@@ -1046,6 +1075,11 @@ func _setup_music() -> void:
 	elif song_stream != null:
 		music.stream = song_stream
 
+	# Song rides the Music bus, hit/miss feedback rides SFX — see
+	# audio/default_bus_layout.tres. Set here rather than in the .tscn so the
+	# routing is visible next to the code that owns the stream.
+	music.bus = "Music"
+
 	if music.stream == null:
 		push_warning("BeatRunner: no song found — set song_path in the beatmap JSON or assign song_stream in the Inspector.")
 
@@ -1055,8 +1089,9 @@ func _song_time() -> float:
 	var tplay: float = music.get_playback_position()
 	tplay += AudioServer.get_time_since_last_mix()
 	# NOTE: do NOT also subtract AudioServer.get_output_latency() here — the
-	# tap-test calibration in AudioCalibrator already measures the full
-	# round-trip latency (engine buffer + BT/hardware + reaction time), so
+	# two-pass calibration in AudioCalibrator already measures the full
+	# audio-vs-display latency (engine buffer + BT/hardware; the player's
+	# reaction time appears in both of its passes and cancels), so
 	# GameConfig's offset already cancels the engine buffer once. Subtracting
 	# it again here double-corrects and shifts gameplay by an extra helping
 	# of buffer latency on top of the calibrated value.
@@ -1104,13 +1139,11 @@ func _load_chart_and_build_plan() -> void:
 
 	var d: Dictionary = parsed as Dictionary
 
-	# Store the beatmap title for the countdown screen
-	var json_title: String = String(d.get("title", "")).strip_edges()
-	if json_title != "":
-		_beatmap_title = json_title
-	else:
-		# Fall back to the filename without extension
-		_beatmap_title = beatmap_json_path.get_file().get_basename()
+	# Countdown title. Always the beatmap KEY with underscores back to spaces —
+	# the same string SongSelect puts on the card, so one song has one name. The
+	# optional JSON "title" override is gone: no chart ever set it, and the audio
+	# filename fallback it hid behind produced a second, different name.
+	_beatmap_title = beatmap_json_path.get_file().get_basename().replace("_", " ")
 
 	var evs: Variant = d.get("events", [])
 	if evs is not Array:
@@ -1342,9 +1375,22 @@ func _build_runner_plan_from_beats(beat_events: Array[Dictionary]) -> Array[Dict
 			if wj_exit_lane >= 0 and (action == "jump" or action == "slide"):
 				action = "right" if virtual_lane < player.lane_xs.size() - 1 else "left"
 
-			# Snap first lane-change gate to slide landing lane
+			# Snap the first lane-change gate to the ramp's exit lane. The trick is
+			# to pick the direction that CLAMPS: "right" at the top lane (or "left"
+			# at lane 0) leaves virtual_lane where it is, so the arch sits exactly
+			# where the ramp put the player and the first gate after a wall jump
+			# asks for nothing.
+			#
+			# That only works from an outer lane. Now that the ramp can land in the
+			# middle, there is no clamping direction — either way is one real lane
+			# move — so leave the generated action alone and let it be an ordinary
+			# gate rather than forcing an arbitrary sidestep.
 			if not wj_gate_fixed and (action == "left" or action == "right"):
-				action = "right" if wj_exit_lane >= player.lane_xs.size() - 1 else "left"
+				var max_li: int = player.lane_xs.size() - 1
+				if wj_exit_lane >= max_li:
+					action = "right"
+				elif wj_exit_lane <= 0:
+					action = "left"
 				wj_gate_fixed = true
 
 			var pre_lane: int  = virtual_lane
@@ -1368,9 +1414,20 @@ func _build_runner_plan_from_beats(beat_events: Array[Dictionary]) -> Array[Dict
 				"phrase_index": pi,
 			})
 
-		# Record WJ exit lane for the following phrase using the LAST wall action's
-		# landing lane — not virtual_lane which may have been moved by padding actions.
-		wj_exit_lane = last_wj_act_lane if (stype == "wall_jump" and last_wj_act_lane >= 0) else -1
+		# Record WJ exit lane for the following phrase. The player leaves a wall-jump
+		# section at the bottom of the DESCENT RAMP, not at the wall they last
+		# bounced off — so the exit lane is the ramp's lane. Roll it here, while the
+		# plan is still being built, because the next phrase's first gate is placed
+		# against it; _spawn_wj_geometry_on_path reads the same value back later so
+		# the geometry and the chart agree.
+		if stype == "wall_jump" and last_wj_act_lane >= 0:
+			_wj_ramp_lane = _runner_rng.randi_range(0, player.lane_xs.size() - 1)
+			wj_exit_lane  = _wj_ramp_lane
+			# Leave the exit lane where the wall dropped them if virtual_lane has to
+			# stay consistent for the padding logic above.
+			virtual_lane  = _wj_ramp_lane
+		else:
+			wj_exit_lane = -1
 
 	return out
 
@@ -4964,6 +5021,10 @@ func _spawn_wj_geometry_on_path() -> void:
 	var elev_start_z: float = active_zs[active_zs.size() - 1] + ledge_half_z
 	var elev_height:  float = cum_heights[active_zs.size() - 1]
 	var elev_length:  float = 18.0
+
+	# Top of the climb: the last ledge is behind the player once they are standing
+	# here, so this is where the wall jumps are over and the ×2 bonus ends.
+	_wj_climb_top_z = elev_start_z
 	# _spawn_floor_segment is path-aware when _track_segs is populated. With a kit present the
 	# kit supplies the VISIBLE elevated floor (ElevFloor) — we still need a collision body to
 	# stand on, so the procedural floor spawns collision-only (no mesh) to avoid z-fighting.
@@ -4982,12 +5043,15 @@ func _spawn_wj_geometry_on_path() -> void:
 				Vector3(0.07, 0.07, elev_length),
 				Color(0.85, 0.45, 1.00, 1.0).lightened(0.20)))
 
-	# ── 7. Descent slide rail ────────────────────────────────────────────────
-	# One inclined ramp per lane: collision covers each lane position separately
-	# so lane-switching works normally.  The player lands on the lane matching the
-	# last wall-jump act, then switches lanes as they descend.  Jumping is locked
-	# by _update_wj_slide() → player.set_jump_locked(true) for the zone duration.
-	var slide_start_z: float = elev_start_z + elev_length + 1.5
+	# ── 7. Descent ramp ──────────────────────────────────────────────────────
+	# ONE ramp, in one lane, chosen at random per run (_wj_ramp_lane, rolled while
+	# the chart was built). Either side of it is open void — the elevated floor
+	# ends here and the ground floor does not resume until slide_end_z — so the
+	# ramp is the only way down, and missing it is a fall rather than a shock.
+	#
+	# Jumping stays locked for the whole zone (_update_wj_slide →
+	# player.set_jump_locked), so the ramp cannot be hopped over from the top.
+	var slide_start_z: float = elev_start_z + elev_length
 	var slide_h:       float = elev_height
 	var slide_run:     float = clampf(slide_h * 3.2, 24.0, 52.0)
 	var slide_diag:    float = sqrt(slide_h * slide_h + slide_run * slide_run)
@@ -4996,145 +5060,143 @@ func _spawn_wj_geometry_on_path() -> void:
 	_wj_slide_start_z = slide_start_z
 	_wj_slide_end_z   = slide_end_z
 
-	var last_wj_act:  String = active_acts[active_acts.size() - 1]
-	var land_lane_idx: int   = max_lane_idx if last_wj_act == "wall_left" else 0
-	var land_x:        float = player.lane_xs[land_lane_idx]
-
-	_wj_slide_safe_lane = land_lane_idx
+	# Fall back to the wall-landing lane if the plan never rolled one (a WJ zone
+	# spawned without a wall_jump phrase, e.g. a hand-authored chart).
+	var last_wj_act:   String = active_acts[active_acts.size() - 1]
+	var land_lane_idx: int    = max_lane_idx if last_wj_act == "wall_left" else 0
+	var ramp_lane: int = _wj_ramp_lane if _wj_ramp_lane >= 0 else land_lane_idx
+	ramp_lane = clampi(ramp_lane, 0, max_lane_idx)
+	_wj_ramp_lane = ramp_lane
+	var ramp_x: float = player.lane_xs[ramp_lane]
 
 	var ramp_cz: float = slide_start_z + slide_run * 0.5
 	var ramp_ch: float = slide_h * 0.5
 	# Positive X pitch: local +Z tilts toward -Y (down) — exit end is lower. ✓
 	var slide_pitch: float = atan2(slide_h, slide_run)
 
-	var safe_color   := Color(0.15, 0.90, 1.00)   # cyan — safe lane
-	var danger_color := Color(1.00, 0.75, 0.05)   # electric yellow — danger lanes
+	var ramp_color := Color(0.15, 0.90, 1.00)   # cyan — the one way down
+	var edge_color := Color(1.00, 0.35, 0.85)   # magenta — the drop either side
 
-	# ── Authored WJ descent slide (Blender "wj_slide") ────────────────────────
-	# One piece covers strips + rails + beacon. It is authored at a reference
-	# height/run (siag metadata) and stretched to THIS climb's exact drop and
-	# run; the safe lane is authored on the Blender LEFT lane, so the piece is
-	# mirrored when the run lands on lane 0. Collision, the jump lock and the
-	# wrong-lane shock logic are untouched either way — only visuals swap.
+	# Wider than a lane strip used to be: it is the only landing surface now, and
+	# the player may be arriving from two lanes over.
+	var ramp_w: float = 2.9
+
+	# ── 7a. Deck ─────────────────────────────────────────────────────────────
+	var ramp_body := StaticBody3D.new()
+	ramp_body.position = _path_world_pos(ramp_cz, ramp_x, ramp_ch)
+	ramp_body.rotation = Vector3(slide_pitch, deg_to_rad(_path_y_rot_at(ramp_cz)), 0.0)
+	gates_root.add_child(ramp_body)
+
+	var ramp_col := CollisionShape3D.new()
+	var ramp_box := BoxShape3D.new()
+	ramp_box.size = Vector3(ramp_w, 0.28, slide_diag)
+	ramp_col.shape = ramp_box
+	ramp_body.add_child(ramp_col)
+
+	# Authored piece hook. A future Blender "wj_slide" is now a SINGLE-lane ramp
+	# authored along +Z, so it needs no mirroring — the old piece was a
+	# three-lane slab with its safe lane baked to one side.
 	var slide_entry: Dictionary = (_piece_lib.first_of("wj_slide") if _piece_lib != null else {})
-	var slide_authored: bool = not slide_entry.is_empty()
-
-	# One narrow ramp per lane — collision (always) + procedural glow strip
-	# (only when no authored slide exists).
-	var lane_strip_w: float = 2.0
-	for li in range(player.lane_xs.size()):
-		var lx:      float = player.lane_xs[li]
-		var is_safe: bool  = (li == land_lane_idx)
-		var col:     Color = safe_color if is_safe else danger_color
-
-		var lane_ramp := StaticBody3D.new()
-		lane_ramp.position = _path_world_pos(ramp_cz, lx, ramp_ch)
-		lane_ramp.rotation = Vector3(slide_pitch, deg_to_rad(_path_y_rot_at(ramp_cz)), 0.0)
-		gates_root.add_child(lane_ramp)
-
-		var lrc := CollisionShape3D.new()
-		var lrb := BoxShape3D.new()
-		lrb.size = Vector3(lane_strip_w, 0.28, slide_diag)
-		lrc.shape = lrb
-		lane_ramp.add_child(lrc)
-
-		if slide_authored:
-			continue   # authored piece supplies every visual for this lane
-
-		# Glow strip on top
-		var strip    := MeshInstance3D.new()
-		var strip_bm := BoxMesh.new()
-		strip_bm.size = Vector3(lane_strip_w, 0.06, slide_diag)
-		strip.mesh    = strip_bm
-		strip.position.y = 0.17
-		var smat := StandardMaterial3D.new()
-		smat.albedo_color               = Color.WHITE
-		smat.emission_enabled           = true
-		smat.emission                   = col
-		smat.emission_energy_multiplier = 2.4 if is_safe else 3.2
-		strip.material_override = smat
-		lane_ramp.add_child(strip)
-
-		# Dangerous lanes: crackle tween for electric flicker
-		if not is_safe:
-			# Same ~0.45 scaling as the arcs: the flicker pattern is untouched,
-			# only its ceiling. A peak of 8.6 still sits an order of magnitude
-			# above ordinary track neon, so a dangerous lane stays unmistakably
-			# hot — which matters, because this is a gameplay readability cue.
-			var zap_e: Array[float] = [
-				3.6, 1.1, 7.2, 1.6, 5.0, 0.8, 6.3, 2.3, 8.1, 0.9,
-				4.3, 1.8, 5.9, 0.7, 3.2, 7.7, 1.4, 4.7, 1.0, 6.8,
-				2.0, 5.4, 0.7, 3.8, 8.6, 1.4, 2.9, 6.5, 1.3, 5.2
-			]
-			var zap_t: Array[float] = [
-				0.04, 0.09, 0.018, 0.07, 0.035, 0.10, 0.022, 0.06, 0.012, 0.08,
-				0.03, 0.065, 0.025, 0.095, 0.05, 0.015, 0.075, 0.032, 0.085, 0.020,
-				0.058, 0.028, 0.092, 0.042, 0.013, 0.078, 0.055, 0.021, 0.088, 0.038
-			]
-			var ztw := lane_ramp.create_tween().set_loops()
-			for zi in range(zap_e.size()):
-				ztw.tween_property(smat, "emission_energy_multiplier", zap_e[zi], zap_t[zi])
-
-	if slide_authored:
+	if not slide_entry.is_empty():
 		var auth_h:   float = maxf(0.1, float(slide_entry.params.get("height", 5.0)))
 		var auth_run: float = maxf(0.1, float(slide_entry.params.get("run",  34.0)))
 		var s_anchor := Node3D.new()
-		s_anchor.position           = _path_world_pos(slide_start_z, 0.0, elev_height)
+		s_anchor.position           = _path_world_pos(slide_start_z, ramp_x, elev_height)
 		s_anchor.rotation_degrees.y = _path_y_rot_at(ramp_cz)
-		# Blender-left arrives world-right after the import yaw → mirror when
-		# the landing lane is lane 0. mirror_wj_slide flips it if a piece was
-		# authored the other way round.
-		var mirror: bool = (land_lane_idx == 0) != mirror_wj_slide
-		s_anchor.scale = Vector3(-1.0 if mirror else 1.0,
-			slide_h / auth_h, slide_run / auth_run)
+		s_anchor.scale = Vector3(1.0, slide_h / auth_h, slide_run / auth_run)
 		gates_root.add_child(s_anchor)
 		var s_inst: Node3D = _piece_lib.instance(slide_entry)
 		s_inst.rotation_degrees.y = 180.0
 		s_anchor.add_child(s_inst)
-		_register_track_emissives(s_inst)   # beat-pulse her emissive parts
+		_register_track_emissives(s_inst)
 	else:
-		# Outer edge rails — share the ramp pitch via a Node3D pivot
-		for side in [-1, 1]:
-			var outer_li:  int   = max_lane_idx if side > 0 else 0
-			var outer_lx:  float = player.lane_xs[outer_li]
-			var rpivot := Node3D.new()
-			rpivot.position = _path_world_pos(ramp_cz, outer_lx, ramp_ch)
-			rpivot.rotation = Vector3(slide_pitch, deg_to_rad(_path_y_rot_at(ramp_cz)), 0.0)
-			gates_root.add_child(rpivot)
+		# Deck surface — a dark panel, so the bright trim below reads against it
+		# instead of glowing into an already-glowing slab.
+		var deck := _make_box_mesh(Vector3(ramp_w, 0.10, slide_diag),
+			Color(0.10, 0.13, 0.20), NeonMat.PANEL, 0.35)
+		deck.position.y = 0.16
+		ramp_body.add_child(deck)
 
-			var rail    := MeshInstance3D.new()
-			var rail_bm := BoxMesh.new()
-			rail_bm.size = Vector3(0.10, 0.30, slide_diag)
-			rail.mesh    = rail_bm
-			rail.position = Vector3(float(side) * (lane_strip_w * 0.5 + 0.05), 0.28, 0.0)
-			var rrmat := StandardMaterial3D.new()
-			rrmat.albedo_color               = Color.WHITE
-			rrmat.emission_enabled           = true
-			rrmat.emission                   = safe_color.lightened(0.30)
-			rrmat.emission_energy_multiplier = 7.0
-			rail.material_override = rrmat
-			rpivot.add_child(rail)
+		# Edge trim — two hot tubes running the full diagonal. This is the
+		# strongest read on where the ramp is from the top of the climb.
+		for side: float in [-1.0, 1.0]:
+			var trim := _make_box_mesh(Vector3(0.13, 0.13, slide_diag), ramp_color, NeonMat.TUBE, 6.5)
+			trim.position = Vector3(side * (ramp_w * 0.5), 0.22, 0.0)
+			ramp_body.add_child(trim)
 
-		# Entry beacon — cyan sphere marking the safe entry point
-		var beacon    := MeshInstance3D.new()
-		var beacon_bm := SphereMesh.new()
-		beacon_bm.radius = 0.35; beacon_bm.height = 0.70
-		beacon.mesh = beacon_bm
-		var bmat := StandardMaterial3D.new()
-		bmat.albedo_color               = Color.WHITE
-		bmat.emission_enabled           = true
-		bmat.emission                   = safe_color
-		bmat.emission_energy_multiplier = 14.0
-		beacon.material_override = bmat
-		beacon.position = _path_world_pos(slide_start_z, land_x, elev_height + 0.6)
-		gates_root.add_child(beacon)
+			# Hand rail on posts above the trim — gives the ramp thickness so it
+			# does not read as a flat decal painted on the void.
+			var hrail := _make_box_mesh(Vector3(0.08, 0.08, slide_diag),
+				ramp_color.lightened(0.35), NeonMat.TUBE, 4.5)
+			hrail.position = Vector3(side * (ramp_w * 0.5), 0.86, 0.0)
+			ramp_body.add_child(hrail)
+			var post_n: int = maxi(3, int(slide_diag / 6.0))
+			for pi2 in range(post_n + 1):
+				var pz: float = -slide_diag * 0.5 + slide_diag * (float(pi2) / float(post_n))
+				var post := _make_box_mesh(Vector3(0.06, 0.70, 0.06),
+					ramp_color.darkened(0.15), NeonMat.TUBE, 3.0)
+				post.position = Vector3(side * (ramp_w * 0.5), 0.52, pz)
+				ramp_body.add_child(post)
 
-	var slide_light := OmniLight3D.new()
-	slide_light.light_color  = safe_color
-	slide_light.light_energy = 2.5
-	slide_light.omni_range   = 18.0
-	slide_light.position     = _path_world_pos(ramp_cz, land_x, slide_h * 0.60)
-	gates_root.add_child(slide_light)
+		# Chevrons down the deck, pointing the way down. Evenly spaced so they
+		# strobe past at a constant rate and sell the speed of the drop.
+		var chev_n: int = maxi(4, int(slide_diag / 3.4))
+		for ci in range(chev_n):
+			var f: float  = float(ci) / float(chev_n)
+			var cz: float = -slide_diag * 0.5 + slide_diag * (f + 0.5 / float(chev_n))
+			# Brighter toward the bottom, so the eye is pulled down the ramp.
+			var ce: float = lerpf(2.2, 5.6, f)
+			for arm: float in [-1.0, 1.0]:
+				var chev := _make_box_mesh(Vector3(ramp_w * 0.52, 0.05, 0.16),
+					ramp_color.lightened(0.20), NeonMat.TUBE, ce)
+				chev.position = Vector3(arm * ramp_w * 0.24, 0.22, cz)
+				chev.rotation_degrees.y = 26.0 * arm
+				ramp_body.add_child(chev)
+
+	# ── 7b. Entry portal ─────────────────────────────────────────────────────
+	# The ramp mouth gets the same arch the gates use, so "go through here" reads
+	# in a language the player already knows — and it is visible from the top of
+	# the climb, which is the whole point of letting the ramp move around.
+	var portal := Node3D.new()
+	portal.position           = _path_world_pos(slide_start_z + 0.4, 0.0, elev_height)
+	portal.rotation_degrees.y = _path_y_rot_at(slide_start_z)
+	gates_root.add_child(portal)
+	_make_gate_arch(portal, ramp_x, ramp_w + 0.5, 0.0, 3.0, ramp_color)
+	_make_approach_marks(portal, ramp_x, ramp_w, ramp_color)
+
+	# ── 7c. Void edges ───────────────────────────────────────────────────────
+	# Where the elevated floor stops, a magenta lip marks the drop on either side
+	# of the ramp mouth — the ramp says "here", these say "not here".
+	for side: float in [-1.0, 1.0]:
+		var lip_x: float = ramp_x + side * (ramp_w * 0.5 + 0.35)
+		var out_x: float = (tw * 0.5) * side
+		if absf(out_x - lip_x) < 0.6:
+			continue   # ramp is hard against the track edge — no room for a lip
+		var lip_w: float = absf(out_x - lip_x)
+		var lip := _make_box_mesh(Vector3(lip_w, 0.14, 0.45), edge_color, NeonMat.TUBE, 5.0)
+		lip.position           = _path_world_pos(slide_start_z, (lip_x + out_x) * 0.5, elev_height + 0.07)
+		lip.rotation_degrees.y = _path_y_rot_at(slide_start_z)
+		gates_root.add_child(lip)
+
+	# ── 7d. Landing flare ────────────────────────────────────────────────────
+	# A lit pad where the ramp meets the ground, so the bottom of the drop has a
+	# target instead of just stopping.
+	var pad := _make_box_mesh(Vector3(ramp_w + 1.2, 0.08, 3.0), ramp_color, NeonMat.PANEL, 3.4)
+	pad.position           = _path_world_pos(slide_end_z + 1.4, ramp_x, 0.06)
+	pad.rotation_degrees.y = _path_y_rot_at(slide_end_z)
+	gates_root.add_child(pad)
+
+	# ── 7e. Lights ───────────────────────────────────────────────────────────
+	for lit: Array in [[slide_start_z, elev_height + 1.2, 3.2, 16.0],
+					   [ramp_cz,       slide_h * 0.55,    2.4, 20.0],
+					   [slide_end_z,   1.2,               2.8, 16.0]]:
+		var rl := OmniLight3D.new()
+		rl.light_color  = ramp_color
+		rl.light_energy = float(lit[2])
+		rl.omni_range   = float(lit[3])
+		rl.position     = _path_world_pos(float(lit[0]), ramp_x, float(lit[1]))
+		gates_root.add_child(rl)
+
 
 	# ── 8. Gate culling for WJ section ───────────────────────────────────────
 	var first_wj_z:    float = active_zs[0]
@@ -5322,7 +5384,7 @@ func _judge_passed_unhit_gates_by_position() -> void:
 				gate_success[i] = true
 				_mark_gate_result(i, true)
 				# First successful wall-jump landing activates the score bonus
-				if _wj_mult_timer <= 0.0:
+				if not _wj_mult_active:
 					_activate_wj_bonus()
 				continue
 			if player_z > gate_z + 18.0:        # well past — never landed
@@ -5407,7 +5469,7 @@ func _build_miss_sfx() -> void:
 	_sfx_miss = AudioStreamPlayer.new()
 	_sfx_miss.stream    = wav
 	_sfx_miss.volume_db = -5.0
-	_sfx_miss.bus       = "Master"
+	_sfx_miss.bus       = "SFX"
 	add_child(_sfx_miss)
 
 
@@ -5421,11 +5483,21 @@ func _check_near_miss(idx: int, entry: Dictionary, action: String) -> void:
 
 	match action:
 		"left", "right":
-			# Near if player is in the adjacent lane to the target
-			var safe_lane: int = int(entry.get("safe_lane", 1))
+			# Near if player is in the adjacent lane to the target.
+			# Key is "post_lane" — the plan builder never writes "safe_lane", so the
+			# old lookup silently fell back to 1 and measured every lane gate against
+			# the centre lane. And the comparison is against the TRACK-RELATIVE
+			# lateral, not world X: past the first 90° turn, X has nothing to do with
+			# which lane the player is in.
+			var safe_lane: int   = int(entry.get("post_lane", 1))
 			var target_x:  float = player.lane_xs[clamp(safe_lane, 0, player.lane_xs.size() - 1)]
 			var lane_gap:  float = 2.4   # spacing between lanes
-			is_near = abs(player.global_position.x - target_x) < lane_gap * 1.8
+			var cur_lat:   float = 0.0
+			if not _track_segs.is_empty():
+				var cs: TrackSeg = _track_segs[_last_seg_idx] as TrackSeg
+				var seg_ctr: Vector3 = cs.origin + cs.direction * (_player_path_dist - cs.path_start)
+				cur_lat = (player.global_position - seg_ctr).dot(cs.right)
+			is_near = abs(cur_lat - target_x) < lane_gap * 1.8
 		"jump":
 			# Near if the player made any upward movement (was at least trying to jump)
 			is_near = player.velocity.y > 1.0 or not player.is_on_floor()
@@ -5710,38 +5782,24 @@ func _gap_curve_x(pd: float) -> float:
 	return sin((pd - _charge_seg_start_pd) * _CHARGE_WEAVE_FREQ) * _CHARGE_WEAVE_AMP
 
 
-## Manages the post-WJ descent slide each frame.
-## - Locks / unlocks jumping (player can't escape the slide early).
-## - Detects wrong-lane contact: if the player steps onto an electrified rail,
-##   they get shocked (combo break + health hit + screen flash), once per 1.5 s.
-func _update_wj_slide(delta: float) -> void:
+## Manages the post-WJ descent each frame — which is now just the jump lock.
+##
+## There used to be a wrong-lane shock here (combo break + 8 % health + flash,
+## once per 1.5 s) because the descent was three ramps with two of them
+## electrified. It is a single ramp over open void now, so there is no wrong
+## lane left to stand on: miss the ramp and you fall, which the y < -12 check in
+## _process turns into a normal death. Nothing to police per-frame.
+func _update_wj_slide(_delta: float) -> void:
 	if _wj_slide_start_z < 0.0 or player == null:
 		return
 
 	var pz: float = _player_path_dist
 	var should_slide: bool = pz >= _wj_slide_start_z and pz < _wj_slide_end_z + 4.0
 
-	if should_slide != _wj_slide_engaged:
-		_wj_slide_engaged = should_slide
-		player.set_jump_locked(should_slide)
-		if not should_slide:
-			_wj_shock_cd = 0.0   # reset so next slide starts fresh
-
-	if not _wj_slide_engaged or _wj_slide_safe_lane < 0:
+	if should_slide == _wj_slide_engaged:
 		return
-
-	# Shock cooldown
-	_wj_shock_cd = maxf(0.0, _wj_shock_cd - delta)
-
-	# Check if player is on an electrified lane
-	if player.current_lane != _wj_slide_safe_lane and _wj_shock_cd <= 0.0:
-		_wj_shock_cd = 1.5   # 1.5 s before next shock
-		_combo = 0
-		_health_pct = clampf(_health_pct - 0.08, 0.0, 1.0)
-		_update_hud_score()
-		_update_hud_health()
-		_hud_flash_color(Color(1.00, 0.85, 0.10, 0.30), 0.35)   # electric yellow flash
-		_shake_camera()
+	_wj_slide_engaged = should_slide
+	player.set_jump_locked(should_slide)
 
 
 func _update_charge_tunnel(t_s: float, delta: float) -> void:
@@ -6441,8 +6499,7 @@ func _catch_spark(idx: int) -> void:
 		_hud.combo_flash(Color(1.5, 1.5, 0.3, 1.0), 0.05, 0.12)
 
 	# Milestone check (re-uses the same streak system)
-	const _GRIND_MILESTONES: Array[int] = [10, 25, 50, 100, 200]
-	if _combo in _GRIND_MILESTONES:
+	if _combo in STREAK_MILESTONES:
 		_show_streak_milestone(_combo)
 
 	_update_grind_hud()
@@ -6503,24 +6560,45 @@ func _score_multiplier() -> int:
 		return _CHARGE_MULT_VALUE
 	# Every 10 combo = +1 multiplier, capped at ×20 (reached at combo 190)
 	var base: int = mini(int(_combo * 0.1) + 1, 20)
-	# Wall-jump bonus: doubles the multiplier while the timer is running
-	if _wj_mult_timer > 0.0:
+	# Wall-jump bonus: doubles the multiplier for as long as the player is on the
+	# climb. Reads the flag, never the fade — the label outlives the bonus by a
+	# third of a second, the bonus itself does not.
+	if _wj_mult_active:
 		base *= 2
 	return base
+
+
+## Ends the ×2 the frame the player reaches the top of the climb, then eases the
+## HUD label out. Called from _process after path tracking, so _player_path_dist
+## is this frame's value.
+func _update_wj_bonus(delta: float) -> void:
+	if _wj_mult_active:
+		if _wj_climb_top_z >= 0.0 and _player_path_dist >= _wj_climb_top_z:
+			_wj_mult_active = false
+			_wj_mult_fade   = _WJ_MULT_FADE_S
+			# Push the score card immediately so the multiplier readout drops back
+			# to the combo value on the same frame the bonus ends, rather than
+			# waiting for the next gate to refresh it.
+			_update_hud_score()
+	elif _wj_mult_fade > 0.0:
+		_wj_mult_fade = maxf(0.0, _wj_mult_fade - delta)
+	_update_wj_bonus_label()
 
 
 func _update_wj_bonus_label() -> void:
 	if _hud == null:
 		return
-	if _wj_mult_timer <= 0.0:
+	if _wj_mult_active:
+		_hud.set_wall_jump(true, 1.0)
+	elif _wj_mult_fade > 0.0:
+		_hud.set_wall_jump(true, clampf(_wj_mult_fade / _WJ_MULT_FADE_S, 0.0, 1.0))
+	else:
 		_hud.set_wall_jump(false)
-		return
-	# Fade out gracefully over the last 2 seconds.
-	_hud.set_wall_jump(true, clampf(_wj_mult_timer / 2.0, 0.0, 1.0))
 
 
 func _activate_wj_bonus() -> void:
-	_wj_mult_timer = _WJ_MULT_DURATION
+	_wj_mult_active = true
+	_wj_mult_fade   = 0.0
 	if _hud != null:
 		_hud.set_wall_jump(true, 1.0)
 	# Gold screen flash to signal the bonus
@@ -6700,8 +6778,7 @@ func _on_gate_scored(success: bool) -> void:
 		if _hud != null and _combo >= 2:
 			_hud.combo_flash(Color(1.5, 1.3, 0.4, 1.0), 0.05, 0.14)
 		# Streak milestones
-		const MILESTONES: Array[int] = [10, 25, 50, 100, 200]
-		if _combo in MILESTONES:
+		if _combo in STREAK_MILESTONES:
 			_show_streak_milestone(_combo)
 	else:
 		# OVERDRIVE safe window: a miss does NOT drop the multiplier (combo preserved) and
@@ -6733,14 +6810,32 @@ func _show_streak_milestone(combo: int) -> void:
 		return
 	# Milestone colours pulled onto the shared palette so a streak banner reads
 	# as part of the same kit as the rest of the HUD.
+	# These cases MUST match STREAK_MILESTONES — they used to read 15/30/75/100
+	# against milestones that fire at 10/25/50/100/200, so every banner except
+	# ×100 came out plain white.
 	var col: Color
 	match combo:
-		15:  col = UiStyle.GOLD
-		30:  col = UiStyle.CYAN
-		75:  col = UiStyle.VIOLET
+		10:  col = UiStyle.GOLD
+		25:  col = UiStyle.CYAN
+		50:  col = UiStyle.VIOLET
 		100: col = Color(1.00, 0.40, 0.20)   # orange
 		_:   col = Color.WHITE               # 200+
 	_hud.show_callout("★  ×%d  STREAK  ★" % combo, col, 0.65)
+
+
+## Picks a seed this song has never served before and records it, so a route is
+## never repeated. Shared by the out-of-lives death path and pause > RESTART —
+## they used to disagree, and only one of them logged the seed it handed out.
+func _roll_fresh_seed() -> void:
+	_runner_rng.randomize()
+	# Bounded so an exhausted seed log can never spin the game — after this many
+	# tries, take whatever came up rather than hanging on the death screen.
+	var tries: int = 0
+	while Save.is_seed_used(Run.current_song_key, _runner_rng.seed) and tries < 64:
+		_runner_rng.randomize()
+		tries += 1
+	Run.run_seed = _runner_rng.seed
+	Save.mark_seed_used(Run.current_song_key, Run.run_seed)
 
 
 func _trigger_death() -> void:
@@ -6756,12 +6851,8 @@ func _trigger_death() -> void:
 	var lives_exhausted: bool = (Run.song_lives <= 0)
 	if lives_exhausted:
 		# All tries used — roll a fresh seed (never-before-seen) and refill lives
-		_runner_rng.randomize()
-		while Save.is_seed_used(Run.current_song_key, _runner_rng.seed):
-			_runner_rng.randomize()
-		Run.run_seed   = _runner_rng.seed
+		_roll_fresh_seed()
 		Run.song_lives = GameConfig.lives_per_song
-		Save.mark_seed_used(Run.current_song_key, Run.run_seed)
 	_sync_hud_lives()
 
 	# Big red death flash
@@ -7895,8 +7986,11 @@ func _pause_confirm() -> void:
 			Run.song_lives -= 1
 			var exhausted: bool = (Run.song_lives <= 0)
 			if exhausted:
-				_runner_rng.randomize()
-				Run.run_seed   = _runner_rng.seed
+				# Same rules as dying out of lives (_trigger_death): roll until we
+				# find a seed this song has never served, then record it. Restart
+				# used to just randomize(), so it could hand back a layout already
+				# played and never logged the new one either.
+				_roll_fresh_seed()
 				Run.song_lives = GameConfig.lives_per_song
 			get_tree().reload_current_scene()
 		2:  # Main Menu
@@ -7934,7 +8028,11 @@ func _resume_game() -> void:
 	get_tree().paused   = false                       # unfreeze everything
 	_paused = false
 	music.stream_paused = false
-	player.set_physics_process(true)
+	# Only hand physics back if the level is actually running. Pausing during the
+	# countdown and resuming used to switch physics on regardless, so the runner
+	# started moving (forward_speed is applied whether or not input is enabled)
+	# before the music had started — desyncing the whole chart.
+	player.set_physics_process(_level_started)
 	player.set_process(true)
 
 	if _pause_root != null:
@@ -8068,71 +8166,18 @@ func _run_world_events(t_s: float) -> void:
 		_world_index += 1
 
 
-## Returns outline points (Vector2, XY plane) for the requested shape at the given radius.
-## Handles: triangle, square, pentagon, hexagon, star, diamond, cross, heart.
-## (circle is handled separately as a TorusMesh — not routed through here.)
-func _get_shape_points(shape_id: String, radius: float) -> Array:
-	var pts: Array = []
-	match shape_id:
-		"triangle":
-			for i in 3:
-				var a: float = (i / 3.0) * TAU - PI * 0.5
-				pts.append(Vector2(cos(a), sin(a)) * radius)
-		"square":
-			for i in 4:
-				var a: float = (i / 4.0) * TAU + PI * 0.25
-				pts.append(Vector2(cos(a), sin(a)) * radius)
-		"pentagon":
-			for i in 5:
-				var a: float = (i / 5.0) * TAU - PI * 0.5
-				pts.append(Vector2(cos(a), sin(a)) * radius)
-		"hexagon":
-			for i in 6:
-				var a: float = (i / 6.0) * TAU
-				pts.append(Vector2(cos(a), sin(a)) * radius)
-		"diamond":
-			for i in 4:
-				var a: float = (i / 4.0) * TAU
-				pts.append(Vector2(cos(a), sin(a)) * radius)
-		"cross":
-			var w: float = radius * 0.28
-			var l: float = radius
-			pts = [
-				Vector2(-w, -l), Vector2( w, -l),
-				Vector2( w, -w), Vector2( l, -w),
-				Vector2( l,  w), Vector2( w,  w),
-				Vector2( w,  l), Vector2(-w,  l),
-				Vector2(-w,  w), Vector2(-l,  w),
-				Vector2(-l, -w), Vector2(-w, -w),
-			]
-		"heart":
-			var steps: int = 32
-			for i in steps:
-				var t: float = (i / float(steps)) * TAU
-				var x: float = 16.0 * pow(sin(t), 3.0)
-				var y: float = -(13.0 * cos(t) - 5.0 * cos(2.0*t) - 2.0 * cos(3.0*t) - cos(4.0*t))
-				pts.append(Vector2(x, y) * (radius / 16.0))
-		_:  # "star" and any unknown value
-			for i in 10:
-				var a: float = (i / 10.0) * TAU - PI * 0.5
-				var r: float = radius if i % 2 == 0 else radius * 0.42
-				pts.append(Vector2(cos(a), sin(a)) * r)
-	return pts
-
-
-## Builds the pooled world-FX system. Halo shape and radius come from GameConfig
+## Builds the pooled world-FX system. Halo radius comes from GameConfig
 ## and cannot change mid-run, so the ring geometry is baked into the pool here
 ## instead of being rebuilt on every melody event. Wisp count per side and
 ## whether spires run at all are quality-tier knobs — see GraphicsQuality.PRESETS.
 func _build_fx_pool() -> void:
-	var shape_id: String = GameConfig.halo_shape
 	var radius:   float  = GameConfig.halo_size
 	var tube_r:   float  = clampf(radius * 0.1, 0.1, 0.1)
-	# Circles are a TorusMesh built inside the pool; every other shape is an
-	# outline traced through these points.
-	var shape_pts: Array = [] if shape_id == "circle" else _get_shape_points(shape_id, radius)
+	# Halos are circles only — the eight polygon/star/heart variants were never
+	# finished, so the picker and the point-tracing path are both gone. An empty
+	# point list tells the pool to build its TorusMesh.
 	_fx_pool = WorldFxPool.new()
-	_fx_pool.setup(world_fx_root, _fx_tween_host, shape_pts, radius, tube_r,
+	_fx_pool.setup(world_fx_root, _fx_tween_host, [], radius, tube_r,
 		GameConfig.halo_dual_color,
 		int(GraphicsQuality.get_setting("world_fx_wisps", 5)),
 		bool(GraphicsQuality.get_setting("world_fx_spires", true)))
@@ -8377,6 +8422,10 @@ func _pulse_floor_beat(t_s: float) -> void:
 	# Snap beat phase to 1 — decays in _process to drive per-frame brightness spikes
 	_beat_phase   = 1.0
 	_beat_cam_t   = 1.0   # camera FOV pulse
+	# The character punctuates the beat too, rather than free-running on its own
+	# clock while the whole rest of the world pulses with the song.
+	if player != null:
+		player.pulse_beat()
 
 	var vit: float = _world_vitality
 	var pulse_color: Color = Color(1.0, 1.0, 1.0, 1.0)
@@ -8694,6 +8743,41 @@ func _update_gate_visibility() -> void:
 		gate.visible = should_show
 
 
+## Feeds the character the lateral offset of the next gate he still has to deal
+## with, normalised to -1..1, so his head turns toward what is coming.
+##
+## Meeko reading the track ahead is the one trait the whole character is built
+## on, and the authored clips physically cannot express it — head, neck and chest
+## have no keyframes in any of the three. This is the input that makes it happen.
+## Only lane gates steer the look; a jump or slide is straight ahead.
+func _update_look_ahead() -> void:
+	if player == null:
+		return
+	var pd:  float = _player_path_dist
+	var max_lane_abs: float = absf(player.lane_xs[player.lane_xs.size() - 1])
+	var look: float = 0.0
+	for i in range(_judge_index, gate_nodes.size()):
+		if i >= gate_judged.size():
+			break
+		if gate_judged[i]:
+			continue
+		var dz: float = gate_world_zs[i] - pd
+		if dz < 0.0:
+			continue
+		if dz > 55.0:
+			break   # too far to be worth turning his head for yet
+		var act: String = gate_actions[i]
+		if act == "left" or act == "right":
+			var lane: int = clampi(int(runner_plan[i].get("post_lane", 1)),
+				0, player.lane_xs.size() - 1)
+			# Where that gate sits relative to where he is standing right now.
+			if max_lane_abs > 0.0:
+				look = clampf((player.lane_xs[lane] - player.lane_xs[player.current_lane])
+					/ max_lane_abs, -1.0, 1.0)
+		break
+	player.set_look_lateral(look)
+
+
 func _sort_event_by_t(a: Dictionary, b: Dictionary) -> bool:
 	return float(a.get("t", 0.0)) < float(b.get("t", 0.0))
 
@@ -8727,6 +8811,15 @@ func _on_music_finished() -> void:
 	# generated track floor during the celebration animation.
 	player.forward_speed = 0.0
 	player.velocity      = Vector3.ZERO
+
+	# A song that ends mid-drop-buildup used to leave the tunnel standing and the
+	# player locked in free-slide (lanes off) all the way through the celebration.
+	# Tear it down, cashing in the charge first if they'd actually built one.
+	if _charge_active:
+		if _charge_building and not _charge_finalized:
+			_charge_finalized = true
+			_finalize_charge(_song_time())
+		_despawn_charge_tunnel()
 
 	# Plenty of time for the celebration to breathe
 	auto_quit_delay_s = 6.0
@@ -9377,6 +9470,29 @@ func _random_cycle_stop_color(idx: int) -> Color:
 	var h: float = fposmod(sin(float(idx) * 12.9898) * 43758.5453, 1.0)
 	return Color.from_hsv(h, _CYCLE_RANDOM_SAT, _CYCLE_RANDOM_VAL)
 
+## Hue rotation applied per gate action on top of the cycle's current colour.
+## Without this every gate on screen took the SAME random colour, which threw
+## away the one thing the palette is actually load-bearing for: telling a jump
+## gate from a slide gate at a glance. Fixed offsets rather than separate random
+## streams so the four types can never drift close together by chance — they sit
+## a quarter-turn apart on the wheel no matter where the cycle currently is.
+const _ACTION_HUE_OFFSET: Dictionary = {
+	"left":       0.000,
+	"right":      0.250,
+	"jump":       0.500,
+	"slide":      0.750,
+	"wall_left":  0.125,
+	"wall_right": 0.125,
+}
+
+## `base` rotated by this action's offset, saturation/value/alpha untouched.
+func _action_cycle_color(action: String, base: Color) -> Color:
+	var off: float = float(_ACTION_HUE_OFFSET.get(action, 0.0))
+	if is_zero_approx(off):
+		return base
+	return Color.from_hsv(fposmod(base.h + off, 1.0), base.s, base.v, base.a)
+
+
 func _current_cycle_color(song_t: float) -> Color:
 	if not color_cycle_enabled:
 		# Cycle off: hold a single static color — whatever the player picked
@@ -9929,6 +10045,12 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 			if not gate.visible:
 				continue
 			if i < _gate_cycle_mats.size() and color_cycle_enabled:
+				# Per-type hue offset, then the same vitality fade the rest of the
+				# world gets. Computed per gate rather than reusing live_col so the
+				# gate types stay readable against each other while cycling.
+				var gate_live: Color = _action_cycle_color(
+					gate_actions[i] if i < gate_actions.size() else "", cycle_col
+				).lerp(dead_tint, (1.0 - vit) * 0.70)
 				for mat: Material in _gate_cycle_mats[i]:
 					# Random mode only: override BOTH the base surface color
 					# AND emission. The gates' actual visible "identity"
@@ -9938,7 +10060,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 					# excluded via the no_cycle mesh tag in
 					# _collect_cycle_mats, so this never bleeds onto parts
 					# that are meant to stay a fixed dark neutral.
-					NeonMat.lerp_tint(mat, live_col, kgate)
+					NeonMat.lerp_tint(mat, gate_live, kgate)
 
 	# ── Grind rail ───────────────────────────────────────────────────────────
 	if GameConfig.color_cycle_affects_rail and color_cycle_enabled:

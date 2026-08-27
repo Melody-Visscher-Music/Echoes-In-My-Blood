@@ -259,6 +259,38 @@ var _slide_visual_timer:  float = 0.0   # anim keeps playing this long AFTER the
 var _so_fluffy_node:         Node       = null        # SO FLUFFY instance on Body mesh
 var _so_fluffy_accent_nodes: Array[Node] = []         # SO FLUFFY on TailTip + WhiteFur
 
+# ── Procedural animation layer ────────────────────────────────────────────────
+@export_group("Procedural Animation")
+## Head / spine / elbow personality layer. Off = authored clips play untouched.
+@export var procedural_flair: bool = true
+## Spring-driven tail. The authored clips key only tail.01 and tail.03, only in
+## Run — the tail is frozen during Jump and Slide. Off restores that.
+@export var procedural_tail: bool = true
+## Spring-driven ears. Same story: keyed in Run only.
+@export var procedural_ears: bool = true
+@export_group("")
+
+## Tail and ear springs live inside CharacterFlair (see its Tail/Ears groups for
+## the tuning). They are hand-written and hard-clamped rather than
+## SpringBoneSimulator3D nodes: that node runs, but on this rig it settles ~170
+## deg off the imported rest, snaps a full 180 periodically, and did not respond
+## to stiffness or drag across a 5x sweep. A tail that can visibly invert is a
+## worse failure than one that is not perfectly physical.
+var _flair: CharacterFlair = null
+
+## Wall-jump launch clip — a one-shot that OWNS the body while it runs, so the
+## most dramatic move in the game stops looking like the ordinary hop.
+var _wall_jump_anim_length: float  = 0.0
+var _wall_jump_timer:       float  = 0.0
+var _wall_jump_clip:        String = ""
+## Which way the next gate sits, -1..1. Fed to the flair layer so he turns his
+## head toward what he is about to hit. Set by Section_BeatRunner3d.
+var _look_lateral:  float = 0.0
+var _beat_pulse:    float = 0.0
+var _prev_on_floor: bool  = true
+var _prev_vy:       float = 0.0
+var _prev_lat:      float = 0.0
+
 # ── Grind-rail system ─────────────────────────────────────────────────────────
 ## Emitted when the player presses jump while grinding. Section listens to this
 ## to register a spark catch attempt.
@@ -501,6 +533,7 @@ func _physics_process(delta: float) -> void:
 			_wall_buffer_timer -= delta
 			if _wall_buffer_timer > 0.0 and _buffered_wall_action != "":
 				# Execute the buffered press now that we're on the floor
+				_play_wall_jump(_buffered_wall_action)
 				if _buffered_wall_action == "wall_left":
 					velocity.y  = wall_jump_velocity
 					target_lane = lane_xs.size() - 1
@@ -645,6 +678,7 @@ func request_action(action: String) -> void:
 					target_lane = lane_xs.size() - 1
 					_buffered_wall_action = ""
 					_wall_buffer_timer    = 0.0
+					_play_wall_jump("wall_left")
 				else:
 					# Pressed while airborne — buffer it so it fires on landing
 					_buffered_wall_action = "wall_left"
@@ -660,6 +694,7 @@ func request_action(action: String) -> void:
 					target_lane = 0
 					_buffered_wall_action = ""
 					_wall_buffer_timer    = 0.0
+					_play_wall_jump("wall_right")
 				else:
 					_buffered_wall_action = "wall_right"
 					_wall_buffer_timer    = WALL_BUFFER_S
@@ -794,10 +829,23 @@ func _build_character() -> void:
 			_attach_so_fluffy(_char_model)
 
 			if _char_anim_player != null:
-				for clip in ["Idle", "Run", "Jump", "Slide", "Grind"]:
+				# Generate the clips the .glb does not ship (Idle, Grind, WallJump)
+				# BEFORE asking which ones exist, so they count as owned.
+				_generate_missing_clips()
+
+				for clip in ["Idle", "Run", "Jump", "Slide", "Grind",
+							 "WallJumpA", "WallJumpB"]:
 					_char_clip_owned[clip] = _char_anim_player.has_animation(clip)
+
 				if _char_clip_owned["Run"]:
-					_run_anim_length = _char_anim_player.get_animation("Run").length
+					var run_clip: Animation = _char_anim_player.get_animation("Run")
+					_run_anim_length = run_clip.length
+					# The .glb exports Run as LOOP_NONE. Nothing set it, so the run
+					# cycle was ending after 0.583 s and being CROSSFADED BACK INTO
+					# ITS OWN START by the re-trigger below — and speed_scale runs up
+					# to 4x, so on a fast song that restart fired every ~0.15 s. It
+					# reads as a permanent stutter in the legs. It is a loop.
+					run_clip.loop_mode = Animation.LOOP_LINEAR
 				if _char_clip_owned["Slide"]:
 					var slide_clip: Animation = _char_anim_player.get_animation("Slide")
 					_slide_anim_length = slide_clip.length
@@ -806,12 +854,75 @@ func _build_character() -> void:
 					slide_clip.loop_mode = Animation.LOOP_NONE
 				if _char_clip_owned["Idle"]:
 					_char_anim_player.play("Idle")
+
+			_build_flair_layer()
 			return
 
 	# ── Fallback: GLB missing — build the original box-primitive character ───
+	# (kept below; the generated-clip and flair helpers above are GLB-only)
 	push_warning("[BeatRunnerPlayer] SIAGCharacter.glb not found — using procedural fallback character.")
 	_char_root.rotation_degrees.y = 180.0
 	_build_character_procedural()
+
+
+## Builds the clips SIAGCharacter.glb does not contain and adds them to its own
+## AnimationLibrary, so AnimationPlayer treats them exactly like the authored
+## three. See CharacterPoses for the rig conventions the poses are written in.
+##
+## The .glb ships Run / Jump / Slide only. The state machine has always asked for
+## Idle and Grind as well — Idle silently never played, and a grind fell through
+## the "clip not owned" guard, which left the AnimationPlayer running the Run
+## cycle while the player rode a rail. Wall jumps borrowed the ordinary Jump, so
+## the single most dramatic move in the game looked like a hop.
+func _generate_missing_clips() -> void:
+	if _char_anim_player == null or _char_skeleton == null:
+		return
+	var prefix: String = CharacterPoses.skeleton_track_prefix(_char_anim_player)
+	if prefix == "":
+		push_warning("[BeatRunnerPlayer] no bone tracks to learn the skeleton path from — generated clips skipped.")
+		return
+	var lib: AnimationLibrary = _char_anim_player.get_animation_library("")
+	if lib == null:
+		return
+
+	var wanted: Dictionary = {
+		"Idle":      [CharacterPoses.idle_frames(),           1.10, true],
+		"Grind":     [CharacterPoses.grind_frames(),          0.90, true],
+		# Two directions so the launch twists toward the wall it is heading for.
+		"WallJumpA": [CharacterPoses.wall_jump_frames(false), 0.58, false],
+		"WallJumpB": [CharacterPoses.wall_jump_frames(true),  0.58, false],
+	}
+	for name: String in wanted:
+		# Never clobber a real authored clip — the moment one of these is made in
+		# Blender and exported, the .glb version wins automatically.
+		if _char_anim_player.has_animation(name):
+			continue
+		var spec: Array = wanted[name]
+		lib.add_animation(name, CharacterPoses.build(
+			spec[0], _char_skeleton, prefix, spec[1], spec[2]))
+	_wall_jump_anim_length = 0.58
+
+
+## Installs the procedural personality layer under the skeleton.
+##
+## It has to be a SkeletonModifier3D child of the Skeleton3D: modifiers run
+## inside the skeleton update, after the AnimationPlayer has written its poses,
+## which is the only place bone poses can be layered without fighting it.
+## Driving them from _physics_process instead either loses to the player or
+## lands a frame late depending on node order.
+func _build_flair_layer() -> void:
+	if _char_skeleton == null or not procedural_flair:
+		return
+	_flair = CharacterFlair.new()
+	_flair.name = "CharacterFlair"
+	# The two sub-toggles just zero their own contribution — cheaper and clearer
+	# than branching inside the per-frame modifier.
+	if not procedural_tail:
+		_flair.tail_swing_deg = 0.0
+		_flair.tail_lift_deg  = 0.0
+	if not procedural_ears:
+		_flair.ear_flick_deg = 0.0
+	_char_skeleton.add_child(_flair)
 
 
 # Duplicate and recolour the Body/Jacket/Hair materials on the GLB model so the
@@ -1167,9 +1278,75 @@ func _build_character_procedural() -> void:
 # CHARACTER ANIMATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+## Starts the wall-jump launch clip. `action` is "wall_left" / "wall_right"; the
+## two mirrored clips twist toward the wall being launched at.
+##
+## If the mirroring ever reads backwards in game, swap the two clip names here —
+## that is the only place the direction is decided.
+func _play_wall_jump(action: String) -> void:
+	if _wall_jump_anim_length <= 0.0:
+		return
+	_wall_jump_clip  = "WallJumpA" if action == "wall_left" else "WallJumpB"
+	if not _char_clip_owned.get(_wall_jump_clip, false):
+		return
+	_wall_jump_timer = _wall_jump_anim_length
+	if _flair != null:
+		# A wall jump is a lateral event: throw the tail and the head with it.
+		_flair.lane_flick(1.0 if action == "wall_left" else -1.0)
+
+
+## Push this frame's motion into the procedural layer. Called from
+## _update_character_anim, which already runs once per physics frame.
+func _feed_flair(delta: float) -> void:
+	var lat: float = 0.0
+	if right_dir != Vector3.ZERO:
+		lat = velocity.dot(right_dir)
+
+	# Landing detection — the recoil scales with how hard he came down.
+	var on_floor: bool = is_on_floor()
+	if on_floor and not _prev_on_floor and _flair != null:
+		_flair.land(clampf(absf(_prev_vy) / maxf(1.0, jump_velocity), 0.0, 1.0))
+	_prev_on_floor = on_floor
+	_prev_vy       = velocity.y
+
+	if _flair != null:
+		_flair.lateral_v    = lat
+		_flair.vertical_v   = velocity.y
+		_flair.bank         = _arc_bank_raw
+		_flair.airborne     = not on_floor
+		_flair.look_lateral = _look_lateral
+		_flair.beat         = _beat_pulse
+		_flair.speed01      = clampf(forward_speed / maxf(1.0, _forward_speed_base * 1.6), 0.0, 1.0) \
+			if _forward_speed_base > 0.0 else 0.0
+
+	_prev_lat = lat
+	_beat_pulse = maxf(0.0, _beat_pulse - delta * 3.6)
+
+
+## Section_BeatRunner3d calls this on each beat so the body can punctuate the
+## music rather than free-running on its own clock.
+func pulse_beat() -> void:
+	_beat_pulse = 1.0
+
+
+## Section_BeatRunner3d calls this with where the next gate sits laterally
+## (-1..1). The head turns toward it — he reads the track ahead, which is the
+## one character trait the authored clips physically cannot express, because the
+## head has no keys in any of them.
+func set_look_lateral(v: float) -> void:
+	_look_lateral = clampf(v, -1.0, 1.0)
+
+
 func _update_character_anim(_delta: float) -> void:
 	if _char_root == null:
 		return
+
+	# Run the launch clock even when the fallback rig is in use, so the state
+	# never sticks on.
+	if _wall_jump_timer > 0.0:
+		_wall_jump_timer = maxf(0.0, _wall_jump_timer - _delta)
+
+	_feed_flair(_delta)
 
 	if _using_glb_character:
 		_update_character_anim_glb(_delta)
@@ -1225,7 +1402,16 @@ func _update_character_anim_glb(_delta: float) -> void:
 	# only a fallback for states the .glb doesn't ship. This is what lets an
 	# authored Slide put the body as low as it wants — the old hard-coded
 	# −0.5 m root shove would stack on top and squash it into the floor.
-	if sliding or _slide_visual_timer > 0.0:
+	#
+	# The wall-jump launch is checked FIRST and outranks everything except a
+	# grind. It is a one-shot that has to be allowed to finish: without this it
+	# would be replaced by "Jump" on the very next frame, because the launch puts
+	# the player airborne instantly, and the whole move would never be seen.
+	if _wall_jump_timer > 0.0 and not _is_grinding:
+		target_anim = _wall_jump_clip
+		_char_root.position.y         = _char_root_base_y
+		_char_root.rotation_degrees.x = 0.0
+	elif sliding or _slide_visual_timer > 0.0:
 		target_anim = "Slide"
 		if _char_clip_owned.get("Slide", false):
 			_char_root.position.y         = _char_root_base_y
@@ -1272,9 +1458,15 @@ func _update_character_anim_glb(_delta: float) -> void:
 	if not _char_clip_owned.get(target_anim, false):
 		return   # state clip not authored — procedural pose above covers it
 	if _char_anim_player.current_animation != target_anim or not _char_anim_player.is_playing():
-		# Crossfade so run flows INTO the slide (and back) instead of snapping;
-		# jumps blend faster — they need to read instantly.
-		_char_anim_player.play(target_anim, 0.08 if target_anim == "Jump" else 0.18)
+		# Crossfade so run flows INTO the slide (and back) instead of snapping.
+		# Jump and the wall-jump launch blend fastest — an explosive move that
+		# eases in over 0.18 s has already lost the moment it was meant to sell.
+		var blend: float = 0.18
+		if target_anim == "Jump":
+			blend = 0.08
+		elif target_anim.begins_with("WallJump"):
+			blend = 0.04
+		_char_anim_player.play(target_anim, blend)
 	_char_anim_player.speed_scale = target_speed
 
 
