@@ -32,6 +32,25 @@ const _GHOST_DRAIN_S:   float = 0.55
 const _IDLE_FADE_DELAY: float = 2.2    # score card settles to a quieter opacity
 const _IDLE_FADE_ALPHA: float = 0.66
 
+## Where the centre banner sits, as a fraction of viewport height. It used to be
+## 0.36, which is exactly where the gates arrive — a streak banner was covering
+## the one thing the player cannot afford to lose sight of. Kept high enough to
+## clear the wall-jump card above it at full callout intensity.
+const _CALLOUT_ROW:     float = 0.22
+const _CALLOUT_SHAKE_S: float = 0.34   # how long a high-intensity banner rocks
+
+## The score range the rainbow accelerates across: at RAINBOW_SCORE the hue
+## drifts, by RAINBOW_SCORE_MAX it is running flat out and stays there.
+##
+## The ceiling is deliberately inside what a real run reaches. An open-ended
+## curve put full speed somewhere past 10 M, well beyond the ~7.5 M a good run
+## actually scores, so the fastest state was one nobody was ever going to see.
+## See _update_score_rainbow.
+const RAINBOW_SCORE:     int = 1_000_000
+const RAINBOW_SCORE_MAX: int = 10_000_000
+const _RAINBOW_SLOW: float = 0.50   # hue cycles/sec at the threshold
+const _RAINBOW_FAST: float = 3.00   # hue cycles/sec at the ceiling
+
 const _PLATE_SHADER: String = "res://shaders/hud_plate.gdshader"
 const _BAR_SHADER:   String = "res://shaders/hud_bar.gdshader"
 const _TEXT_SHADER:  String = "res://shaders/hud_text.gdshader"
@@ -61,6 +80,9 @@ var _score_roll_tw:  Tween = null
 var _score_target: int = 0
 var _score_shown:  int = 0
 var _score_font_size: int = 0   # current size bucket — see _apply_score_text
+var _score_text_mat: ShaderMaterial = null   # the numerals' chrome shader
+var _rainbow_hue: float = 0.0
+var _rainbow_on:  bool  = false
 
 # Health / lives
 var _hp_group:  Control   = null
@@ -93,7 +115,11 @@ var _flow_bar:   ColorRect = null
 # Wall-jump banner + the transient centre-screen callouts
 var _wj_label:     Label      = null
 var _wj_card:      PlatePanel = null
-var _callout_card: PlatePanel = null
+var _callout_card:      PlatePanel = null
+var _callout_label:     Label      = null
+var _callout_intensity: float      = 0.0
+var _callout_hue:       float      = 0.0
+var _callout_shake:     float      = 0.0
 
 # Song progress
 var _prog_bg:   ColorRect = null
@@ -137,6 +163,15 @@ func _ready() -> void:
 func _on_viewport_resized() -> void:
 	_refresh_vp()
 	_layout()
+
+
+## Only two things here need a frame: the rainbow score (a continuous hue whose
+## rate depends on the score itself, so it cannot be pre-baked into a tween) and
+## the live half of a high-intensity callout. Everything else in this HUD is
+## still event-driven.
+func _process(delta: float) -> void:
+	_update_score_rainbow(delta)
+	_update_callout(delta)
 
 
 func _refresh_vp() -> void:
@@ -276,7 +311,7 @@ func _build_score() -> void:
 	_score_value.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	_score_value.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
 	_score_value.self_modulate = Color(1.00, 0.62, 0.88, 1.0)
-	_apply_text_shader(_score_value)
+	_score_text_mat = _apply_text_shader(_score_value)
 	_anchor_tl(_score_value)
 	_score_group.add_child(_score_value)
 
@@ -713,6 +748,60 @@ func _apply_score_text(v: float) -> void:
 		_score_value.add_theme_font_size_override("font_size", size)
 
 
+## Past RAINBOW_SCORE the score readout stops walking the signature band and
+## runs the full hue wheel instead - the one place in this HUD where a rotating
+## rainbow is earned rather than lazy, because reaching seven figures is the
+## point of it. It keeps accelerating up to RAINBOW_SCORE_MAX, so the number
+## visibly gets more unhinged the higher it climbs.
+##
+## Driven off the DISPLAYED score, not the target, so it switches on as the
+## odometer rolls through the million rather than the instant the hit lands.
+func _update_score_rainbow(delta: float) -> void:
+	if _score_value == null:
+		return
+	var on: bool = _score_shown >= RAINBOW_SCORE
+	if on != _rainbow_on:
+		_rainbow_on = on
+		if not on:
+			# Hand the readout back to set_chrome_phase in its default shading.
+			_restore_score_tints()
+	if not on:
+		return
+
+	_rainbow_hue = fposmod(_rainbow_hue + delta * _rainbow_speed(), 1.0)
+	var c:  Color = Color.from_hsv(_rainbow_hue, 0.80, 1.0)
+	var c2: Color = Color.from_hsv(fposmod(_rainbow_hue + 0.12, 1.0), 0.85, 1.0)
+	var c3: Color = Color.from_hsv(fposmod(_rainbow_hue + 0.45, 1.0), 0.75, 1.0)
+
+	_score_value.self_modulate = c
+	_score_cap.self_modulate   = Color(c3.r, c3.g, c3.b, 0.90)
+	if _score_text_mat != null:
+		# The chrome shader's ramp is multiplicative, so feeding it two hues
+		# gives the digits a rolling gradient instead of one flat colour.
+		_score_text_mat.set_shader_parameter("top_tint",    Vector3(c.r, c.g, c.b))
+		_score_text_mat.set_shader_parameter("bottom_tint", Vector3(c2.r, c2.g, c2.b))
+	var sm := _score_plate.material as ShaderMaterial
+	if sm != null:
+		sm.set_shader_parameter("edge_color",  c)
+		sm.set_shader_parameter("edge_color2", c3)
+
+
+## Cycles per second, ramped log-spaced across the decade between the two
+## thresholds — every ×10 of score is the same step, so the climb reads as
+## steady rather than back-loaded — and held there above the ceiling.
+func _rainbow_speed() -> float:
+	var over: float = float(maxi(_score_shown, RAINBOW_SCORE)) / float(RAINBOW_SCORE)
+	var span: float = float(RAINBOW_SCORE_MAX) / float(RAINBOW_SCORE)
+	var t: float = clampf(log(over) / log(maxf(span, 1.0001)), 0.0, 1.0)
+	return lerpf(_RAINBOW_SLOW, _RAINBOW_FAST, t)
+
+
+func _restore_score_tints() -> void:
+	if _score_text_mat != null:
+		_score_text_mat.set_shader_parameter("top_tint",    Vector3(1.0, 1.0, 1.0))
+		_score_text_mat.set_shader_parameter("bottom_tint", Vector3(0.72, 0.60, 0.92))
+
+
 func _apply_combo(combo: int, mult: int) -> void:
 	var show: bool = combo >= 2
 	_combo_plate.visible = show
@@ -1019,24 +1108,46 @@ func set_wall_jump(active: bool, alpha: float = 1.0) -> void:
 		_wj_card.modulate = Color(1.0, 1.0, 1.0, clampf(alpha, 0.0, 1.0))
 
 
-## A transient centre-screen banner: streak milestones, PERFECT FLOW, OVERDRIVE,
-## DROPPED. These were the last things in gameplay still drawn in Godot's default
-## font on a bare outline, which is exactly why they looked out of place next to
-## the rebuilt HUD.
+## A transient banner: streak milestones, PERFECT FLOW, OVERDRIVE, DROPPED.
+## These were the last things in gameplay still drawn in Godot's default font on
+## a bare outline, which is exactly why they looked out of place next to the
+## rebuilt HUD.
+##
+## It hangs at _CALLOUT_ROW, high on the screen rather than across the middle of
+## it, because the gates the player is reading arrive through the centre.
+##
+## `intensity` (0-1) is how big a deal this banner is, and it is not a flag with
+## two settings: type size, chamfer depth, edge bloom, entry overshoot, dwell,
+## shockwave rings, radial sparks, screen rock and - at the top of the range - a
+## running hue all scale off it continuously. A x200 streak is meant to look like
+## a different event from a x10, not the same banner in another colour.
 ##
 ## Only one is ever on screen: a new banner replaces the one in flight rather
 ## than stacking on top of it.
-func show_callout(text: String, col: Color, hold: float = 0.70) -> void:
+func show_callout(text: String, col: Color, hold: float = 0.70,
+		intensity: float = 0.0) -> void:
 	if _root == null:
 		return
 	if _callout_card != null and is_instance_valid(_callout_card):
 		_callout_card.queue_free()
 	var s: float = _s
+	var i: float = clampf(intensity, 0.0, 1.0)
+	_callout_intensity = i
+	_callout_hue       = 0.0
+	_callout_shake     = _CALLOUT_SHAKE_S * i
 
-	var card := PlatePanel.create(int(18 * s), col, 20.0 * s)
+	var card := PlatePanel.create(int((18.0 + 14.0 * i) * s), col, (20.0 + 16.0 * i) * s)
 	card.set_cuts(1.0, 0.0, 1.0, 0.0)
+	# Written straight onto the plate uniforms rather than through set_accent(),
+	# which re-applies the NORMAL state and would flatten the bloom set here.
+	card.set_param("edge_color",  col)
+	card.set_param("edge_color2", col.lightened(0.35 * i))
+	card.set_param("edge_px",     1.7 + 2.6 * i)
+	card.set_param("glow_px",     12.0 + 40.0 * i)
+	card.set_param("grid_amount", 0.14 + 0.24 * i)
+	card.set_param("scan_amount", 0.35 + 0.45 * i)
 	card.anchor_left = 0.5; card.anchor_right  = 0.5
-	card.anchor_top  = 0.36; card.anchor_bottom = 0.36
+	card.anchor_top  = _CALLOUT_ROW; card.anchor_bottom = _CALLOUT_ROW
 	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
 	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -1044,29 +1155,159 @@ func show_callout(text: String, col: Color, hold: float = 0.70) -> void:
 	_root.add_child(card)
 	_callout_card = card
 
-	var lbl := UiStyle.label(text, UiStyle.display(900, 5.0), int(34 * s), Color.WHITE)
+	var lbl := UiStyle.label(text, UiStyle.display(900, 5.0 + 2.5 * i),
+		int((34.0 + 17.0 * i) * s), Color.WHITE, int(6.0 * i * s))
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.self_modulate = col
 	card.content.add_child(lbl)
+	_callout_label = lbl
 
 	# The plate's size comes from its content, so the punch pivot can only be set
 	# once layout has actually measured it.
 	card.resized.connect(func() -> void:
 		card.pivot_offset = card.size * 0.5)
 
-	card.scale = Vector2(0.82, 0.82)
-	var tw := create_tween()
+	# Shockwave: one ring at the low end, three at the top, each a copy of the
+	# banner's own silhouette blown outward on a slight stagger.
+	var rings: int = 1 + int(round(i * 2.0))
+	for r in rings:
+		_callout_ring(card, col, 0.05 * float(r),
+			(220.0 + 90.0 * float(r) + 160.0 * i) * s)
+
+	if i > 0.05:
+		_callout_sparks(card, col, int(round(6.0 + 16.0 * i)), i)
+
+	var s0: float = 0.82 - 0.26 * i
+	card.scale = Vector2(s0, s0)
+	# Bound to the card, not to the HUD: a replacement banner frees this one
+	# mid-flight, and a HUD-owned tween would then be driving a freed node.
+	var tw := card.create_tween()
 	tw.set_parallel(true)
 	tw.tween_property(card, "modulate", Color.WHITE, 0.10)
-	tw.tween_property(card, "scale", Vector2.ONE, 0.28) \
+	tw.tween_property(card, "scale", Vector2.ONE, 0.28 + 0.14 * i) \
 		.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
-	var out := create_tween()
+	var s1: float = 1.06 + 0.18 * i
+	var out := card.create_tween()
 	out.tween_interval(0.10 + hold)
 	out.tween_property(card, "modulate:a", 0.0, 0.25)
-	out.parallel().tween_property(card, "scale", Vector2(1.06, 1.06), 0.25) \
+	out.parallel().tween_property(card, "scale", Vector2(s1, s1), 0.25) \
 		.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
 	out.tween_callback(card.queue_free)
+
+
+## One expanding echo of the banner silhouette: fill, grid and scanlines off,
+## edge and bloom only, so it reads as a shockwave rather than a second card.
+## Parented to the card so it inherits the banner's centre for free.
+##
+## `pad` is how far past the banner the ring travels, in PIXELS, converted to a
+## scale factor once the card has been measured. A fixed scale factor cannot
+## work here: the same 2.4x that looks like a shockwave around a "x10 STREAK"
+## throws the ring clean off both edges of the screen around the much wider
+## "x200 UNSTOPPABLE".
+func _callout_ring(card: PlatePanel, col: Color, delay: float, pad: float) -> void:
+	var ring := PlateChassis.make_plate(24.0 * _s, false)
+	PlateChassis.set_param(ring, "fill_amount", 0.0)
+	PlateChassis.set_param(ring, "grid_amount", 0.0)
+	PlateChassis.set_param(ring, "scan_amount", 0.0)
+	PlateChassis.set_param(ring, "idle_pulse",  0.0)
+	PlateChassis.set_param(ring, "edge_px",     2.4)
+	PlateChassis.set_param(ring, "glow_px",     28.0)
+	PlateChassis.set_param(ring, "edge_color",  col)
+	PlateChassis.set_param(ring, "edge_color2", col.lightened(0.4))
+	ring.modulate = Color(1, 1, 1, 0)
+	card.add_child(ring)
+	card.move_child(ring, 0)   # under the plate: only the overhang shows
+	card.resized.connect(func() -> void:
+		PlateChassis.resize(ring, card.size)
+		ring.pivot_offset = card.size * 0.5)
+
+	# Started from the resize, not from here: the card is measured from its own
+	# content, so until layout has run there is no width to turn `pad` into a
+	# scale factor against.
+	card.resized.connect(func() -> void:
+		var grow: float = 1.0 + pad / maxf(card.size.x, 1.0)
+
+		var fade := ring.create_tween()
+		fade.tween_interval(delay)
+		fade.tween_property(ring, "modulate:a", 0.75, 0.06)
+		fade.tween_property(ring, "modulate:a", 0.0, 0.50)
+
+		var push := ring.create_tween()
+		push.tween_interval(delay)
+		push.tween_property(ring, "scale", Vector2(grow, grow), 0.56) \
+			.set_trans(Tween.TRANS_CUBIC).set_ease(Tween.EASE_OUT)
+		push.tween_callback(ring.queue_free)
+	, CONNECT_ONE_SHOT)
+
+
+## Radial dashes thrown out of the banner centre. Positioned from the viewport
+## rather than from the card, so they can be fired before the plate has been
+## measured, and slotted under the card in the draw order so they fly out from
+## behind the type instead of across it.
+func _callout_sparks(card: PlatePanel, col: Color, count: int, i: float) -> void:
+	var s: float = _s
+	var cx: float = _vp.x * 0.5
+	var cy: float = _vp.y * _CALLOUT_ROW
+	for k in count:
+		var ang: float = TAU * (float(k) + randf_range(-0.3, 0.3)) / float(count)
+		var w: float = (24.0 + 34.0 * randf()) * s * (0.7 + 0.6 * i)
+		var h: float = (2.5 + 2.5 * i) * s
+		var sp := ColorRect.new()
+		sp.color = col.lightened(0.30)
+		_anchor_tl(sp)
+		_set_rect(sp, cx, cy - h * 0.5, w, h)
+		sp.pivot_offset = Vector2(0.0, h * 0.5)
+		sp.rotation = ang
+		sp.modulate = Color(1, 1, 1, 0)
+		_root.add_child(sp)
+		_root.move_child(sp, card.get_index())
+
+		var d0: float = (55.0 + 45.0 * i) * s
+		var d1: float = d0 + (110.0 + 170.0 * i) * s * randf_range(0.7, 1.25)
+		# Offsets, not `position`: a freshly added Control has no valid position
+		# until the next layout pass, but its offsets are authoritative at once.
+		var mv := sp.create_tween()
+		mv.tween_method(func(d: float) -> void:
+			_set_rect(sp, cx + cos(ang) * d, cy + sin(ang) * d - h * 0.5, w, h)
+		, d0, d1, 0.45 + 0.25 * i).set_trans(Tween.TRANS_QUINT).set_ease(Tween.EASE_OUT)
+
+		var fd := sp.create_tween()
+		fd.tween_property(sp, "modulate:a", 1.0, 0.06)
+		fd.tween_property(sp, "modulate:a", 0.0, 0.40 + 0.25 * i)
+		fd.tween_callback(sp.queue_free)
+
+
+## The part of a banner that cannot be baked into a tween: a damped rock on the
+## way in, and a hue that keeps moving for the top tier of streaks.
+func _update_callout(delta: float) -> void:
+	if _callout_intensity <= 0.05:
+		return
+	if _callout_card == null or not is_instance_valid(_callout_card):
+		_callout_intensity = 0.0
+		_callout_label     = null
+		return
+	var i: float = _callout_intensity
+
+	if _callout_shake > 0.0:
+		_callout_shake = maxf(_callout_shake - delta, 0.0)
+		# Rotation rather than a position offset: the card is placed by its
+		# anchors, so nudging its offsets would fight the next layout pass.
+		var amp: float = 0.045 * i * (_callout_shake / _CALLOUT_SHAKE_S)
+		_callout_card.rotation = sin(float(Time.get_ticks_msec()) * 0.055) * amp
+		if _callout_shake <= 0.0:
+			_callout_card.rotation = 0.0
+
+	# Only the top tier runs the hue. Below it the milestone colour is what tells
+	# the tiers apart, and a rotating hue would erase that distinction.
+	if i >= 0.75:
+		_callout_hue = fposmod(_callout_hue + delta * (0.35 + i * 0.85), 1.0)
+		var c: Color = Color.from_hsv(_callout_hue, 0.72, 1.0)
+		_callout_card.set_param("edge_color",  c)
+		_callout_card.set_param("edge_color2",
+			Color.from_hsv(fposmod(_callout_hue + 0.35, 1.0), 0.72, 1.0))
+		if _callout_label != null and is_instance_valid(_callout_label):
+			_callout_label.self_modulate = c
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1109,8 +1350,10 @@ func set_chrome_phase(phase: float) -> void:
 	var c_hp:    Color = UiStyle.signature_color(-phase, 0.55)
 	var c_prog:  Color = UiStyle.signature_color(phase, 0.30)
 
+	# While the score is in its rainbow state it owns its own colours; the band
+	# walk would otherwise overwrite them on the very next frame.
 	var sm := _score_plate.material as ShaderMaterial
-	if sm != null:
+	if sm != null and not _rainbow_on:
 		sm.set_shader_parameter("edge_color", c_score)
 		sm.set_shader_parameter("edge_color2", UiStyle.signature_color(phase, 0.22))
 	var cm := _combo_plate.material as ShaderMaterial
@@ -1121,8 +1364,9 @@ func set_chrome_phase(phase: float) -> void:
 	# NOTIFICATION_THEME_CHANGED, discarding the Label's shaped-text buffer and
 	# re-sorting its containers. Base font_color is white, so the product is
 	# identical, and it still stacks with the score-flash tween on modulate.
-	_score_cap.self_modulate   = Color(c_score.r, c_score.g, c_score.b, 0.85)
-	_score_value.self_modulate = c_score.lightened(0.25)
+	if not _rainbow_on:
+		_score_cap.self_modulate   = Color(c_score.r, c_score.g, c_score.b, 0.85)
+		_score_value.self_modulate = c_score.lightened(0.25)
 
 	var hm := _hp_bar.material as ShaderMaterial
 	if hm != null:

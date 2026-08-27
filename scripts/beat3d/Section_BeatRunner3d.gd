@@ -5954,8 +5954,10 @@ func _finalize_charge(t_s: float) -> void:
 		_charge_mult_timer = lerpf(_CHARGE_MULT_MIN_S, _CHARGE_MULT_MAX_S, clampf(fill, 0.0, 1.0))
 		_charge_mult_total = _charge_mult_timer
 		_hud_flash_color(Color(0.30, 0.85, 1.00, 0.26), 0.55)
+		# The ×100 window is the biggest payoff in the run, so it gets the top
+		# tier of banner — the same treatment a ×200 streak earns.
 		_show_grind_banner("⚡  ×%d  OVERDRIVE  (%.1fs)" % [_CHARGE_MULT_VALUE, _charge_mult_timer],
-			Color(0.40, 0.90, 1.00))
+			Color(0.40, 0.90, 1.00), 0.85)
 		_shake_camera()
 	else:
 		_show_grind_banner("…charge fizzled", Color(0.60, 0.60, 0.72))
@@ -6385,7 +6387,8 @@ func _despawn_grind_rail() -> void:
 	if _grind_total_this_seg > 0 and _grind_caught_this_seg >= _grind_total_this_seg and not _grind_failed:
 		_score += _GRIND_FULLCLEAR_BONUS
 		_update_hud_score()
-		_show_grind_banner("◈  PERFECT FLOW!  +%d  ◈" % _GRIND_FULLCLEAR_BONUS, Color(1.0, 0.85, 0.2))
+		_show_grind_banner("◈  PERFECT FLOW!  +%d  ◈" % _GRIND_FULLCLEAR_BONUS,
+			Color(1.0, 0.85, 0.2), 0.6)
 
 	# Rap-section notes count toward the song's note total at the results — but ONLY if the
 	# player actually rode the rail this segment. Skipping a grind costs nothing (no phantom
@@ -6545,10 +6548,11 @@ func _spawn_score_popup(world_pos: Vector3, pts: int, mult: int) -> void:
 	tw.finished.connect(lbl.queue_free)
 
 
-# Big centred banner (PERFECT FLOW / DROPPED). Mirrors _show_streak_milestone.
-func _show_grind_banner(text: String, col: Color) -> void:
+# Big banner (PERFECT FLOW / DROPPED). Mirrors _show_streak_milestone, including
+# its `intensity` — a payoff gets the rings and sparks, a failure stays flat.
+func _show_grind_banner(text: String, col: Color, intensity: float = 0.0) -> void:
 	if _hud != null:
-		_hud.show_callout(text, col, 0.70)
+		_hud.show_callout(text, col, 0.70, intensity)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -6808,19 +6812,33 @@ func _on_gate_scored(success: bool) -> void:
 func _show_streak_milestone(combo: int) -> void:
 	if _hud == null:
 		return
-	# Milestone colours pulled onto the shared palette so a streak banner reads
-	# as part of the same kit as the rest of the HUD.
-	# These cases MUST match STREAK_MILESTONES — they used to read 15/30/75/100
+	# How big a deal this banner is, on a log curve from the first milestone to
+	# the last. GameHud.show_callout scales its ENTIRE presentation off this
+	# — type size, bloom, shockwave rings, sparks, rock, hue — so a milestone
+	# added to STREAK_MILESTONES needs no new case here to look right.
+	var lo: float = log(float(maxi(STREAK_MILESTONES[0], 1)))
+	var hi: float = log(float(maxi(STREAK_MILESTONES[STREAK_MILESTONES.size() - 1], 2)))
+	var t: float = clampf(inverse_lerp(lo, hi, log(float(maxi(combo, 1)))), 0.0, 1.0)
+
+	# Thresholds rather than exact matches: these used to read 15/30/75/100
 	# against milestones that fire at 10/25/50/100/200, so every banner except
-	# ×100 came out plain white.
-	var col: Color
-	match combo:
-		10:  col = UiStyle.GOLD
-		25:  col = UiStyle.CYAN
-		50:  col = UiStyle.VIOLET
-		100: col = Color(1.00, 0.40, 0.20)   # orange
-		_:   col = Color.WHITE               # 200+
-	_hud.show_callout("★  ×%d  STREAK  ★" % combo, col, 0.65)
+	# ×100 came out plain white. Ranges cannot fall out of step that way again.
+	var col: Color   = UiStyle.GOLD
+	var mark: String = "★"
+	var word: String = "STREAK"
+	if combo >= 200:
+		col = Color(1.00, 0.30, 0.55); mark = "★★★"; word = "UNSTOPPABLE"
+	elif combo >= 100:
+		col = Color(1.00, 0.40, 0.20); mark = "★★★"; word = "MEGA STREAK"
+	elif combo >= 50:
+		col = UiStyle.VIOLET;          mark = "★★"
+	elif combo >= 25:
+		col = UiStyle.CYAN
+
+	# Bigger milestones also hang around longer — a ×200 that vanished on the
+	# same 0.65 s timer as a ×10 would undercut everything else about it.
+	_hud.show_callout("%s  ×%d  %s  %s" % [mark, combo, word, mark],
+		col, 0.65 + 0.45 * t, t)
 
 
 ## Picks a seed this song has never served before and records it, so a route is
