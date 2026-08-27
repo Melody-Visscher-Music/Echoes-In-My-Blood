@@ -12,9 +12,9 @@ render_mode blend_mix, unshaded;
 //     makes "you just lost some" legible without reading the number.
 //   • tick marks at even fractions, so the fill has a scale to read against.
 //   • diagonal energy stripes scrolling inside the fill.
-//   • the lightning bolt from the original HP bar, kept intact and gated by
-//     `bolt_amount` — its HP-reactive tuning (sluggish ember when low, frantic
-//     arcing when full) was worth preserving.
+//   • lightning across the fill, gated by `bolt_amount`. Several short bolts
+//     striking independently rather than one long one down the middle, and it
+//     dies out completely as the bar empties.
 //   • a red edge strobe driven by `danger` for the low-health warning.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,24 @@ uniform float stripe_speed = 22.0;
 float sd_box(vec2 p, vec2 h) {
 	vec2 q = abs(p) - h;
 	return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+}
+
+float hash11(float x) {
+	return fract(sin(x * 12.9898) * 43758.5453);
+}
+
+// One lightning channel, sampled at x (0-1 along the bolt). Random heights at
+// random nodes, joined by STRAIGHT lines — a bolt is a run of straight segments
+// meeting at sharp irregular angles, and that irregularity is the whole tell.
+// A triangle or sine wave gives evenly spaced kinks of equal size, which the eye
+// reads as a waveform on an oscilloscope no matter how sharp the corners are.
+float bolt_path(float x, float nodes, float seed) {
+	float u = x * nodes;
+	float i = floor(u);
+	float f = fract(u);
+	float y0 = hash11(i * 1.7 + seed) * 2.0 - 1.0;
+	float y1 = hash11((i + 1.0) * 1.7 + seed) * 2.0 - 1.0;
+	return mix(y0, y1, f);   // linear on purpose: smoothing would round the kinks
 }
 
 void fragment() {
@@ -107,34 +125,89 @@ void fragment() {
 	col = mix(col, fill_rgb, fill_m);
 	a   = max(a, fill_m * fill_color.a);
 
-	// ── lightning bolt (ported from the original HP bar) ─────────────────────
-	// A single bolt across the bar's mid-height, striking in short random
-	// bursts. Activity scales with how full the bar is: a rare, dim, nearly
-	// straight ember when low; fast, bright and jagged when full.
+	// ── lightning ───────────────────────────────────────────────────────────
+	// Three independent bolts on their own clocks, each running the WHOLE length
+	// of the fill — from the left end cap to wherever the health currently stops
+	// — so a strike measures the bar rather than decorating part of it. Several
+	// are usually lit at once, crossing at different heights.
+	//
+	// Each is built like an actual bolt rather than a squiggle: straight segments
+	// at irregular angles (see bolt_path), a fork peeling off partway and dying
+	// out, a hot near-white core inside a softer halo, and a sharp attack that
+	// decays instead of a square on/off.
+	//
+	// Everything rides how full the bar is — how many bolts strike, how often,
+	// how jagged, how thick, how bright — and it is cut off entirely near empty.
+	// A dying bar showing a slow tame ember read as "still fine"; showing nothing
+	// is the honest signal, and it hands the low-HP read over to the red strobe.
 	if (bolt_amount > 0.001 && fill_m > 0.5) {
-		float hp    = clamp(fill_pct, 0.0, 1.0);
-		float speed = mix(1.5, 9.0, hp);
-		float t     = TIME * speed;
+		float hp  = clamp(fill_pct, 0.0, 1.0);
+		// Reaches zero just above empty and is back to full by a third of a bar:
+		// "none left at 1 HP", not "none left at 30".
+		float act = smoothstep(0.05, 0.34, hp);
+		if (act > 0.001) {
+			float rate = mix(3.5, 12.0, hp);   // strikes per second, per bolt
+			float lit  = 0.0;
 
-		float flick_thresh = mix(0.93, 0.55, hp);
-		float flick = step(flick_thresh, fract(sin(floor(t) * 12.9898 + bolt_seed) * 43758.5453));
+			// Position along the fill: 0 at the left end cap, 1 at the fill head,
+			// taken from the sheared axis so the bolt follows the same slant the
+			// fill boundary does.
+			float lx = clamp(ax / max(fill_pct, 0.001), 0.0, 1.0);
 
-		if (flick > 0.5) {
-			// Three overlapping sines at rising frequency and falling weight —
-			// a hand-drawn zigzag rather than one smooth curve.
-			float wob_amp = mix(0.05, 0.20, hp);
-			float wob = sin(UV.x * 14.0 + t * 3.0 + bolt_seed)            * wob_amp
-					  + sin(UV.x * 33.0 - t * 5.0 + bolt_seed * 2.0)      * wob_amp * 0.55
-					  + sin(UV.x * 71.0 + t * 8.0 + bolt_seed * 3.0)      * wob_amp * 0.25;
-			float ly   = clamp(0.5 + wob, 0.0, 1.0);
-			float dist = abs(UV.y - ly);
+			for (int k = 0; k < 3; k++) {
+				float ks   = float(k) * 37.31 + bolt_seed;
+				float t    = TIME * rate + float(k) * 0.29;
+				float tick = floor(t);
+				float ph   = fract(t);
 
-			float core = smoothstep(0.11, 0.0, dist);
-			float glowb = smoothstep(0.24, 0.0, dist) * 0.5;
-			float bright = mix(0.35, 1.0, hp) * bolt_amount;
+				// Not every bolt strikes on every tick.
+				float r1 = hash11(tick * 3.77 + ks);
+				if (r1 < mix(0.68, 0.20, hp)) { continue; }
 
-			col += vec3(0.85, 0.94, 1.0) * (core + glowb) * bright;
-			a    = max(a, min((core + glowb) * bright, 0.9));
+				float r2 = hash11(tick * 9.11 + ks * 1.7);
+				float r3 = hash11(tick * 1.93 + ks * 2.3);
+				float r4 = hash11(tick * 6.41 + ks * 3.9);
+
+				// Sharp attack, a moment at full, then a quick decay: a strike
+				// rather than a square wave. The plateau matters — a pure
+				// exponential from the instant of the tick decayed so fast that
+				// most frames caught nothing at all and the bar looked dead
+				// between flashes.
+				float flash = exp(-max(ph - 0.18, 0.0) * mix(12.0, 7.0, hp));
+
+				// Two octaves, not three: at 26 px tall the third only ever
+				// showed up as fuzz along the channel, and fuzz is the opposite
+				// of the clean angular kink that sells this.
+				//
+				// Node count tracks the fill so the kinks stay roughly the same
+				// distance apart in PIXELS whether the bar is full or a stub —
+				// a fixed count would cram the same number of turns into a
+				// quarter-length bolt and turn it back into a squiggle.
+				float sd   = tick * 1.3 + ks;
+				float amp  = mix(0.09, 0.30, hp);
+				float n1   = 4.0 + 9.0 * hp;
+				float path = bolt_path(lx, n1,       sd)       * 0.70
+						   + bolt_path(lx, n1 * 2.6, sd + 5.1) * 0.30;
+				float ly   = 0.5 + (r4 - 0.5) * 0.16 + path * amp;
+
+				float dist = abs(UV.y - ly);
+				float core = smoothstep(mix(0.026, 0.048, hp), 0.0, dist) * 1.45;
+				float halo = smoothstep(mix(0.095, 0.190, hp), 0.0, dist) * 0.40;
+
+				// A fork peeling away from the channel partway along and petering
+				// out — thinner and dimmer than the trunk it left.
+				float fx  = 0.28 + r3 * 0.34;
+				float fk  = smoothstep(fx, fx + 0.05, lx) * smoothstep(fx + 0.38, fx + 0.14, lx);
+				float fy  = ly + (bolt_path(lx, 11.0, sd + 21.3) * 0.55
+						  + (r2 - 0.5) * 1.6) * amp * 1.4 * fk;
+				float fcore = smoothstep(0.016, 0.0, abs(UV.y - fy)) * fk * 0.80;
+
+				lit = max(lit, (core + halo + fcore) * flash);
+			}
+
+			float bright = lit * mix(0.70, 1.50, hp) * bolt_amount * act;
+			col += vec3(0.86, 0.93, 1.0) * bright;
+			a    = max(a, min(bright, 0.95));
 		}
 	}
 
