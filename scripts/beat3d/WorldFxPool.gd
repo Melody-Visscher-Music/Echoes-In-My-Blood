@@ -117,8 +117,11 @@ func setup(fx_root: Node3D, tween_host: Node, shape_pts: Array,
 	_unit_sphere = SphereMesh.new()
 	_unit_sphere.radius          = 0.5
 	_unit_sphere.height          = 1.0
-	_unit_sphere.radial_segments = 6
-	_unit_sphere.rings           = 3
+	# 6x3 was fine while wisps only ever hovered small at the track edge. They
+	# now fly past the lens, where that reads as a hexagon rather than an orb —
+	# and this is ONE shared mesh, so the extra triangles cost nothing.
+	_unit_sphere.radial_segments = 12
+	_unit_sphere.rings           = 6
 
 	_build_spires()
 	_build_lights()
@@ -142,7 +145,11 @@ func _fx_beam_material() -> ShaderMaterial:
 
 
 func _fx_orb_material() -> ShaderMaterial:
-	return NeonMat.orb(Color.WHITE, 4.0)
+	var m: ShaderMaterial = NeonMat.orb(Color.WHITE, 4.0)
+	# Wisps sweep right past the camera now, so they dissolve at the silhouette
+	# rather than ending on a polygon edge. See energy_orb.gdshader.
+	m.set_shader_parameter("edge_fade", 1.0)
+	return m
 
 
 ## Tweens a shader uniform. The material is a Resource, so capturing it in the
@@ -274,11 +281,19 @@ func _build_wisps() -> void:
 		_wisp_busy.append(false)
 
 
+## `at` is the wisp's ROUTE: called with a 0-1 progress value, it returns the
+## world position for that moment. The caller owns the flight path — which is
+## where the knowledge of the track lives — and the pool owns the node, the
+## colour and the envelope.
+##
+## It used to take a start point and a world drift target instead, which could
+## only ever describe a straight line, and could not follow a curving track or
+## carry a sway.
+##
 ## radius reproduces the old per-wisp SphereMesh radius through scale on the
 ## shared unit sphere (scale = radius * 2 because the shared mesh is 1 m across).
-## drift_x / rise / dur keep the original tween shape exactly.
-func spawn_wisp(pos: Vector3, radius: float, col: Color, energy: float,
-		rise: float, drift_x: float, dur: float) -> void:
+func spawn_wisp(at: Callable, radius: float, col: Color, energy: float,
+		dur: float) -> void:
 	if _wisp_nodes.is_empty():
 		return
 	var i: int = _next_slot(_wisp_busy, _wisp_cur, _wisp_tws)
@@ -286,20 +301,35 @@ func spawn_wisp(pos: Vector3, radius: float, col: Color, energy: float,
 
 	var mat: ShaderMaterial = _wisp_mats[i]
 	NeonMat.set_tint(mat, col)
-	NeonMat.set_energy(mat, energy)
-	mat.set_shader_parameter("alpha", 0.92)
+	NeonMat.set_energy(mat, 0.0)
+	mat.set_shader_parameter("alpha", 0.0)
 
+	var full: float = radius * 2.0
 	var mi: MeshInstance3D = _wisp_nodes[i]
-	mi.position = pos
-	mi.scale    = Vector3.ONE * (radius * 2.0)
+	mi.position = at.call(0.0)
+	mi.scale    = Vector3.ONE * (full * 0.30)
 	mi.visible  = true
 	_wisp_busy[i] = true
 
+	# Route, size and glow in ONE tween method rather than five parallel tweens.
+	# A slot can be recycled mid-flight, and _next_slot can only kill the tween
+	# it has a handle on — anything else would keep driving a node that has
+	# already been handed to the next wisp.
+	var twinkle_ph: float = randf() * TAU
 	var tw: Tween = _new_tween()
-	tw.parallel().tween_property(mi,  "position:y", pos.y + rise, dur)
-	tw.parallel().tween_property(mi,  "position:x", drift_x, dur)
-	_tw_param(tw, mat, "energy", energy, 0.0, dur * 0.90)
-	_tw_param(tw, mat, "alpha",  0.92,   0.0, dur * 0.88)
+	tw.tween_method(func(t: float) -> void:
+		mi.position = at.call(t)
+		# Blooms on quickly, holds while it flies, falls away at the end. Kept
+		# soft at both ends: a wisp that pops in or cuts out reads as a glitch.
+		var rise_t: float = smoothstep(0.0, 0.14, t)
+		var fall_t: float = 1.0 - smoothstep(0.62, 1.0, t)
+		var env:    float = rise_t * fall_t
+		mi.scale = Vector3.ONE * (full * (0.30 + 0.70 * rise_t) * (0.35 + 0.65 * fall_t))
+		# A slow glimmer on top, out of phase per wisp, so a stream of them
+		# shimmers instead of moving like one rigid object.
+		NeonMat.set_energy(mat, energy * env * (0.82 + 0.18 * sin(twinkle_ph + t * TAU * 3.0)))
+		mat.set_shader_parameter("alpha", 0.95 * env)
+	, 0.0, 1.0, dur)
 	tw.tween_callback(func() -> void:
 		mi.visible = false
 		_wisp_busy[i] = false

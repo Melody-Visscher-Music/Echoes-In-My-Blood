@@ -8159,6 +8159,11 @@ func _spawn_gate_echo(gate_world_pos: Vector3, echo_color: Color) -> void:
 		gate_world_pos.x + rgt.x * lane_lateral,
 		lane_blocker_height * 0.5,
 		gate_world_pos.z + rgt.z * lane_lateral)
+	# A QuadMesh faces +Z, and these pooled nodes are built once and never
+	# rotated again. That happens to be square-on to the camera while the track
+	# runs down the Z axis and exactly edge-on - i.e. invisible - one corner
+	# later, which is why the hit echo quietly stopped appearing after a turn.
+	mi.rotation_degrees.y = _path_y_rot_at(_player_path_dist)
 
 	# Expand outward and fade to nothing over ~0.7 s
 	var tw := create_tween().set_parallel(true)
@@ -8396,24 +8401,49 @@ func _pulse_world(pass_id: String, note_dur: float = 0.0) -> void:
 			pulse_color, bloom_e, 0.80)
 
 	# ── 3. Floating wisps ─────────────────────────────────────
-	# Small glowing orbs drift upward from both track edges like fireflies
-	# stirred by the melody — gives the air a living, musical feel.
+	# Lit at the halo's own plane, well up the track, and then flown back down it
+	# and out past the camera: the melody arrives from up ahead and washes over
+	# the player. They used to hover at his elbow and drift up a couple of
+	# metres, which put them where he never looks and gave them nowhere to go.
+	#
+	# Each one owns a route rather than a destination — the closure below is
+	# sampled by the pool across the wisp's life, so the flight follows the
+	# centreline through a corner instead of cutting the chord, and can carry a
+	# sway and a climb at the same time.
+	#
 	# Count per side is a quality-tier knob (WorldFxPool.wisps_per_side); the
-	# randomised radius now rides on scale over one shared unit sphere instead of
+	# randomised radius rides on scale over one shared unit sphere instead of
 	# generating a fresh SphereMesh per orb.
-	var wsp_count: int = _fx_pool.wisps_per_side
+	var wsp_count: int   = _fx_pool.wisps_per_side
 	var wisp_e:    float = lerpf(3.0, 7.0, vit)
-	for side in [-4.6, 4.6]:
+	var w_from:    float = _player_path_dist + player.forward_speed * 0.55   # halo plane
+	var half_w:    float = _track_full_width() * 0.5
+	for side in [-1.0, 1.0]:
 		for i in range(wsp_count):
-			var wsp_r: float   = 0.05 + randf() * 0.07
-			var wc: Color      = pulse_color.lightened(randf() * 0.35)
-			var z_off: float   = float(i) * 2.0 - 3.0
-			var x_off: float   = side + randf_range(-0.9, 0.9)
-			var wsp_pos: Vector3 = _path_world_pos(_player_path_dist + z_off, x_off, 0.2 + randf() * 0.6)
-			var dur: float     = 0.55 + randf() * 0.40
-			var rise: float    = 2.0 + randf() * 2.0
-			var drift_x: float = x_off + randf_range(-0.8, 0.8)
-			_fx_pool.spawn_wisp(wsp_pos, wsp_r, wc, wisp_e, rise, drift_x, dur)
+			var lat0: float = side * randf_range(half_w * 0.30, half_w + 2.40)
+			var lat1: float = lat0 + randf_range(-0.9, 0.9)
+			# Kept low and climbing only a little. Higher up they crossed the
+			# sight line to the gates, which is the one thing the player is
+			# actually reading — down here they stay peripheral.
+			var h0:   float = 0.15 + randf() * 0.60
+			var h1:   float = h0 + 0.30 + randf() * 0.70
+			var sway: float = randf_range(0.20, 0.55)
+			var ph:   float = randf() * TAU
+			var dur:  float = 0.62 + randf() * 0.24
+			# Drifts backwards along the path on its own account, on top of the
+			# player closing on it — together that puts the moment it sweeps past
+			# the camera near the end of its life, so it leaves frame instead of
+			# winking out in the middle of the screen.
+			var w_to: float = w_from - (6.0 + randf() * 3.0)
+			# One in five burns near-white, so the stream has highlights in it
+			# rather than being one flat colour repeated ten times.
+			var wc: Color = pulse_color.lightened(0.70 if randf() < 0.2 else randf() * 0.35)
+			_fx_pool.spawn_wisp(func(t: float) -> Vector3:
+				return _path_world_pos(
+					lerpf(w_from, w_to, t),
+					lerpf(lat0, lat1, t) + sin(ph + t * TAU) * sway,
+					lerpf(h0, h1, t))
+			, 0.05 + randf() * 0.07, wc, wisp_e, dur)
 
 	# ── 4. Fog colour pulse ───────────────────────────────────
 	# The world's atmospheric fog briefly absorbs the melody's colour —
@@ -8559,80 +8589,161 @@ func _burst_sparks(vit: float, _col: Color) -> void:
 
 
 # ── 3D Speed streaks ──────────────────────────────────────────────────────────
-# Elongated particles that fly past the player in world space, attached to the
-# player so they always surround them. Appear at x10 combo, full intensity x50.
+# A tight burst out of the jacket, parented to the player so it rides every
+# corner with him. Personal: HIS speed, in his own colour, going white-hot as
+# the combo climbs and gold in overdrive.
+#
+# There was briefly a second layer here — a ring of streaks whipping past on
+# every side. It read as noise around the thing the player is trying to watch,
+# so it is gone; the burst is the whole effect.
+#
+# It runs TRANSFORM_ALIGN_Z_BILLBOARD_Y_TO_VELOCITY, which is what actually
+# makes a streak read as a streak: the quad always faces the camera and always
+# points along its own motion. The old emitter aligned nothing and leaned on a
+# BoxMesh that was long in Z, which only describes the direction of travel while
+# the track still runs down the Z axis.
+#
+# Colour is driven through ParticleProcessMaterial.color (one property write per
+# frame) and brightness is folded into it — values above 1.0 bloom through the
+# environment glow. The gradient texture only carries the alpha/falloff SHAPE,
+# so it is baked once at build time and never touched again.
+
+const _STREAK_MIN_COMBO:  float = 2.0    # nothing below the first multiplier
+const _STREAK_FULL_COMBO: float = 15.0   # jacket burst is at full density here
+
+
+## Additive, unshaded, double-sided — a light trail, not a solid object.
+func _streak_material() -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
+	m.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
+	m.blend_mode                 = BaseMaterial3D.BLEND_MODE_ADD
+	m.vertex_color_use_as_albedo = true
+	m.albedo_color               = Color(1.0, 1.0, 1.0, 1.0)
+	m.cull_mode                  = BaseMaterial3D.CULL_DISABLED
+	m.disable_receive_shadows    = true
+	return m
+
+
+## Hot head, coloured body, clean tail — as a multiplier over whatever colour
+## the process material is carrying that frame.
+func _bake_streak_ramp() -> ImageTexture:
+	var img := Image.create(48, 1, false, Image.FORMAT_RGBA8)
+	for x in range(48):
+		var t: float = float(x) / 47.0
+		var c: Color
+		if t < 0.20:
+			c = Color(1.0, 1.0, 1.0, 1.0).lerp(Color(0.92, 0.92, 0.92, 0.90), t / 0.20)
+		elif t < 0.80:
+			c = Color(0.92, 0.92, 0.92, 0.90).lerp(Color(0.30, 0.30, 0.30, 0.0), (t - 0.20) / 0.60)
+		else:
+			c = Color(0.0, 0.0, 0.0, 0.0)
+		img.set_pixel(x, 0, c)
+	return ImageTexture.create_from_image(img)
+
+
+## Stretch on the way out, taper before death, so a streak is drawn rather than
+## simply switched on and off.
+func _bake_streak_curve(birth: float, peak: float, death: float) -> CurveTexture:
+	var c := Curve.new()
+	c.add_point(Vector2(0.0,  birth))
+	c.add_point(Vector2(0.22, peak))
+	c.add_point(Vector2(1.0,  death))
+	var ct := CurveTexture.new()
+	ct.curve = c
+	return ct
+
 
 func _ensure_speed_streaks() -> void:
 	if _speed_streaks != null or player == null:
 		return
 
-	# BoxMesh approach — no RibbonTrailMesh / trail system.
-	# Each particle IS an already-elongated streak: wide enough to see (X),
-	# razor-thin (Y), and long in Z so it looks like a light-trail line from
-	# the slightly-elevated rear camera.  No alignment fighting — DISABLED keeps
-	# the box naturally axis-aligned so Z-length stays along the run direction.
-	var sm := BoxMesh.new()
-	sm.size = Vector3(0.055, 0.007, 1.6)   # wide-ish, paper-thin, long in Z
+	# Y is the streak's LENGTH: Y_TO_VELOCITY aligns the mesh's Y axis with the
+	# particle's direction of travel, whichever way that happens to point.
+	var qm := QuadMesh.new()
+	qm.size = Vector2(0.045, 1.10)
+	qm.surface_set_material(0, _streak_material())
 
-	var mmat := StandardMaterial3D.new()
-	mmat.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mmat.transparency               = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mmat.vertex_color_use_as_albedo = true
-	mmat.albedo_color               = Color(1.0, 1.0, 1.0, 1.0)
-	mmat.cull_mode                  = BaseMaterial3D.CULL_DISABLED
-	sm.surface_set_material(0, mmat)
-
-	# Color over particle lifetime: jacket colour on spawn → fades to transparent.
-	var jc := GameConfig.jacket_color
-	var ramp := _bake_gradient(Color(jc.r, jc.g, jc.b, 0.95), Color(jc.r * 0.3, jc.g * 0.3, jc.b * 0.3, 0.0))
+	var jc: Color = GameConfig.jacket_color
 
 	var pmat := ParticleProcessMaterial.new()
-	# Tighter emission box — keeps streaks close to jacket centre so they look
+	# Tight emission box — keeps streaks close to jacket centre so they look
 	# like they burst out from inside the fabric rather than floating beside it.
 	pmat.emission_shape       = ParticleProcessMaterial.EMISSION_SHAPE_BOX
-	pmat.emission_box_extents = Vector3(0.17, 0.09, 0.01)
-	# Shoot straight backward — box Z-axis is already along run direction.
-	pmat.direction            = Vector3(0.0, 0.0, -1.0)
-	pmat.spread               = 1.5   # nearly parallel, tiny variance for natural feel
+	# Shoulder-width and torso-tall, so the burst reads as coming off HIM rather
+	# than out of a single point in the middle of his back.
+	pmat.emission_box_extents = Vector3(0.26, 0.20, 0.02)
+	pmat.direction            = Vector3(0.0, 0.0, -1.0)   # local −Z = straight back
+	pmat.spread               = 9.0                       # fans out instead of collinear
 	pmat.gravity              = Vector3.ZERO
-	pmat.initial_velocity_min = 14.0
-	pmat.initial_velocity_max = 20.0
-	pmat.scale_min            = 1.0
-	pmat.scale_max            = 1.0
+	pmat.initial_velocity_min = 18.0
+	pmat.initial_velocity_max = 26.0
+	pmat.scale_min            = 0.70
+	pmat.scale_max            = 1.00
+	# Ends near zero, not at a fifth: whatever survives to the camera plane has
+	# to be too small to register, because a billboarded quad half a metre from
+	# the lens is a bar across the screen no matter how thin it is in metres.
+	pmat.scale_curve          = _bake_streak_curve(0.35, 1.0, 0.08)
 	pmat.color                = Color(jc.r, jc.g, jc.b, 1.0)
-	pmat.color_ramp           = ramp
+	pmat.color_ramp           = _bake_streak_ramp()
 	_speed_streaks_mat = pmat
 
 	var pe := GPUParticles3D.new()
-	pe.process_material  = pmat
-	pe.draw_pass_1       = sm
-	pe.amount            = 8
-	pe.lifetime          = 0.38
-	pe.trail_enabled     = false   # the box itself is the streak — no trail system
-	pe.transform_align   = GPUParticles3D.TRANSFORM_ALIGN_DISABLED
-	pe.one_shot          = false
-	pe.emitting          = true
-	pe.explosiveness     = 0.0
-	pe.randomness        = 0.0
-	pe.amount_ratio      = 0.0
+	pe.process_material = pmat
+	pe.draw_pass_1      = qm
+	pe.amount           = 28
+	# Short on purpose, and the single most important number here. The camera
+	# rides 4.5 m off his back while he runs forward at ~18 m/s, so a streak
+	# fired backwards closes on the lens at nearly 40 m/s. Anything still bright
+	# and full-size when it gets there is a white bar across the whole screen.
+	pe.lifetime         = 0.16
+	pe.trail_enabled    = false   # the quad itself is the streak
+	pe.transform_align  = GPUParticles3D.TRANSFORM_ALIGN_Z_BILLBOARD_Y_TO_VELOCITY
+	pe.one_shot         = false
+	pe.emitting         = true
+	pe.explosiveness    = 0.0
+	pe.randomness       = 0.35
+	pe.amount_ratio     = 0.0
+	# Particles travel far behind an emitter that is only ever a metre or so
+	# wide, so the default culling box would pop them out early.
+	pe.visibility_aabb  = AABB(Vector3(-6.0, -6.0, -32.0), Vector3(12.0, 12.0, 38.0))
 	# Slightly higher (1.28 vs 1.05) to sit at jacket torso level.
 	# Z = -0.06 puts the emitter at the back surface of the jacket (facing camera),
 	# so streaks appear to burst out from inside the fabric.
-	pe.position          = Vector3(0.0, 1.28, -0.06)
+	pe.position         = Vector3(0.0, 1.28, -0.06)
 	player.add_child(pe)
 	_speed_streaks = pe
+
 
 
 func _update_speed_streaks() -> void:
 	if _speed_streaks_mat == null or _speed_streaks == null:
 		return
-	# Fade in from combo x0, fully visible at x40
-	var combo_t: float = clampf(float(_combo) / 40.0, 0.0, 1.0)
-	_speed_streaks.amount_ratio = combo_t
-	# Beat pulse: briefly boost velocity so streaks flare longer on each hit
-	var vel_boost: float = _beat_phase * 8.0
-	_speed_streaks_mat.initial_velocity_min = 20.0 + vel_boost
-	_speed_streaks_mat.initial_velocity_max = 24.0 + vel_boost
+	# OVERDRIVE outranks the combo ramp outright: the ×100 window should look
+	# like the fastest the game gets, whatever combo happens to be behind it.
+	var od:      bool  = _charge_mult_timer > 0.0
+	var combo_f: float = float(_combo)
+	var flare:   float = _beat_phase * _beat_phase   # snappier than raw phase
+
+	var t: float = 1.0 if od else clampf(combo_f / _STREAK_FULL_COMBO, 0.0, 1.0)
+	# A floor rather than a fade from zero: below ×2 there is no multiplier and
+	# no streaks at all, and from there they are legible straight away and grow.
+	# Ramping density up from nothing spent the first fifteen gates on an effect
+	# too faint to see from the rear camera.
+	var dens: float = 0.0 if (not od and combo_f < _STREAK_MIN_COMBO) \
+		else lerpf(0.34, 1.0, t)
+	_speed_streaks.amount_ratio = clampf(dens + flare * 0.15, 0.0, 1.0)
+	var vel: float = lerpf(12.0, 22.0, t) + flare * 8.0
+	_speed_streaks_mat.initial_velocity_min = vel
+	_speed_streaks_mat.initial_velocity_max = vel + 7.0
+	# His own jacket colour, burning toward white as the combo climbs; gold once
+	# overdrive is live. Brightness rides on the colour, so it can go overbright
+	# and bloom without a second material write.
+	var base: Color = Color(1.00, 0.82, 0.25) if od \
+		else GameConfig.jacket_color.lerp(Color(1.0, 1.0, 1.0), t * 0.55)
+	var energy: float = lerpf(1.45, 2.20, t) + flare * 0.90
+	_speed_streaks_mat.color = Color(base.r * energy, base.g * energy, base.b * energy, 1.0)
+
 
 
 # ── Footstep floor ripple ─────────────────────────────────────────────────────
@@ -8648,14 +8759,18 @@ func _check_footstep_ripple(delta: float) -> void:
 	_foot_cycle += delta * 3.2
 	var s: float = sin(_foot_cycle * TAU)
 
-	# Downward zero-crossing → right foot lands; upward → left foot lands
+	# Downward zero-crossing → right foot lands; upward → left foot lands.
+	# The ±0.28 is a step to the SIDE, so it has to ride the path's right vector
+	# — as a world-X offset it swung round to sit in front of and behind the
+	# player once the track turned, putting both feet on the centre line.
+	var foot_r: Vector3 = _path_right_at(_player_path_dist) * 0.28
 	if _foot_prev_sin > 0.15 and s <= 0.0:
 		_emit_footstep_ripple(
-			player.global_position + Vector3(0.28, 0.05, 0.0),
+			player.global_position + foot_r + Vector3(0.0, 0.05, 0.0),
 			Color(0.60, 0.08, 0.92), 1)   # right foot — purple (_COL_EYE_R)
 	elif _foot_prev_sin < -0.15 and s >= 0.0:
 		_emit_footstep_ripple(
-			player.global_position + Vector3(-0.28, 0.05, 0.0),
+			player.global_position - foot_r + Vector3(0.0, 0.05, 0.0),
 			Color(0.10, 0.55, 1.00), 0)   # left foot  — blue  (_COL_EYE_L)
 	_foot_prev_sin = s
 
@@ -8979,8 +9094,13 @@ func _spawn_finish_lasers() -> void:
 	for side in [-1, 1]:
 		for wave in range(3):
 			var sdelay: float = 0.30 + float(wave) * 1.80
+			var sweep_pd: float = _player_path_dist + 8.0 + float(wave) * 12.0
 			var sweep_pivot := Node3D.new()
-			sweep_pivot.position = _path_world_pos(_player_path_dist + 8.0 + float(wave) * 12.0, float(side) * (tw * 0.5 + 1.0), 0.5)
+			sweep_pivot.position = _path_world_pos(sweep_pd, float(side) * (tw * 0.5 + 1.0), 0.5)
+			# Yawed onto the path so the rotation:z sweep below still swings the
+			# beam ACROSS the track. Unrotated it swings along the direction of
+			# travel instead, anywhere the run has turned off the Z axis.
+			sweep_pivot.rotation_degrees.y = _path_y_rot_at(sweep_pd)
 			world_fx_root.add_child(sweep_pivot)
 
 			var sweep: MeshInstance3D = _make_box_mesh(Vector3(0.12, 45.0, 0.12),
@@ -10004,10 +10124,14 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	# ── Ambient spark emitter — init lazily, follow player, update density/color ──
 	_ensure_spark_ambient()
 	if _spark_ambient != null and player != null:
-		# Center the big sphere above and ahead of the player so it fills the sky
-		_spark_ambient.global_position = player.global_position + Vector3(0.0, 6.0, 14.0)
+		# Center the big sphere above and ahead of the player so it fills the sky.
+		# "Ahead" is the path tangent, not +Z: as a fixed world offset the sphere
+		# slid off to one side after every corner and the sky thinned out ahead.
+		_spark_ambient.global_position = player.global_position \
+			+ _path_forward_at(_player_path_dist) * 14.0 \
+			+ Vector3(0.0, 6.0, 0.0)
 
-	# ── 3D speed streaks — appear at high combo, follow the player ──────────
+	# ── 3D speed streaks — ride the combo, follow the player ─────────────────
 	_ensure_speed_streaks()
 	_update_speed_streaks()
 

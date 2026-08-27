@@ -20,6 +20,11 @@ uniform float corona     : hint_range(0.0, 2.0) = 0.75;
 uniform float swirl_speed = 0.9;
 uniform float swirl_amount : hint_range(0.0, 1.0) = 0.30;
 uniform float alpha : hint_range(0.0, 1.0) = 1.0;
+// Fades the silhouette out instead of ending at the mesh edge. Off by default,
+// because a gem or a grind spark wants a solid body; the melody wisps turn it
+// on, since they now fly right past the lens where a low-poly sphere at full
+// alpha to its own rim reads as a hexagon with a glow inside it.
+uniform float edge_fade : hint_range(0.0, 1.0) = 0.0;
 
 
 void fragment() {
@@ -44,5 +49,5 @@ void fragment() {
 	METALLIC  = 0.0;
 	ROUGHNESS = 0.30;
 	EMISSION  = tint.rgb * energy * glow;
-	ALPHA     = clamp(alpha, 0.0, 1.0);
+	ALPHA     = clamp(alpha * mix(1.0, smoothstep(0.0, 0.40, ndv), edge_fade), 0.0, 1.0);
 }
