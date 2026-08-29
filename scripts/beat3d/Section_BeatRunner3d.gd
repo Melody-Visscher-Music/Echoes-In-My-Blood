@@ -352,6 +352,32 @@ var _wj_slide_engaged:   bool  = false  # true while the player is inside the ra
 ## one randomly-chosen lane now: everything either side of it is open void, and
 ## missing it means the drop, not a shock.
 var _wj_ramp_lane:       int   = -1
+# Descent spark taps. The ramp used to ask for nothing at all — you rode it down
+# and waited. One spark per beat down the deck now, caught on the same contract
+# the grind rails use (hold the trigger, tap jump). Parallel arrays, exactly like
+# _spark_nodes / _spark_caught / _spark_tap_pds, kept separate so a descent and a
+# rail can never judge against each other's list.
+var _desc_spark_nodes:  Array[Node3D] = []
+var _desc_spark_caught: Array[bool]   = []
+var _desc_spark_pds:    Array[float]  = []
+## Score per descent spark. Matches the grind rail's per-spark value: the ramp is
+## the payoff for having cleared the climb, so it should pay like one.
+@export var descent_spark_score: int = 750
+## Miss a spark and the combo breaks. Turn this off to make the ramp a pure bonus
+## lane, where failing to tap simply scores nothing.
+@export var descent_miss_breaks_combo: bool = true
+## Health lost per missed spark. 0 by default — a miss costs the combo, which is
+## already the expensive currency; taking HP as well would make the reward for a
+## clean wall-jump climb into a second gauntlet.
+@export_range(0.0, 0.25, 0.01) var descent_miss_health: float = 0.0
+## Spark taps per beat down the ramp. 2 = eighth notes. One per beat sounds like
+## the obvious choice and is not: a ramp is only 2-5 beats long, so on-beat gives
+## two taps on a short one, which is not a mechanic. Eighths read as a fill.
+@export_range(1, 4, 1) var descent_spark_subdiv: int = 2
+## Floor on the gap between taps, in seconds. The subdivision above backs off to
+## on-beat by itself when it would breach this, so a fast song cannot turn the
+## ramp into a drum roll no one can play.
+@export_range(0.08, 0.50, 0.01) var descent_min_tap_s: float = 0.18
 
 # Ambient sky sparks — always drifting, pulses on beat
 var _spark_ambient:     GPUParticles3D          = null
@@ -664,6 +690,9 @@ func _ready() -> void:
 	# Connect grind-tap signal so Section can judge spark catches
 	if player.grind_tap_pressed.is_connected(_on_grind_tap) == false:
 		player.grind_tap_pressed.connect(_on_grind_tap)
+	# Same idea for the descent ramp, judged against its own spark list.
+	if player.descent_tap_pressed.is_connected(_on_descent_tap) == false:
+		player.descent_tap_pressed.connect(_on_descent_tap)
 
 	# Cache camera for beat-sync FX
 	_camera = get_viewport().get_camera_3d()
@@ -920,6 +949,13 @@ func _process(delta: float) -> void:
 
 	# Tell the character where the next gate wants him, so he looks at it.
 	_update_look_ahead()
+
+	# ...and whether the stretch he is running through is electric. Purely a
+	# presentation switch — hitboxes, timing windows and scoring are identical in
+	# and out of a zone. It makes him swap to the compact "*Elec" clips and drop
+	# the flourish, because in here a gate is a live arc and contact is death.
+	if player != null:
+		player.set_electric(_is_electric_at(t_s))
 
 	# floor now reacts to BEATS
 	_run_floor_beats(t_s)
@@ -1381,17 +1417,21 @@ func _build_runner_plan_from_beats(beat_events: Array[Dictionary]) -> Array[Dict
 			# where the ramp put the player and the first gate after a wall jump
 			# asks for nothing.
 			#
-			# That only works from an outer lane. Now that the ramp can land in the
-			# middle, there is no clamping direction — either way is one real lane
-			# move — so leave the generated action alone and let it be an ordinary
-			# gate rather than forcing an arbitrary sidestep.
+			# The clamp only works from an OUTER lane, and the ramp can land in the
+			# middle, so this used to give up there and leave an ordinary gate — which
+			# meant coming off the bottom of the ramp and immediately having to dodge
+			# sideways. Now that the descent asks for spark taps all the way down, that
+			# is not a fair thing to ask, so the lane is forced directly instead.
+			#
+			# Overriding post_lane is enough on its own: a "left"/"right" gate is judged
+			# purely on WHERE HE IS at the beat (BeatRunnerPlayer.matches_gate never
+			# looks at the button), so an arch on the lane he is already standing in is
+			# a gate that asks for nothing — exactly what the clamp trick achieved, but
+			# from any lane.
+			var force_ramp_lane: bool = false
 			if not wj_gate_fixed and (action == "left" or action == "right"):
-				var max_li: int = player.lane_xs.size() - 1
-				if wj_exit_lane >= max_li:
-					action = "right"
-				elif wj_exit_lane <= 0:
-					action = "left"
-				wj_gate_fixed = true
+				force_ramp_lane = true
+				wj_gate_fixed   = true
 
 			var pre_lane: int  = virtual_lane
 
@@ -1400,6 +1440,10 @@ func _build_runner_plan_from_beats(beat_events: Array[Dictionary]) -> Array[Dict
 				"right":      virtual_lane = min(player.lane_xs.size() - 1, virtual_lane + 1)
 				"wall_left":  virtual_lane = player.lane_xs.size() - 1   # bounce to right side
 				"wall_right": virtual_lane = 0                            # bounce to left side
+			# Applied AFTER the match so it wins over whatever the action would have
+			# done: post_lane below reads virtual_lane, and that is what places the arch.
+			if force_ramp_lane:
+				virtual_lane = clampi(wj_exit_lane, 0, player.lane_xs.size() - 1)
 			# Record wall landing lane separately — virtual_lane may drift if padding follows
 			if action == "wall_left" or action == "wall_right":
 				last_wj_act_lane = virtual_lane
@@ -5069,6 +5113,40 @@ func _spawn_wj_geometry_on_path() -> void:
 	_wj_ramp_lane = ramp_lane
 	var ramp_x: float = player.lane_xs[ramp_lane]
 
+	# ── 7z. Descent sparks ───────────────────────────────────────────────────
+	# One per beat down the deck, so the ride is played rather than watched. Spaced
+	# in METRES from the song's own beat length — the same conversion the descent
+	# platforms use — so they land on the beat at any tempo.
+	#
+	# The first and last are inset: a spark right at the lip would have to be tapped
+	# on the frame he touches the ramp, before he can possibly have read it.
+	_clear_descent_sparks()
+	var beat_m: float = maxf(2.0, _runner_avg_beat_s * player.forward_speed)
+	# Subdivide, then back off to on-beat if that would put the taps closer together
+	# than a player can actually hit them. Distance is the unit here because the
+	# sparks are placed along the path, but the limit is a TIME one — hence the
+	# division by forward_speed to check it.
+	var sub_m: float = beat_m / maxf(1.0, float(descent_spark_subdiv))
+	if sub_m / maxf(1.0, player.forward_speed) < descent_min_tap_s:
+		sub_m = beat_m
+	var desc_inset: float = minf(sub_m * 0.5, slide_run * 0.18)
+	var desc_span:  float = slide_run - desc_inset * 2.0
+	var desc_count: int   = clampi(int(floor(desc_span / sub_m)) + 1, 0, 24)
+	for di2: int in range(desc_count):
+		var spd: float = slide_start_z + desc_inset + float(di2) * sub_m
+		if spd > slide_end_z - desc_inset * 0.5:
+			break
+		# Ride the deck down: height falls linearly from the top of the ramp to the
+		# ground, plus the usual orb clearance above the surface.
+		var frac: float = clampf((spd - slide_start_z) / maxf(0.01, slide_run), 0.0, 1.0)
+		var sy:   float = slide_h * (1.0 - frac) + _GRIND_SPARK_H
+		var sp_node: Node3D = _build_spark_node_at(spd, ramp_x, sy)
+		sp_node.visible = false
+		gates_root.add_child(sp_node)
+		_desc_spark_nodes.append(sp_node)
+		_desc_spark_caught.append(false)
+		_desc_spark_pds.append(spd)
+
 	var ramp_cz: float = slide_start_z + slide_run * 0.5
 	var ramp_ch: float = slide_h * 0.5
 	# Positive X pitch: local +Z tilts toward -Y (down) — exit end is lower. ✓
@@ -5796,10 +5874,128 @@ func _update_wj_slide(_delta: float) -> void:
 	var pz: float = _player_path_dist
 	var should_slide: bool = pz >= _wj_slide_start_z and pz < _wj_slide_end_z + 4.0
 
+	# Spark visibility and misses have to run EVERY frame while engaged, not only
+	# on the edge — the early-out below fires as soon as the state stops changing.
+	if _wj_slide_engaged:
+		_update_descent_sparks()
+
 	if should_slide == _wj_slide_engaged:
 		return
 	_wj_slide_engaged = should_slide
-	player.set_jump_locked(should_slide)
+	player.set_wj_descent(should_slide)
+	if not should_slide:
+		# Off the bottom. Anything still uncaught is behind him and must not be able
+		# to break a combo later in the song.
+		_clear_descent_sparks()
+
+
+## Frees the ramp's spark orbs and empties the parallel arrays. Safe to call when
+## there are none — it runs once per WJ zone build and once on leaving the ramp.
+func _clear_descent_sparks() -> void:
+	for sn: Node3D in _desc_spark_nodes:
+		if is_instance_valid(sn):
+			sn.queue_free()
+	_desc_spark_nodes.clear()
+	_desc_spark_caught.clear()
+	_desc_spark_pds.clear()
+
+
+## Shows the orbs as he comes down the deck and retires the ones he rode past.
+## Mirrors _update_spark_visibility() + _check_missed_sparks() for the rail, but a
+## descent miss costs the COMBO rather than dropping him off anything — there is
+## nothing to fall off here that is not already a death.
+func _update_descent_sparks() -> void:
+	if _desc_spark_nodes.is_empty():
+		return
+	var pd:          float = _player_path_dist
+	var behind_m:    float = judge_window_s * player.forward_speed
+	var miss_thresh: float = judge_window_s * player.forward_speed * 1.6
+	for i: int in range(_desc_spark_nodes.size()):
+		if _desc_spark_caught[i]:
+			continue
+		var spd:   float = _desc_spark_pds[i]
+		var ahead: float = spd - pd
+		if is_instance_valid(_desc_spark_nodes[i]):
+			_desc_spark_nodes[i].visible = ahead >= -behind_m and ahead <= _GRIND_PREVIEW_M
+		if pd > spd + miss_thresh:
+			_desc_spark_caught[i] = true
+			if is_instance_valid(_desc_spark_nodes[i]):
+				_desc_spark_nodes[i].visible = false
+			_miss_descent_spark()
+
+
+## A spark rode past untapped.
+func _miss_descent_spark() -> void:
+	if not descent_miss_breaks_combo:
+		return
+	# The OVERDRIVE window protects the combo everywhere else it can be lost, so it
+	# protects it here too — otherwise the ×100 payoff would have one lane in the
+	# song where it silently does not apply.
+	if _charge_mult_timer > 0.0:
+		return
+	_combo = 0
+	if descent_miss_health > 0.0:
+		_health_pct = clampf(_health_pct - descent_miss_health, 0.0, 1.0)
+		_update_hud_health()
+		if _health_pct <= 0.0:
+			_trigger_death()
+			return
+	_world_vitality = clampf(_world_vitality - 0.06, 0.0, 1.0)
+	_update_hud_score()
+	_hud_flash_color(Color(1.00, 0.10, 0.10, 0.12), 0.26)
+	if _hud != null:
+		_hud.combo_flash(Color(1.0, 0.15, 0.15, 1.0), 0.05, 0.18)
+	if _sfx_miss != null:
+		_sfx_miss.stop()
+		_sfx_miss.play()
+
+
+## Jump tapped (with the grind trigger held) on the ramp. Same nearest-spark
+## search the rail uses, against the descent's own list.
+func _on_descent_tap() -> void:
+	if _desc_spark_nodes.is_empty() or not _wj_slide_engaged:
+		return
+	var pd:       float = _player_path_dist
+	var best_idx: int   = -1
+	var best_d:   float = judge_window_s * player.forward_speed * 1.5
+	for i: int in range(_desc_spark_nodes.size()):
+		if _desc_spark_caught[i]:
+			continue
+		var d: float = absf(_desc_spark_pds[i] - pd)
+		if d < best_d:
+			best_d   = d
+			best_idx = i
+	if best_idx >= 0:
+		_catch_descent_spark(best_idx)
+
+
+func _catch_descent_spark(idx: int) -> void:
+	_desc_spark_caught[idx] = true
+	var pts: int = descent_spark_score * _score_multiplier()
+	_score    += pts
+	_combo    += 1
+	_max_combo = maxi(_max_combo, _combo)
+	_update_hud_score()
+
+	# The character pumps on the beat, so the catch is visible on HIM and not only
+	# in the HUD — the ramp is the one stretch where the camera has nothing else
+	# to look at.
+	player.descent_pump()
+
+	if is_instance_valid(_desc_spark_nodes[idx]):
+		var sn: Node3D = _desc_spark_nodes[idx]
+		_spawn_score_popup(sn.global_position, pts, 1)
+		sn.visible = true
+		var tw := create_tween()
+		tw.tween_property(sn, "scale", Vector3(2.8, 2.8, 2.8), 0.07)
+		tw.tween_property(sn, "scale", Vector3(0.0, 0.0, 0.0), 0.11)
+		tw.tween_callback(sn.queue_free)
+		_desc_spark_nodes[idx] = null
+
+	if _hud != null and _combo >= 2:
+		_hud.combo_flash(Color(0.4, 1.5, 1.5, 1.0), 0.05, 0.12)
+	if _combo in STREAK_MILESTONES:
+		_show_streak_milestone(_combo)
 
 
 func _update_charge_tunnel(t_s: float, delta: float) -> void:
@@ -6318,8 +6514,16 @@ func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 
 func _build_spark_node(pd: float) -> Node3D:
 	var off: Vector2 = _grind_branch_offset(pd)
+	return _build_spark_node_at(pd, _GRIND_RAIL_LATERAL + off.x, _GRIND_SPARK_H + off.y)
+
+
+## The orb itself, at an arbitrary lateral offset and height. Split out of
+## _build_spark_node() so the descent ramp gets visually identical sparks without
+## inheriting the grind rail's branch offset — a ramp spark sits above the DECK,
+## in the ramp's lane, and the rail is nowhere near it.
+func _build_spark_node_at(pd: float, lateral: float, height: float) -> Node3D:
 	var root := Node3D.new()
-	root.position           = _path_world_pos(pd, _GRIND_RAIL_LATERAL + off.x, _GRIND_SPARK_H + off.y)
+	root.position           = _path_world_pos(pd, lateral, height)
 	root.rotation_degrees.y = _path_y_rot_at(pd)
 
 	# Each spark orb gets its own random color, rolled once here and never

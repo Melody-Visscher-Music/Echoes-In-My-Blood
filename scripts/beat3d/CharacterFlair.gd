@@ -28,6 +28,12 @@ var speed01:     float = 0.0   # 0..1 how fast he is going vs. the authored base
 var airborne:    bool  = false
 var beat:        float = 0.0   # 0..1, snaps to 1 on each beat and decays
 var look_lateral: float = 0.0  # where the next gate is, -1..1 (negative = his left)
+## 0..1 — how dangerous the surroundings are right now. BeatRunnerPlayer drives
+## this to 1 inside an electric zone, where touching a gate kills rather than
+## bumps. Everything it scales is personality: the fidget, the beat bop, the tail
+## whip. He does not stop moving, he stops PLAYING — the loose, showing-off
+## motion drains out and what is left is tense and small. See the Danger group.
+var danger: float = 0.0
 
 ## Fires a landing recoil. Called by the player on the frame it touches down;
 ## the size scales with how hard the landing was.
@@ -95,6 +101,20 @@ func lane_flick(dir: float) -> void:
 ## How fast the lag catches up. Lower = looser, floppier arms.
 @export_range(1.0, 30.0, 0.5) var elbow_catchup: float = 9.0
 
+@export_group("Danger")
+## How much of the fidget and the beat bop survive at full danger. 0.15 leaves a
+## trace so he still reads as alive rather than as a paused model.
+@export_range(0.0, 1.0, 0.05) var danger_idle_left: float = 0.15
+## Extra forward hunch at full danger. Small — the clips already curl him; this
+## is the bit of tension that shows even between moves.
+@export_range(0.0, 25.0, 0.5) var danger_hunch_deg: float = 6.0
+## How far the ears pin back at full danger. This is the single clearest tell an
+## animal has, and it costs one line.
+@export_range(0.0, 1.5, 0.05) var danger_ear_pin: float = 0.9
+## How much of the tail whip is held back at full danger. The tail tucks in
+## rather than trailing wide where an arc could find it.
+@export_range(0.0, 1.0, 0.05) var danger_tail_hold: float = 0.55
+
 @export_group("")
 ## Master switch. Off = the authored clips play completely untouched.
 @export var enabled: bool = true
@@ -105,6 +125,7 @@ var _land_t:   float = 0.0
 var _flick:    float = 0.0
 var _look_s:   float = 0.0   # smoothed look target
 var _bank_s:   float = 0.0
+var _danger_s: float = 0.0   # smoothed danger — zones start and end on a hard edge
 var _lean_s:   float = 0.0
 var _twist_s:  float = 0.0
 var _elbow_l:  float = 0.0   # lagged upper-arm swing, per side
@@ -195,6 +216,11 @@ func _process_modification_with_delta(delta: float) -> void:
 	# Smooth every continuous input so a jittery frame can never snap the body.
 	_look_s  = lerpf(_look_s,  clampf(look_lateral, -1.0, 1.0), k)
 	_bank_s  = lerpf(_bank_s,  clampf(bank, -1.0, 1.0), k)
+	# Slower than the rest: a zone boundary is a hard edge in the chart, and
+	# snapping the whole body's demeanour on one frame reads as a glitch.
+	_danger_s = lerpf(_danger_s, clampf(danger, 0.0, 1.0), clampf(delta * 3.5, 0.0, 1.0))
+	# What survives of the loose, playful motion at the current danger level.
+	var loose: float = lerpf(1.0, danger_idle_left, _danger_s)
 	_lean_s  = lerpf(_lean_s,  clampf(speed01, 0.0, 1.0), clampf(delta * 3.0, 0.0, 1.0))
 	_twist_s = lerpf(_twist_s, clampf(lateral_v / 6.0, -1.0, 1.0), k)
 
@@ -203,8 +229,11 @@ func _process_modification_with_delta(delta: float) -> void:
 	# turn read as a body leaning rather than a model being tilted.
 	var land_curve: float = _land_t * _land_t
 	_add(sk, _b_spine, Vector3(
-		speed_lean_deg * _lean_s + land_fold_deg * land_curve,
-		lane_twist_deg * _twist_s,
+		speed_lean_deg * _lean_s + land_fold_deg * land_curve
+			+ danger_hunch_deg * _danger_s,
+		# The shoulder-throw on a lane change is showmanship; it shrinks with the
+		# rest of it, so he changes lane without swinging himself into the fence.
+		lane_twist_deg * _twist_s * loose,
 		0.0), 1.0)
 	_add(sk, _b_chest, Vector3(
 		-land_fold_deg * 0.45 * land_curve,
@@ -220,9 +249,13 @@ func _process_modification_with_delta(delta: float) -> void:
 	# Counter the bank so the horizon stays put, turn toward the next gate, then
 	# add the fidget on top. Split across neck and head so it bends rather than
 	# swivelling like a turret.
-	var beat_nod: float  = -head_beat_deg * beat * beat
-	var fidget_y: float  = sin(_t * 2.3) * head_fidget_deg * 0.6 + sin(_t * 5.1) * head_fidget_deg * 0.25
-	var fidget_x: float  = sin(_t * 3.7) * head_fidget_deg * 0.35
+	# The bop and the fidget are him enjoying himself. Both fade with danger; the
+	# LOOK does not, because watching the next gate is the opposite of showing off
+	# and is exactly what he would be doing.
+	var beat_nod: float  = -head_beat_deg * beat * beat * loose
+	var fidget_y: float  = (sin(_t * 2.3) * head_fidget_deg * 0.6
+		+ sin(_t * 5.1) * head_fidget_deg * 0.25) * loose
+	var fidget_x: float  = sin(_t * 3.7) * head_fidget_deg * 0.35 * loose
 	var flick_y:  float  = _flick * 14.0
 
 	_add(sk, _b_neck, Vector3(
@@ -255,13 +288,16 @@ func _process_modification_with_delta(delta: float) -> void:
 		# Clamped per joint, so no combination of inputs can fold the tail over.
 		_add(sk, b, Vector3(
 			clampf(_ty * tail_lift_deg  * w, -tail_max_deg, tail_max_deg),
-			clampf(_tx * tail_swing_deg * w, -tail_max_deg, tail_max_deg),
+			clampf(_tx * tail_swing_deg * w * (1.0 - danger_tail_hold * _danger_s),
+				-tail_max_deg, tail_max_deg),
 			0.0), 1.0)
 
 	# ── Ears ─────────────────────────────────────────────────────────────────
 	# Driven off the same lateral impulse but much stiffer, plus a kick on
 	# landing. Z is the flap axis and the two sides mirror.
-	var ear_target: float = clampf(-lateral_v / 9.0, -1.0, 1.0) + _flick * 0.5 - land_curve * 0.8
+	# Pinned flat at full danger. One line, and it is the loudest thing on him.
+	var ear_target: float = clampf(-lateral_v / 9.0, -1.0, 1.0) + _flick * 0.5 \
+		- land_curve * 0.8 - _danger_s * danger_ear_pin
 	var se: Array = _spring(_ex, _exv, ear_target, ear_spring_k, ear_damp, delta)
 	_ex = se[0]; _exv = se[1]
 	var ear_deg: float = clampf(_ex * ear_flick_deg, -ear_max_deg, ear_max_deg)

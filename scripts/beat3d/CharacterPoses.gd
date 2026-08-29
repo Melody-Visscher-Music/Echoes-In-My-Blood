@@ -218,6 +218,428 @@ static func wall_jump_frames(mirror: bool) -> Array:
 	]
 
 
+## ROLL — the Slide replacement. The .glb ships a 0.92 s airborne 360° flip for
+## "Slide": the hips lift 0.72 → 1.01 m and the whole body somersaults. It is a
+## nice piece of animation and it is the wrong move — the gameplay slide window
+## is 0.13–0.35 s, so the clip was simply left to outlive it three times over.
+##
+## This is a ground roll. The bones only make the BALL; the revolution itself is
+## driven on _char_root by BeatRunnerPlayer, tied to slide_duration, so the
+## tumble finishes exactly when the hitbox stands back up — at any BPM. Four keys:
+##
+##   drop  knees drive up, spine curls, chin tucks, arms fold in
+##   ball  tightest point — the frame that reads as "roll"
+##   open  legs reach out for the ground, arms start to unfold
+##   catch back to something Run can blend out of in one crossfade
+##
+## The small spine/head Y through the middle takes him slightly over one
+## shoulder rather than dead straight down the lane — the flourish is in the
+## shape, not in extra length.
+static func roll_frames() -> Array:
+	return [
+		# ── DROP
+		[0.00, {
+			"thigh.L": Vector3(-72, 0, 0), "shin.L": Vector3(74, 0, 0), "foot.L": Vector3(-20, 0, 0),
+			"thigh.R": Vector3(-62, 0, 0), "shin.R": Vector3(64, 0, 0), "foot.R": Vector3(-18, 0, 0),
+			"spine":   Vector3(40, 4, 0),
+			"neck":    Vector3(14, 6, 0),  "head": Vector3(10, 4, 0),
+			# Elbows folded hard: the hands come to the chest and stay out of the roll.
+			"upper_arm.L": Vector3(-62, 0, 0), "forearm.L": Vector3(0, 0, -108),
+			"upper_arm.R": Vector3(-62, 0, 0), "forearm.R": Vector3(0, 0, 108),
+		}],
+		# ── BALL
+		[0.11, {
+			"thigh.L": Vector3(-104, 0, 0), "shin.L": Vector3(96, 0, 0), "foot.L": Vector3(-30, 0, 0),
+			"thigh.R": Vector3(-98, 0, 0),  "shin.R": Vector3(92, 0, 0), "foot.R": Vector3(-28, 0, 0),
+			"spine":   Vector3(50, 8, 0),
+			"neck":    Vector3(20, 10, 0),  "head": Vector3(14, 8, 0),
+			"upper_arm.L": Vector3(-52, 0, 0), "forearm.L": Vector3(0, 0, -126),
+			"upper_arm.R": Vector3(-52, 0, 0), "forearm.R": Vector3(0, 0, 126),
+		}],
+		# ── OPEN
+		[0.21, {
+			"thigh.L": Vector3(-46, 0, 0), "shin.L": Vector3(60, 0, 0), "foot.L": Vector3(-12, 0, 0),
+			"thigh.R": Vector3(-30, 0, 0), "shin.R": Vector3(40, 0, 0), "foot.R": Vector3(-10, 0, 0),
+			"spine":   Vector3(26, 3, 0),
+			"neck":    Vector3(6, 4, 0),   "head": Vector3(4, 3, 0),
+			"upper_arm.L": Vector3(-66, 0, 0), "forearm.L": Vector3(0, 0, -80),
+			"upper_arm.R": Vector3(-66, 0, 0), "forearm.R": Vector3(0, 0, 80),
+		}],
+		# ── CATCH
+		[0.30, _merge([ARMS_DOWN, {
+			"thigh.L": Vector3(-20, 0, 0), "shin.L": Vector3(32, 0, 0), "foot.L": Vector3(-4, 0, 0),
+			"thigh.R": Vector3(-6, 0, 0),  "shin.R": Vector3(16, 0, 0), "foot.R": Vector3(-4, 0, 0),
+			"spine":   Vector3(10, 0, 0),
+			"neck":    Vector3(0, 0, 0),   "head": Vector3(0, 0, 0),
+		}])],
+	]
+
+
+## JUMP RISE — the first ~0.16 s off the ground. One-shot.
+##
+## The authored Jump opens with a −0.28 m crouch keyed on the root, which is
+## dead on arrival: velocity.y is set on the same frame the clip starts, so the
+## mesh sank while the body was already climbing. There is deliberately no
+## anticipation here for that reason — he is extending from frame one, and the
+## weight is sold by the legs snapping out rather than by a dip that arrives
+## too late to mean anything.
+##
+## Deliberately one-sided: left arm punches overhead, right drives down and
+## back, lead knee comes up. The authored clip was asymmetric too (thigh.R 155°
+## against thigh.L 65°) but with no apparent intent, which read as sloppy rather
+## than as style. Same asymmetry, aimed.
+static func jump_rise_frames() -> Array:
+	return [
+		# ── LAUNCH — already extending
+		[0.00, {
+			"thigh.L": Vector3(-18, 0, 0), "shin.L": Vector3(30, 0, 0), "foot.L": Vector3(-18, 0, 0),
+			"thigh.R": Vector3(24, 0, 0),  "shin.R": Vector3(8, 0, 0),  "foot.R": Vector3(-34, 0, 0),
+			# Negative spine X = arched back. Full extension, the opposite of a tuck.
+			"spine":   Vector3(-12, 8, 0),
+			"neck":    Vector3(-14, 6, 0), "head": Vector3(-6, 4, 0),
+			"upper_arm.L": Vector3(10, 20, 0),   "forearm.L": Vector3(0, 0, -30),
+			"upper_arm.R": Vector3(-84, -20, 0), "forearm.R": Vector3(0, 0, 60),
+		}],
+		# ── DRIVE — the punch. X positive on upper_arm = above horizontal.
+		[0.08, {
+			"thigh.L": Vector3(-70, 0, 0), "shin.L": Vector3(84, 0, 0), "foot.L": Vector3(-26, 0, 0),
+			"thigh.R": Vector3(10, 0, 0),  "shin.R": Vector3(20, 0, 0), "foot.R": Vector3(-30, 0, 0),
+			"spine":   Vector3(-6, 12, 0),
+			"neck":    Vector3(-10, 8, 0), "head": Vector3(-4, 6, 0),
+			"upper_arm.L": Vector3(36, 26, 0),   "forearm.L": Vector3(0, 0, -16),
+			"upper_arm.R": Vector3(-70, -14, 0), "forearm.R": Vector3(0, 0, 52),
+		}],
+		# ── SETTLE — lands exactly on jump_air_frames() key 0 so the crossfade
+		# into the looping hold is invisible. Keep these two in sync by hand.
+		[0.16, {
+			"thigh.L": Vector3(-92, 0, 0), "shin.L": Vector3(92, 0, 0), "foot.L": Vector3(-20, 0, 0),
+			"thigh.R": Vector3(-34, 0, 0), "shin.R": Vector3(52, 0, 0), "foot.R": Vector3(-24, 0, 0),
+			"spine":   Vector3(6, 10, 0),
+			"neck":    Vector3(-4, 6, 0),  "head": Vector3(0, 5, 0),
+			"upper_arm.L": Vector3(16, 20, 0),   "forearm.L": Vector3(0, 0, -40),
+			"upper_arm.R": Vector3(-58, -10, 0), "forearm.R": Vector3(0, 0, 64),
+		}],
+	]
+
+
+## JUMP AIR — the tucked hold. LOOPING.
+##
+## This clip is the reason the jump stops breaking. Real airtime is
+## 2 × jump_velocity / gravity, which set_beat_duration scales to 0.20–0.66 s,
+## and a rail drop has no upper bound at all. No fixed-length clip can cover
+## that range: the authored 0.83 s somersault could not finish at ANY tempo, so
+## he landed mid-rotation every single time. A loop stretches to fit anything.
+##
+## Nothing here rotates. The airborne flourish is a twist driven on _char_root
+## from vertical velocity, which is exactly zero at touchdown by construction —
+## see BeatRunnerPlayer._update_character_anim_glb().
+static func jump_air_frames() -> Array:
+	var hold: Dictionary = {
+		"thigh.L": Vector3(-92, 0, 0), "shin.L": Vector3(92, 0, 0), "foot.L": Vector3(-20, 0, 0),
+		"thigh.R": Vector3(-34, 0, 0), "shin.R": Vector3(52, 0, 0), "foot.R": Vector3(-24, 0, 0),
+		"spine":   Vector3(6, 10, 0),
+		"neck":    Vector3(-4, 6, 0),  "head": Vector3(0, 5, 0),
+		"upper_arm.L": Vector3(16, 20, 0),   "forearm.L": Vector3(0, 0, -40),
+		"upper_arm.R": Vector3(-58, -10, 0), "forearm.R": Vector3(0, 0, 64),
+	}
+	return [
+		[0.00, hold],
+		# Slow float — the knees trade a little and the arms breathe. Small on
+		# purpose: this pose is on screen for anything from 3 frames to seconds.
+		[0.20, {
+			"thigh.L": Vector3(-80, 0, 0), "shin.L": Vector3(84, 0, 0), "foot.L": Vector3(-26, 0, 0),
+			"thigh.R": Vector3(-46, 0, 0), "shin.R": Vector3(62, 0, 0), "foot.R": Vector3(-18, 0, 0),
+			"spine":   Vector3(10, 6, 0),
+			"neck":    Vector3(0, 4, 0),   "head": Vector3(2, 3, 0),
+			"upper_arm.L": Vector3(10, 16, 0),  "forearm.L": Vector3(0, 0, -48),
+			"upper_arm.R": Vector3(-64, -6, 0), "forearm.R": Vector3(0, 0, 58),
+		}],
+		# Closes exactly on key 0 — no pop at the wrap.
+		[0.40, hold],
+	]
+
+
+## JUMP LAND — touchdown. One-shot, fired by the same impact the flair layer
+## already detects. Reach, absorb, recover.
+##
+## The absorb is deliberately moderate: CharacterFlair adds its own land_fold to
+## the spine (22° scaled by impact) on top of whatever plays here, so an
+## aggressive fold in the clip stacks into a face-plant on a hard landing.
+static func jump_land_frames() -> Array:
+	return [
+		# ── REACH — legs down, arms out to catch the balance
+		[0.00, {
+			"thigh.L": Vector3(-34, 0, 0), "shin.L": Vector3(40, 0, 0), "foot.L": Vector3(-6, 0, 0),
+			"thigh.R": Vector3(-22, 0, 0), "shin.R": Vector3(30, 0, 0), "foot.R": Vector3(-6, 0, 0),
+			"spine":   Vector3(14, 4, 0),
+			"neck":    Vector3(2, 2, 0),   "head": Vector3(2, 0, 0),
+			"upper_arm.L": Vector3(-46, 14, 0),  "forearm.L": Vector3(0, 0, -52),
+			"upper_arm.R": Vector3(-50, -10, 0), "forearm.R": Vector3(0, 0, 50),
+		}],
+		# ── ABSORB — the knees eat the drop
+		[0.07, {
+			"thigh.L": Vector3(-58, 0, 0), "shin.L": Vector3(76, 0, 0), "foot.L": Vector3(-14, 0, 0),
+			"thigh.R": Vector3(-50, 0, 0), "shin.R": Vector3(70, 0, 0), "foot.R": Vector3(-14, 0, 0),
+			"spine":   Vector3(24, 2, 0),
+			"neck":    Vector3(10, 0, 0),  "head": Vector3(6, 0, 0),
+			"upper_arm.L": Vector3(-40, 22, 0),  "forearm.L": Vector3(0, 0, -70),
+			"upper_arm.R": Vector3(-44, -16, 0), "forearm.R": Vector3(0, 0, 68),
+		}],
+		# ── RECOVER — one crossfade from Run
+		[0.18, _merge([ARMS_DOWN, {
+			"thigh.L": Vector3(-20, 0, 0), "shin.L": Vector3(30, 0, 0), "foot.L": Vector3(-4, 0, 0),
+			"thigh.R": Vector3(-8, 0, 0),  "shin.R": Vector3(18, 0, 0), "foot.R": Vector3(-4, 0, 0),
+			"spine":   Vector3(8, 0, 0),
+			"neck":    Vector3(0, 0, 0),   "head": Vector3(0, 0, 0),
+		}])],
+	]
+
+
+## ════════════════════════════════════════════════════════════════════════════
+## ELECTRIC-ZONE VARIANTS
+## ════════════════════════════════════════════════════════════════════════════
+##
+## In an electric zone the gates are live arcs and contact is death, not a bump.
+## Every clip below is the survival read of a move that has a show-off version
+## above it, and they differ on three rules:
+##
+##   1. NOTHING LEAVES THE SILHOUETTE. No arm above the head, no leg thrown out,
+##      no yaw that swings a shoulder wide. The ordinary Jump punches an arm
+##      overhead, which is exactly the limb that would touch an electric jump
+##      gate's arc. Here both arms clamp to the chest.
+##   2. SYMMETRIC. All the Y components are zero. Asymmetry is style, and style
+##      is what he stops doing when the thing beside him can kill him.
+##   3. SMALLER AND FASTER. Tighter tucks, deeper curls, shorter clips. He is
+##      making himself into the smallest possible object and getting out.
+##
+## The root-level flourish is suppressed separately, in BeatRunnerPlayer: the
+## airborne twist goes to zero (a twist is width) while the dive DEEPENS, and the
+## roll loses its shoulder yaw and orbits lower. Pose and root motion have to
+## agree or the clip fights the transform.
+
+## The electric air tuck. Shared by JumpRiseElec's last key and JumpAirElec's
+## first, the same contract the ordinary pair keeps — see jump_rise_frames().
+const ELEC_TUCK: Dictionary = {
+	"thigh.L": Vector3(-100, 0, 0), "shin.L": Vector3(100, 0, 0), "foot.L": Vector3(-26, 0, 0),
+	"thigh.R": Vector3(-96, 0, 0),  "shin.R": Vector3(96, 0, 0),  "foot.R": Vector3(-26, 0, 0),
+	# Curled forward, not arched. He is folding, not presenting.
+	"spine":   Vector3(22, 0, 0),
+	"neck":    Vector3(12, 0, 0),   "head": Vector3(8, 0, 0),
+	# Elbows folded to the limit: hands at the chest, inside the silhouette.
+	"upper_arm.L": Vector3(-58, 0, 0), "forearm.L": Vector3(0, 0, -118),
+	"upper_arm.R": Vector3(-58, 0, 0), "forearm.R": Vector3(0, 0, 118),
+}
+
+
+## ROLL (ELECTRIC) — the survival roll. Same four beats as roll_frames() but
+## tighter, faster and dead symmetric: no spine or head Y, so he goes straight
+## under the bar instead of over a shoulder. Paired with a lower orbit
+## (electric_roll_pivot_h) so the whole tumble sits closer to the floor.
+static func roll_elec_frames() -> Array:
+	return [
+		# ── DIVE — already committed, no wind-up to spare
+		[0.00, {
+			"thigh.L": Vector3(-84, 0, 0), "shin.L": Vector3(84, 0, 0), "foot.L": Vector3(-24, 0, 0),
+			"thigh.R": Vector3(-80, 0, 0), "shin.R": Vector3(82, 0, 0), "foot.R": Vector3(-24, 0, 0),
+			"spine":   Vector3(46, 0, 0),
+			"neck":    Vector3(20, 0, 0),  "head": Vector3(16, 0, 0),
+			"upper_arm.L": Vector3(-58, 0, 0), "forearm.L": Vector3(0, 0, -118),
+			"upper_arm.R": Vector3(-58, 0, 0), "forearm.R": Vector3(0, 0, 118),
+		}],
+		# ── BALL — tightest shape in the whole game
+		[0.09, {
+			"thigh.L": Vector3(-112, 0, 0), "shin.L": Vector3(104, 0, 0), "foot.L": Vector3(-34, 0, 0),
+			"thigh.R": Vector3(-110, 0, 0), "shin.R": Vector3(102, 0, 0), "foot.R": Vector3(-34, 0, 0),
+			"spine":   Vector3(56, 0, 0),
+			"neck":    Vector3(26, 0, 0),   "head": Vector3(20, 0, 0),
+			"upper_arm.L": Vector3(-46, 0, 0), "forearm.L": Vector3(0, 0, -134),
+			"upper_arm.R": Vector3(-46, 0, 0), "forearm.R": Vector3(0, 0, 134),
+		}],
+		# ── OPEN — legs reach for the floor, arms stay in
+		[0.18, {
+			"thigh.L": Vector3(-50, 0, 0), "shin.L": Vector3(64, 0, 0), "foot.L": Vector3(-12, 0, 0),
+			"thigh.R": Vector3(-40, 0, 0), "shin.R": Vector3(52, 0, 0), "foot.R": Vector3(-12, 0, 0),
+			"spine":   Vector3(30, 0, 0),
+			"neck":    Vector3(8, 0, 0),   "head": Vector3(6, 0, 0),
+			"upper_arm.L": Vector3(-62, 0, 0), "forearm.L": Vector3(0, 0, -86),
+			"upper_arm.R": Vector3(-62, 0, 0), "forearm.R": Vector3(0, 0, 86),
+		}],
+		# ── CATCH — up and running, no posing on the way out
+		[0.26, _merge([ARMS_DOWN, {
+			"thigh.L": Vector3(-18, 0, 0), "shin.L": Vector3(30, 0, 0), "foot.L": Vector3(-4, 0, 0),
+			"thigh.R": Vector3(-6, 0, 0),  "shin.R": Vector3(16, 0, 0), "foot.R": Vector3(-4, 0, 0),
+			"spine":   Vector3(8, 0, 0),
+			"neck":    Vector3(0, 0, 0),   "head": Vector3(0, 0, 0),
+		}])],
+	]
+
+
+## JUMP RISE (ELECTRIC) — 0.13 s, one-shot. Shorter and flatter than the
+## ordinary launch: no arched back, no overhead punch. The arms drive DOWN and
+## stay down, because on an electric jump gate the arc is above him and a raised
+## hand is the first thing that would find it.
+static func jump_rise_elec_frames() -> Array:
+	return [
+		# ── SNAP — straight up, nothing extended
+		[0.00, {
+			"thigh.L": Vector3(-12, 0, 0), "shin.L": Vector3(22, 0, 0), "foot.L": Vector3(-30, 0, 0),
+			"thigh.R": Vector3(-8, 0, 0),  "shin.R": Vector3(18, 0, 0), "foot.R": Vector3(-30, 0, 0),
+			"spine":   Vector3(-4, 0, 0),
+			"neck":    Vector3(-6, 0, 0),  "head": Vector3(-2, 0, 0),
+			"upper_arm.L": Vector3(-88, 0, 0), "forearm.L": Vector3(0, 0, -70),
+			"upper_arm.R": Vector3(-88, 0, 0), "forearm.R": Vector3(0, 0, 70),
+		}],
+		# ── GATHER — knees come straight up under him
+		[0.06, {
+			"thigh.L": Vector3(-66, 0, 0), "shin.L": Vector3(82, 0, 0), "foot.L": Vector3(-30, 0, 0),
+			"thigh.R": Vector3(-62, 0, 0), "shin.R": Vector3(78, 0, 0), "foot.R": Vector3(-30, 0, 0),
+			"spine":   Vector3(8, 0, 0),
+			"neck":    Vector3(2, 0, 0),   "head": Vector3(2, 0, 0),
+			"upper_arm.L": Vector3(-72, 0, 0), "forearm.L": Vector3(0, 0, -96),
+			"upper_arm.R": Vector3(-72, 0, 0), "forearm.R": Vector3(0, 0, 96),
+		}],
+		# ── into the hold, exactly
+		[0.13, ELEC_TUCK],
+	]
+
+
+## JUMP AIR (ELECTRIC) — the survival hold. LOOPING, for the same reason the
+## ordinary one loops: airtime is 0.20–0.66 s and unbounded off a rail, and no
+## fixed clip covers that.
+##
+## This is the pose that has to be right, because it is the one he is actually
+## wearing while he passes the arc. Knees to the chest, arms clamped in, chin
+## down. The float is half the size of the ordinary one — he is holding still on
+## purpose, not breathing.
+static func jump_air_elec_frames() -> Array:
+	return [
+		[0.00, ELEC_TUCK],
+		[0.18, {
+			"thigh.L": Vector3(-94, 0, 0), "shin.L": Vector3(96, 0, 0), "foot.L": Vector3(-22, 0, 0),
+			"thigh.R": Vector3(-102, 0, 0), "shin.R": Vector3(100, 0, 0), "foot.R": Vector3(-28, 0, 0),
+			"spine":   Vector3(25, 0, 0),
+			"neck":    Vector3(14, 0, 0),  "head": Vector3(9, 0, 0),
+			"upper_arm.L": Vector3(-54, 0, 0), "forearm.L": Vector3(0, 0, -124),
+			"upper_arm.R": Vector3(-54, 0, 0), "forearm.R": Vector3(0, 0, 124),
+		}],
+		[0.36, ELEC_TUCK],
+	]
+
+
+## JUMP LAND (ELECTRIC) — 0.14 s. Quicker than the ordinary landing and it does
+## not open out: the arms stay tucked through the absorb, because he is still
+## standing next to the thing that nearly killed him. Recovery only unfolds on
+## the last key, where Run takes over anyway.
+static func jump_land_elec_frames() -> Array:
+	return [
+		# ── REACH
+		[0.00, {
+			"thigh.L": Vector3(-36, 0, 0), "shin.L": Vector3(44, 0, 0), "foot.L": Vector3(-6, 0, 0),
+			"thigh.R": Vector3(-32, 0, 0), "shin.R": Vector3(40, 0, 0), "foot.R": Vector3(-6, 0, 0),
+			"spine":   Vector3(16, 0, 0),
+			"neck":    Vector3(4, 0, 0),   "head": Vector3(3, 0, 0),
+			"upper_arm.L": Vector3(-52, 0, 0), "forearm.L": Vector3(0, 0, -64),
+			"upper_arm.R": Vector3(-52, 0, 0), "forearm.R": Vector3(0, 0, 64),
+		}],
+		# ── ABSORB
+		[0.06, {
+			"thigh.L": Vector3(-56, 0, 0), "shin.L": Vector3(72, 0, 0), "foot.L": Vector3(-12, 0, 0),
+			"thigh.R": Vector3(-52, 0, 0), "shin.R": Vector3(68, 0, 0), "foot.R": Vector3(-12, 0, 0),
+			"spine":   Vector3(26, 0, 0),
+			"neck":    Vector3(10, 0, 0),  "head": Vector3(6, 0, 0),
+			"upper_arm.L": Vector3(-46, 0, 0), "forearm.L": Vector3(0, 0, -76),
+			"upper_arm.R": Vector3(-46, 0, 0), "forearm.R": Vector3(0, 0, 76),
+		}],
+		# ── RECOVER
+		[0.14, _merge([ARMS_DOWN, {
+			"thigh.L": Vector3(-18, 0, 0), "shin.L": Vector3(28, 0, 0), "foot.L": Vector3(-4, 0, 0),
+			"thigh.R": Vector3(-6, 0, 0),  "shin.R": Vector3(16, 0, 0), "foot.R": Vector3(-4, 0, 0),
+			"spine":   Vector3(6, 0, 0),
+			"neck":    Vector3(0, 0, 0),   "head": Vector3(0, 0, 0),
+		}])],
+	]
+
+
+## ════════════════════════════════════════════════════════════════════════════
+## WALL-JUMP DESCENT RAMP
+## ════════════════════════════════════════════════════════════════════════════
+##
+## The ramp used to be the one stretch of the song that asked for nothing — you
+## rode it down and waited. It is a rhythm game, so it now carries spark taps on
+## the beat, caught with the grind contract (hold the trigger, tap jump).
+##
+## It gets its own clips rather than borrowing Grind, because it is not a grind:
+## there is no rail under him and nothing to balance ON. He is riding a steep
+## surface with his weight BEHIND him and a hand trailing the deck — the shape a
+## person makes going down something they do not entirely trust.
+
+## The ride pose. Shared, so DescentPump ends exactly where Descent begins and
+## the pump drops back into the ride with no seam. Same contract the jump pair
+## keeps — see jump_rise_frames().
+const DESCENT_RIDE: Dictionary = {
+	"thigh.L": Vector3(-46, 0, 0), "shin.L": Vector3(70, 0, 0), "foot.L": Vector3(-16, 0, 0),
+	"thigh.R": Vector3(-30, 0, 0), "shin.R": Vector3(52, 0, 0), "foot.R": Vector3(-10, 0, 0),
+	# Negative spine X = leaning BACK. The body stays upright while the deck falls
+	# away under it, so the lean is the only thing selling the slope.
+	"spine":   Vector3(-14, 6, 0),
+	# ...but the head goes the other way: chin down, reading the ramp ahead.
+	"neck":    Vector3(14, -4, 0),  "head": Vector3(10, -3, 0),
+	# Lead arm out wide for balance; trailing arm low and back, hand near the deck.
+	"upper_arm.L": Vector3(-30, 34, 0),  "forearm.L": Vector3(0, 0, -40),
+	"upper_arm.R": Vector3(-70, -30, 0), "forearm.R": Vector3(0, 0, 30),
+}
+
+
+## DESCENT — riding the ramp. LOOPING, because the ramp's length in seconds
+## depends on the song's tempo and the run length rolled for the climb.
+static func descent_frames() -> Array:
+	return [
+		[0.00, DESCENT_RIDE],
+		# Weight trades between the legs and the shoulders counter-rock. Bigger
+		# than the airborne float — he is working to stay on this thing.
+		[0.30, {
+			"thigh.L": Vector3(-34, 0, 0), "shin.L": Vector3(56, 0, 0), "foot.L": Vector3(-10, 0, 0),
+			"thigh.R": Vector3(-44, 0, 0), "shin.R": Vector3(66, 0, 0), "foot.R": Vector3(-16, 0, 0),
+			"spine":   Vector3(-10, -4, 0),
+			"neck":    Vector3(16, 3, 0),  "head": Vector3(11, 2, 0),
+			"upper_arm.L": Vector3(-24, 28, 0),  "forearm.L": Vector3(0, 0, -32),
+			"upper_arm.R": Vector3(-76, -24, 0), "forearm.R": Vector3(0, 0, 38),
+		}],
+		[0.60, DESCENT_RIDE],
+	]
+
+
+## DESCENT PUMP — one per caught spark. A compress-and-extend, the same move a
+## skater uses to pump a transition: it is what a player does with their body
+## when they hit a beat, so it reads as the tap even though the tap is a button.
+##
+## Short on purpose (0.16 s). At a fast tempo the sparks are ~0.35 s apart, so
+## anything longer would still be playing when the next one arrives.
+static func descent_pump_frames() -> Array:
+	return [
+		# ── COMPRESS — down into the deck
+		[0.00, {
+			"thigh.L": Vector3(-62, 0, 0), "shin.L": Vector3(84, 0, 0), "foot.L": Vector3(-20, 0, 0),
+			"thigh.R": Vector3(-56, 0, 0), "shin.R": Vector3(78, 0, 0), "foot.R": Vector3(-20, 0, 0),
+			"spine":   Vector3(6, 4, 0),
+			"neck":    Vector3(18, -2, 0), "head": Vector3(12, -2, 0),
+			"upper_arm.L": Vector3(-40, 30, 0),  "forearm.L": Vector3(0, 0, -64),
+			"upper_arm.R": Vector3(-78, -26, 0), "forearm.R": Vector3(0, 0, 50),
+		}],
+		# ── EXTEND — the pop. Legs drive out, chest opens, lead arm swings up.
+		[0.07, {
+			"thigh.L": Vector3(-18, 0, 0), "shin.L": Vector3(26, 0, 0), "foot.L": Vector3(-26, 0, 0),
+			"thigh.R": Vector3(-12, 0, 0), "shin.R": Vector3(20, 0, 0), "foot.R": Vector3(-26, 0, 0),
+			"spine":   Vector3(-20, 8, 0),
+			"neck":    Vector3(6, -4, 0),  "head": Vector3(4, -3, 0),
+			"upper_arm.L": Vector3(0, 40, 0),    "forearm.L": Vector3(0, 0, -20),
+			"upper_arm.R": Vector3(-60, -34, 0), "forearm.R": Vector3(0, 0, 20),
+		}],
+		# ── back into the ride, exactly
+		[0.16, DESCENT_RIDE],
+	]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # BUILDER
 # ═════════════════════════════════════════════════════════════════════════════

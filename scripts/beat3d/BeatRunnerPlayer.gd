@@ -18,6 +18,53 @@ class_name BeatRunnerPlayer
 @export var stand_capsule_height: float = 1.8
 @export var slide_capsule_height: float = 0.95
 
+# ── Restyled action clips (poses live in CharacterPoses) ─────────────────
+## Play the generated "Roll" instead of the .glb's authored "Slide" — which is a
+## 0.92 s airborne 360° flip, three times longer than the gameplay window that
+## triggers it. The roll finishes exactly on that window instead. Both clips are
+## always in the library, so this switches between them live during Play.
+@export var restyle_slide: bool = true
+## Full forward revolutions the roll turns. Keep this a whole number — the body
+## is left at exactly this many turns when the window closes, so 1.5 would end
+## the slide upside down.
+@export var slide_roll_turns: float = 1.0
+## Height above _char_root the roll orbits — roughly the belly. Too low and he
+## pivots on his feet; too high and he swings around his chest.
+@export var slide_roll_pivot_h: float = 0.55
+## Peak yaw through the middle of the roll, so it goes slightly over one
+## shoulder. Zero at both ends by construction.
+@export var slide_roll_yaw_deg: float = 8.0
+## How far the body drops into the roll. Tucking the knees CANNOT lower him — the
+## hips sit at their rest height no matter what the legs do, so without this the
+## tumble happens at standing height and clips the slide bar (underside 1.425 m).
+## Held flat through the middle and eased off at both ends, so nothing pops.
+@export var slide_roll_drop: float = 0.22
+
+## Play the generated JumpRise / JumpAir / JumpLand set instead of the .glb's
+## authored "Jump" — an 0.83 s 360° somersault that cannot finish inside the
+## 0.20–0.66 s of real airtime at ANY tempo, so he always landed mid-rotation.
+## Switches live during Play; the authored clip is left in the library untouched.
+@export var restyle_jump: bool = true
+## Peak yaw of the airborne twist, reached at the apex. Eases to exactly 0 at
+## touchdown at every BPM, so it can never be caught halfway.
+@export var jump_twist_deg: float = 34.0
+## Forward pitch reached at the bottom of the fall — he leans into the landing.
+@export var jump_dive_deg: float = 16.0
+
+## Swap to the compact "*Elec" clips while the Section reports an electric zone.
+## Contact with a live gate is death rather than a bump, so he stops presenting
+## and starts surviving: symmetric, tucked, nothing outside the silhouette.
+@export var restyle_electric: bool = true
+## Roll orbit height in an electric zone. Lower than the ordinary roll on
+## purpose — the whole tumble sits closer to the floor, under the limbo bar.
+@export var electric_roll_pivot_h: float = 0.45
+## Body drop in an electric zone. Deeper than the ordinary roll: clearing the bar
+## with visible margin matters more than looking good doing it.
+@export var electric_roll_drop: float = 0.28
+## Airborne dive in an electric zone. DEEPER than the ordinary one: the twist is
+## suppressed to zero because a twist is width, and the fold replaces it.
+@export var electric_dive_deg: float = 26.0
+
 # ── Character model tuning (SIAGCharacter.glb) ────────────────────────────────
 @export var character_yaw_offset_deg: float = 0.0
 @export var character_scale: float = 1.0
@@ -256,6 +303,19 @@ var _slide_anim_length:   float = 0.0   # authored Slide clip length (s)
 var _slide_anim_speed:    float = 1.0   # speed_scale chosen for the current slide
 var _slide_visual_timer:  float = 0.0   # anim keeps playing this long AFTER the
 										# gameplay slide window has already closed
+# Restyled jump phases: JumpRise (one-shot) → JumpAir (loop) → JumpLand (one-shot).
+var _jump_rise_len:   float = 0.0
+var _jump_land_len:   float = 0.0
+var _jump_rise_timer: float = 0.0
+var _jump_land_timer: float = 0.0
+# Slide roll — set for the generated roll, never for the authored flip.
+var _roll_active:      bool   = false
+var _roll_len:         float  = 0.30   # seconds the revolution is spread across
+var _roll_anim_length: float  = 0.0    # generated Roll clip length (s)
+var _slide_clip:       String = "Slide"   # which clip THIS slide is playing
+# True while the Section says this stretch of song is an electric zone. Set
+# once per frame by Section_BeatRunner3d; see set_electric().
+var _electric: bool = false
 var _so_fluffy_node:         Node       = null        # SO FLUFFY instance on Body mesh
 var _so_fluffy_accent_nodes: Array[Node] = []         # SO FLUFFY on TailTip + WhiteFur
 
@@ -296,6 +356,11 @@ var _prev_lat:      float = 0.0
 ## to register a spark catch attempt.
 signal grind_tap_pressed
 
+## Emitted on each spark tap during the wall-jump descent ramp. Separate from
+## grind_tap_pressed so the Section can judge the two against their own spark
+## lists without either handler having to know about the other's state.
+signal descent_tap_pressed
+
 var _is_grinding:          bool  = false
 var _grind_rail_available: bool  = false   # set each frame by Section_BeatRunner3d
 var _grind_rail_x:         float = 0.0    # lateral offset of the grind rail (branches out)
@@ -307,11 +372,36 @@ var _grind_saved_mask:     int   = -1     # collision_mask saved while grinding 
 
 # ── WJ descent slide — jump locked while sliding down ───────────────────────
 var _jump_locked: bool = false   # set by Section; prevents jumping off the WJ slide ramp
+var _wj_descent:  bool = false   # riding the ramp: spark taps are live
+## One-shot pump clip fired by a caught spark. Ticked with the other anim clocks.
+var _descent_pump_len:   float = 0.0
+var _descent_pump_timer: float = 0.0
 
 ## Lock / unlock the jump action.  Called by Section_BeatRunner3d when the player
 ## enters / leaves the post-wall-jump descent slide.
 func set_jump_locked(v: bool) -> void:
 	_jump_locked = v
+
+
+## Enter / leave the descent ramp. Locks the jump (the ramp must not be hopped
+## over) and arms the spark taps, which reuse the freed-up jump button.
+func set_wj_descent(v: bool) -> void:
+	_wj_descent  = v
+	_jump_locked = v
+	if not v:
+		_descent_pump_timer = 0.0
+
+
+func is_wj_descent() -> bool:
+	return _wj_descent
+
+
+## Fired by the Section on a caught spark, so the pump reads as the tap.
+func descent_pump() -> void:
+	if _char_clip_owned.get("DescentPump", false):
+		_descent_pump_timer = maxf(0.0, _descent_pump_len - 0.02)
+	if _flair != null:
+		_flair.lane_flick(0.35)   # small weight-shift snap on the beat
 
 # ── Charge-tunnel free-slide (drop buildup) ───────────────────────────────────
 # A separate movement sub-mode used only inside a "drop buildup". The lane snap is
@@ -624,6 +714,19 @@ func _poll_runner_inputs() -> void:
 				emit_signal("grind_tap_pressed")
 			return   # no lane/jump/slide/wall-jump inputs during grind
 
+	# ── WJ descent ramp ──────────────────────────────────────
+	# Deliberately the SAME contract as the grind: hold the trigger to stay planted,
+	# tap jump on the beat to catch a spark. Jump is locked here anyway, so the
+	# button is free and the muscle memory carries straight over from the rails.
+	#
+	# Steering is NOT blocked. The ramp is one lane wide over open void, so lane
+	# input still has to reach the movement code or there would be no way to correct
+	# a bad landing — and stepping off the side is already a fall.
+	if _wj_descent:
+		if Input.is_action_pressed("runner_grind") \
+		and Input.is_action_just_pressed("runner_jump"):
+			emit_signal("descent_tap_pressed")
+
 	# Charge-tunnel free-slide: horizontal steer only (integrated in _physics_process).
 	# Block lane/jump/slide/wall-jump so the player can ONLY thread the hoop tunnel.
 	if _charge_slide_active:
@@ -658,6 +761,12 @@ func request_action(action: String) -> void:
 		"jump":
 			if is_on_floor() and not is_sliding() and not _jump_locked:
 				velocity.y = jump_velocity
+				# Only a real jump plays the launch clip — walking off a ledge or
+				# dropping off a rail goes straight to the airborne hold. Set just
+				# short of the clip so the timer cannot outlive the one-shot and
+				# re-trigger it for a frame; JumpRise ends on JumpAir's first key,
+				# so handing over early is invisible.
+				_jump_rise_timer = maxf(0.0, _jump_rise_len - 0.02)
 			last_jump_song_t = song_time
 
 		"slide":
@@ -712,20 +821,38 @@ func is_sliding() -> bool:
 	return slide_timer > 0.0
 
 
-# The authored Slide clip is almost always longer than the gameplay slide window
-# (slide_duration is rhythm-tight: 0.13–0.35 s). We used to squeeze the whole clip
-# into that window, which made a long clip unreadably fast. It now plays at its
-# AUTHORED speed — same as Jump — and simply outlives the window: the hitbox stands
-# back up on time while the animation keeps playing its recovery. A following slide
-# crossfades over whatever is left, exactly like a re-triggered jump.
-# slide_anim_max_speed defaults to 1.0, i.e. compression off; raise it only if the
-# full-length tail overstays, and it will then fit the clip into the earliest
-# possible next slide (slide_duration + slide_cooldown) up to that ceiling.
+# Starts the slide's visual. Two different jobs, depending on restyle_slide.
+#
+# RESTYLED (default): the generated roll is 0.30 s and the gameplay window is
+# 0.13–0.35 s, so the clip is scaled to land exactly on the window — a fast song
+# gets a fast roll, which is what it should look like anyway. The revolution is
+# driven per-frame from the same _roll_len in _apply_roll_pose(), so the pose and
+# the spin cannot drift apart.
+#
+# AUTHORED: the old behaviour, kept for the A/B. The 0.92 s flip plays at its
+# authored speed and simply outlives the window (slide_anim_max_speed defaults to
+# 1.0 = never compress); a following slide crossfades over whatever is left.
 func _start_slide_anim() -> void:
+	_roll_active = false
+	_slide_clip  = "Slide"
+
+	if restyle_slide and _char_clip_owned.get("Roll", false):
+		# The electric roll is a different length from the ordinary one, so read the
+		# length of whichever clip we actually picked rather than a cached number.
+		_slide_clip         = _elec_clip("Roll")
+		var rlen: float     = _char_anim_player.get_animation(_slide_clip).length \
+			if _char_anim_player != null else _roll_anim_length
+		_roll_active        = true
+		_roll_len           = maxf(0.05, slide_duration)
+		_slide_anim_speed   = clampf(maxf(0.05, rlen) / _roll_len, 0.5, 3.0)
+		_slide_visual_timer = _roll_len
+		return
+
 	if _slide_anim_length <= 0.0 or not _char_clip_owned.get("Slide", false):
 		_slide_anim_speed   = 1.0
 		_slide_visual_timer = 0.0
 		return
+
 	var budget: float = slide_duration + slide_cooldown
 	_slide_anim_speed = clampf(_slide_anim_length / maxf(0.05, budget),
 							   1.0, maxf(1.0, slide_anim_max_speed))
@@ -834,7 +961,10 @@ func _build_character() -> void:
 				_generate_missing_clips()
 
 				for clip in ["Idle", "Run", "Jump", "Slide", "Grind",
-							 "WallJumpA", "WallJumpB"]:
+							 "WallJumpA", "WallJumpB",
+							 "Roll", "JumpRise", "JumpAir", "JumpLand",
+							 "RollElec", "JumpRiseElec", "JumpAirElec", "JumpLandElec",
+							 "Descent", "DescentPump"]:
 					_char_clip_owned[clip] = _char_anim_player.has_animation(clip)
 
 				if _char_clip_owned["Run"]:
@@ -852,6 +982,15 @@ func _build_character() -> void:
 					# One-shot, explicitly: the visual tail detects "clip done" via
 					# is_playing(), which never goes false on a looping clip.
 					slide_clip.loop_mode = Animation.LOOP_NONE
+				if _char_clip_owned.get("Roll", false):
+					_roll_anim_length = _char_anim_player.get_animation("Roll").length
+				# JumpAir's loop mode comes from CharacterPoses.build()'s loop flag.
+				if _char_clip_owned.get("JumpRise", false):
+					_jump_rise_len = _char_anim_player.get_animation("JumpRise").length
+				if _char_clip_owned.get("JumpLand", false):
+					_jump_land_len = _char_anim_player.get_animation("JumpLand").length
+				if _char_clip_owned.get("DescentPump", false):
+					_descent_pump_len = _char_anim_player.get_animation("DescentPump").length
 				if _char_clip_owned["Idle"]:
 					_char_anim_player.play("Idle")
 
@@ -892,6 +1031,31 @@ func _generate_missing_clips() -> void:
 		"WallJumpA": [CharacterPoses.wall_jump_frames(false), 0.58, false],
 		"WallJumpB": [CharacterPoses.wall_jump_frames(true),  0.58, false],
 	}
+	# Replacements for the two authored action clips. Both of them are 360°
+	# somersaults timed to nothing the game actually does — see the notes on
+	# CharacterPoses.roll_frames() and jump_air_frames().
+	#
+	# These are registered under NEW names rather than over the authored ones. The
+	# .glb's Slide and Jump stay in the library untouched, so restyle_slide /
+	# restyle_jump pick between them live in the Inspector during Play, and a bad
+	# generated pose can never cost us the exported art.
+	wanted["Roll"]     = [CharacterPoses.roll_frames(),      0.30, false]
+	wanted["JumpRise"] = [CharacterPoses.jump_rise_frames(), 0.16, false]
+	wanted["JumpAir"]  = [CharacterPoses.jump_air_frames(),  0.40, true]
+	wanted["JumpLand"] = [CharacterPoses.jump_land_frames(), 0.18, false]
+	# Electric-zone variants of the same four. Registered unconditionally: the
+	# switch is per-frame in _elec_clip(), not per-build, because a song crosses
+	# in and out of zones and the library is built once.
+	wanted["RollElec"]     = [CharacterPoses.roll_elec_frames(),      0.26, false]
+	wanted["JumpRiseElec"] = [CharacterPoses.jump_rise_elec_frames(), 0.13, false]
+	wanted["JumpAirElec"]  = [CharacterPoses.jump_air_elec_frames(),  0.36, true]
+	wanted["JumpLandElec"] = [CharacterPoses.jump_land_elec_frames(), 0.14, false]
+	# The descent ramp gets its own pair rather than borrowing Grind — there is no
+	# rail under him there. Ride loops (the ramp's length in seconds depends on
+	# tempo); the pump is a one-shot per caught spark.
+	wanted["Descent"]     = [CharacterPoses.descent_frames(),      0.60, true]
+	wanted["DescentPump"] = [CharacterPoses.descent_pump_frames(), 0.16, false]
+
 	for name: String in wanted:
 		# Never clobber a real authored clip — the moment one of these is made in
 		# Blender and exported, the .glb version wins automatically.
@@ -922,6 +1086,7 @@ func _build_flair_layer() -> void:
 		_flair.tail_lift_deg  = 0.0
 	if not procedural_ears:
 		_flair.ear_flick_deg = 0.0
+	_flair.danger = 1.0 if _electric else 0.0
 	_char_skeleton.add_child(_flair)
 
 
@@ -1304,8 +1469,15 @@ func _feed_flair(delta: float) -> void:
 
 	# Landing detection — the recoil scales with how hard he came down.
 	var on_floor: bool = is_on_floor()
-	if on_floor and not _prev_on_floor and _flair != null:
-		_flair.land(clampf(absf(_prev_vy) / maxf(1.0, jump_velocity), 0.0, 1.0))
+	if on_floor and not _prev_on_floor:
+		var impact: float = clampf(absf(_prev_vy) / maxf(1.0, jump_velocity), 0.0, 1.0)
+		if _flair != null:
+			_flair.land(impact)
+		# Anything softer than this is a kerb, not a landing — folding him in half
+		# every time he clips a lip would read worse than not playing it at all.
+		if impact > 0.18:
+			_jump_rise_timer = 0.0
+			_jump_land_timer = maxf(0.0, _jump_land_len - 0.02)
 	_prev_on_floor = on_floor
 	_prev_vy       = velocity.y
 
@@ -1321,6 +1493,26 @@ func _feed_flair(delta: float) -> void:
 
 	_prev_lat = lat
 	_beat_pulse = maxf(0.0, _beat_pulse - delta * 3.6)
+
+
+## Section_BeatRunner3d calls this each frame with whether the song is currently
+## inside an electric zone. Everything downstream of it is cosmetic — the hitbox,
+## the timing windows and the scoring are identical either way. What changes is
+## that he stops throwing limbs out where a live arc could find them.
+func set_electric(v: bool) -> void:
+	_electric = v
+	if _flair != null:
+		_flair.danger = 1.0 if v else 0.0
+
+
+## Picks the electric variant of a clip when we are in a zone and it exists.
+## Falls back to the ordinary name, so a missing "*Elec" clip is a silent
+## downgrade rather than a state with no animation at all.
+func _elec_clip(base: String) -> String:
+	if not (_electric and restyle_electric):
+		return base
+	var e: String = base + "Elec"
+	return e if _char_clip_owned.get(e, false) else base
 
 
 ## Section_BeatRunner3d calls this on each beat so the body can punctuate the
@@ -1345,6 +1537,14 @@ func _update_character_anim(_delta: float) -> void:
 	# never sticks on.
 	if _wall_jump_timer > 0.0:
 		_wall_jump_timer = maxf(0.0, _wall_jump_timer - _delta)
+	# Ticked before _feed_flair, which is what SETS the land timer — so a timer
+	# started this frame keeps its full length.
+	if _jump_rise_timer > 0.0:
+		_jump_rise_timer = maxf(0.0, _jump_rise_timer - _delta)
+	if _jump_land_timer > 0.0:
+		_jump_land_timer = maxf(0.0, _jump_land_timer - _delta)
+	if _descent_pump_timer > 0.0:
+		_descent_pump_timer = maxf(0.0, _descent_pump_timer - _delta)
 
 	_feed_flair(_delta)
 
@@ -1387,16 +1587,27 @@ func _update_character_anim_glb(_delta: float) -> void:
 	var target_anim:  String = "Idle"
 	var target_speed: float  = 1.0
 
+	# Neutral every frame; the branches below opt back in. The roll needs Z and
+	# the airborne twist needs Y, and nothing here used to touch either, so
+	# without this reset a move could leave the body permanently offset.
+	_char_root.position.z         = 0.0
+	_char_root.rotation_degrees.y = character_yaw_offset_deg
+
 	# ── Kill the cosmetic slide tail when it stops making sense ──────────────
 	# Leaving the ground or hopping on a rail hands the body to another clip, and
 	# a finished one-shot must not be re-triggered by the leftover timer.
 	if _slide_visual_timer > 0.0 and not sliding:
 		if not on_floor or _is_grinding:
 			_slide_visual_timer = 0.0
-		elif _char_anim_player != null \
-		and _char_anim_player.current_animation == "Slide" \
+		elif not _roll_active \
+		and _char_anim_player != null \
+		and _char_anim_player.current_animation == _slide_clip \
 		and not _char_anim_player.is_playing():
+			# Authored-clip path only. The roll ends on its own clock instead: it is
+			# time-scaled to the window, so is_playing() goes false early.
 			_slide_visual_timer = 0.0
+	if _slide_visual_timer <= 0.0:
+		_roll_active = false
 
 	# Authored clips own their pose: the procedural root crouch/lean below is
 	# only a fallback for states the .glb doesn't ship. This is what lets an
@@ -1412,14 +1623,16 @@ func _update_character_anim_glb(_delta: float) -> void:
 		_char_root.position.y         = _char_root_base_y
 		_char_root.rotation_degrees.x = 0.0
 	elif sliding or _slide_visual_timer > 0.0:
-		target_anim = "Slide"
-		if _char_clip_owned.get("Slide", false):
-			_char_root.position.y         = _char_root_base_y
-			_char_root.rotation_degrees.x = 0.0
-			# Speed was chosen once, at slide start, by _start_slide_anim() — the
-			# clip is allowed to run past the gameplay window rather than being
-			# crushed into it. See that function for the reasoning.
+		# "Roll" or "Slide" — chosen once per slide by _start_slide_anim().
+		target_anim = _slide_clip
+		if _char_clip_owned.get(_slide_clip, false):
+			# Speed was chosen once, at slide start, by _start_slide_anim().
 			target_speed = _slide_anim_speed
+			if _roll_active:
+				_apply_roll_pose()
+			else:
+				_char_root.position.y         = _char_root_base_y
+				_char_root.rotation_degrees.x = 0.0
 		else:
 			_char_root.position.y         = _char_root_base_y - 0.50
 			_char_root.rotation_degrees.x = -10.0
@@ -1436,9 +1649,25 @@ func _update_character_anim_glb(_delta: float) -> void:
 		# for balance while the outside arm reaches out to grip it.
 		_char_root.rotation_degrees.z = rad_to_deg(_grind_rail_roll)   # 0 normally; only corkscrews roll
 	elif not on_floor:
-		target_anim = "Jump"
+		_char_root.position.y = _char_root_base_y
+		if restyle_jump and _char_clip_owned.get("JumpAir", false):
+			target_anim = _elec_clip("JumpRise") if (_jump_rise_timer > 0.0 \
+				and _char_clip_owned.get("JumpRise", false)) else _elec_clip("JumpAir")
+			_apply_air_flourish()
+		else:
+			target_anim = "Jump"
+			_char_root.rotation_degrees.x = 0.0 if _char_clip_owned.get("Jump", false) else -5.0
+	elif _wj_descent and _char_clip_owned.get("Descent", false):
+		# Outranks the landing clip: dropping onto the ramp from the last wall bounce
+		# would otherwise fire JumpLand and stand him up in the middle of the ride.
+		target_anim = "DescentPump" if (_descent_pump_timer > 0.0 \
+			and _char_clip_owned.get("DescentPump", false)) else "Descent"
 		_char_root.position.y         = _char_root_base_y
-		_char_root.rotation_degrees.x = 0.0 if _char_clip_owned.get("Jump", false) else -5.0
+		_char_root.rotation_degrees.x = 0.0
+	elif _jump_land_timer > 0.0 and _char_clip_owned.get("JumpLand", false):
+		target_anim = _elec_clip("JumpLand")
+		_char_root.position.y         = _char_root_base_y
+		_char_root.rotation_degrees.x = 0.0
 	else:
 		target_anim  = "Run"
 		# Authored Run clip: speed derived from the ACTUAL ground speed so the
@@ -1466,8 +1695,87 @@ func _update_character_anim_glb(_delta: float) -> void:
 			blend = 0.08
 		elif target_anim.begins_with("WallJump"):
 			blend = 0.04
+		elif target_anim.begins_with("JumpRise") or target_anim.begins_with("JumpLand"):
+			# Both are ~0.16 s one-shots; the default 0.18 s ease would have eaten
+			# the entire clip before any of it was visible.
+			blend = 0.05
+		elif target_anim.begins_with("JumpAir"):
+			# Electric blends faster still — in a zone, hesitation is the tell.
+			blend = 0.06 if _electric else 0.10
+		elif target_anim == "DescentPump":
+			blend = 0.04   # the pump IS the beat — it cannot ease in
+		elif target_anim == "Descent":
+			blend = 0.12
+		elif _roll_active and target_anim == _slide_clip:
+			blend = 0.08   # same reason — the roll is 0.30 s, not 0.92 s
 		_char_anim_player.play(target_anim, blend)
 	_char_anim_player.speed_scale = target_speed
+
+
+## The roll's revolution. The generated Slide clip only makes the ball shape —
+## this turns the body, on _char_root, across exactly the gameplay slide window,
+## so he is upright again on the frame the hitbox stands back up. That holds at
+## any BPM because slide_duration and _roll_len are the same number.
+##
+## Rotating _char_root alone would pivot him around his feet and swing his head
+## through the floor, so the origin is offset to orbit a point up at the belly
+## instead: offset = pivot − R·pivot, which for a pitch of θ about (0, h, 0) is
+## (0, h(1−cos θ), −h sin θ). That formula holds for either sign of θ.
+##
+## POSITIVE θ IS FORWARD. The model's front is local +Z (the tail runs back to
+## z − 0.69, the muzzle reaches z + 0.21) and _char_root carries no yaw on the GLB
+## path, so +30° of pitch moves the head to z + 0.60 and −30° moves it to − 0.60.
+## Do not take the sign from the procedural fallback's leans: THAT rig is built
+## under _char_root.rotation_degrees.y = 180, which flips its local X, so its
+## negative leans mean the opposite of what the same number means here.
+func _apply_roll_pose() -> void:
+	var p: float = clampf(1.0 - _slide_visual_timer / maxf(0.01, _roll_len), 0.0, 1.0)
+	# Smoothstep: fastest through the middle of the tumble, like a real roll — and
+	# like the authored flip's own easing.
+	var e:   float = p * p * (3.0 - 2.0 * p)
+	var deg: float = 360.0 * slide_roll_turns * e
+	var r:   float = deg_to_rad(deg)
+	# Electric: orbit lower so the whole tumble passes under the limbo bar, and
+	# drop the shoulder yaw entirely — yaw swings a shoulder wide, and wide is the
+	# one thing he cannot afford next to a live gate.
+	var elec: bool  = _electric and restyle_electric
+	var h:    float = electric_roll_pivot_h if elec else slide_roll_pivot_h
+	var yaw:  float = 0.0 if elec else slide_roll_yaw_deg
+	var drop: float = electric_roll_drop if elec else slide_roll_drop
+	# Trapezoid: full drop by 10% in, held, released over the last 15%. A sine
+	# envelope would still be half-height at the entry, which is exactly where the
+	# bar is — he has to already be low when he reaches it, not on the way there.
+	# p is never sampled at 0: _slide_visual_timer is decremented in
+	# _physics_process before the animation update runs, so the first drawn frame
+	# is already a delta in and the ramp has started.
+	var env:  float = clampf(minf(p / 0.10, (1.0 - p) / 0.15), 0.0, 1.0)
+	_char_root.rotation_degrees.x = deg
+	_char_root.position.y         = _char_root_base_y + h * (1.0 - cos(r)) - drop * env
+	_char_root.position.z         = -h * sin(r)
+	# Peaks mid-roll and is back to zero at both ends, so it cannot leave him yawed.
+	_char_root.rotation_degrees.y = character_yaw_offset_deg + yaw * sin(p * PI)
+
+
+## The airborne flourish: a twist out and back, plus a dive into the landing.
+##
+## Driven by vertical velocity rather than by a clock, which is the whole point.
+## p = 0 at launch, 0.5 at the apex, 1.0 at touchdown speed — and because
+## set_beat_duration scales gravity and jump_velocity together, those three points
+## hold at every BPM and for any airtime. sin(p·PI) is therefore exactly zero on
+## the frame he lands, so the twist can never be caught halfway. That is precisely
+## what the authored 360° could not do.
+func _apply_air_flourish() -> void:
+	var p: float = clampf(1.0 - velocity.y / maxf(1.0, jump_velocity), 0.0, 2.0) * 0.5
+	# Electric zone: the twist goes to zero and the dive deepens to replace it. A
+	# twist reads as confidence and costs lateral width; a fold reads as fear and
+	# buys clearance. Same p curve either way, so it still lands square.
+	var elec:  bool  = _electric and restyle_electric
+	var twist: float = 0.0 if elec else jump_twist_deg
+	var dive:  float = electric_dive_deg if elec else jump_dive_deg
+	_char_root.rotation_degrees.y = character_yaw_offset_deg + twist * sin(p * PI)
+	# Second half of the arc only — he reaches for the ground, he does not dive off
+	# the top of the jump. Positive pitch is forward; see _apply_roll_pose().
+	_char_root.rotation_degrees.x = dive * clampf((p - 0.5) * 2.0, 0.0, 1.0)
 
 
 func _update_character_anim_procedural(_delta: float) -> void:
