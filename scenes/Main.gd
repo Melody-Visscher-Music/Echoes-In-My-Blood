@@ -5,6 +5,7 @@ var _center_container: Control
 var _options_panel: Control
 var _gameplay_panel: Control
 var _howtoplay_panel: Control
+var _play_panel: Control
 var _controls_panel: Control
 var _menu_box: VBoxContainer
 
@@ -154,13 +155,9 @@ func _build_ui() -> void:
 
 	# No wordmark here: the background art already carries the title and the
 	# author credit, so a second one just competes with it.
-	var new_btn := _menu_btn("NEW GAME", _on_new_game, s)
-	menu_box.add_child(new_btn)
-	new_btn.grab_focus()
-
-	var cont_btn := _menu_btn("CONTINUE", _on_continue, s)
-	cont_btn.disabled = true
-	menu_box.add_child(cont_btn)
+	var play_btn := _menu_btn("PLAY", _on_play, s)
+	menu_box.add_child(play_btn)
+	play_btn.grab_focus()
 
 	menu_box.add_child(_menu_btn("OPTIONS", _on_options, s))
 	menu_box.add_child(_menu_btn("QUIT",    _on_quit,    s))
@@ -184,6 +181,10 @@ func _build_ui() -> void:
 	_howtoplay_panel = _build_howtoplay_panel()
 	_howtoplay_panel.visible = false
 	add_child(_howtoplay_panel)
+
+	_play_panel = _build_play_panel()
+	_play_panel.visible = false
+	add_child(_play_panel)
 
 	_rewrap_menu.call_deferred()
 
@@ -984,9 +985,91 @@ func _htp_row(parent: Node, key: String, desc: String, s: float = 1.0) -> void:
 	row.add_child(dl)
 
 
+# ── Play panel ─────────────────────────────────────────────────────────────────
+
+## NEW GAME / CONTINUE are the story-mode entries and stay locked until story
+## mode exists; FREEPLAY is the one live route and goes to song select.
+func _build_play_panel() -> Control:
+	var s   := _ui_s()
+	var arr := _panel_bg(Color(0.02, 0.01, 0.10, 0.92))
+	var bg:      Control = arr[0]
+	var wrapper: Control = arr[1]
+
+	var panel := PlatePanel.create(int(42 * s), UiStyle.VIOLET, 26.0 * s)
+	panel.custom_minimum_size = Vector2(_panel_w(), 0)
+	wrapper.add_child(panel)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", int(14 * s))
+	panel.content.add_child(vbox)
+
+	var ttl := Label.new()
+	ttl.text = "PLAY"
+	ttl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	ttl.add_theme_font_override("font", UiStyle.caption(7.0))
+	ttl.add_theme_font_size_override("font_size", int(26 * s))
+	ttl.add_theme_color_override("font_color", Color.WHITE)
+	ttl.self_modulate = UiStyle.signature_color(0.1)
+	vbox.add_child(ttl)
+	vbox.add_child(_rule(s))
+
+	var new_btn := _menu_btn("NEW GAME", _on_new_game, s)
+	new_btn.disabled = true
+	vbox.add_child(new_btn)
+
+	var cont_btn := _menu_btn("CONTINUE", _on_continue, s)
+	cont_btn.disabled = true
+	vbox.add_child(cont_btn)
+
+	var lock := Label.new()
+	lock.text = "🔒  Story mode is still in development — it lands in a later update."
+	lock.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lock.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lock.add_theme_font_size_override("font_size", int(15 * s))
+	lock.add_theme_color_override("font_color", Color(0.78, 0.70, 0.95, 0.85))
+	vbox.add_child(lock)
+
+	vbox.add_child(_rule(s))
+
+	vbox.add_child(_menu_btn("FREEPLAY", _on_freeplay, s))
+
+	var free_note := Label.new()
+	free_note.text = "Pick any track and play it straight."
+	free_note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	free_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	free_note.add_theme_font_size_override("font_size", int(15 * s))
+	free_note.add_theme_color_override("font_color", Color(0.78, 0.78, 0.90, 1.0))
+	vbox.add_child(free_note)
+
+	var sp := Control.new()
+	sp.custom_minimum_size = Vector2(0, int(6 * s))
+	vbox.add_child(sp)
+
+	var back_btn := PlateButton.new()
+	back_btn.text = "← BACK"
+	back_btn.custom_minimum_size = Vector2(int(185 * s), int(48 * s))
+	back_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_style_btn(back_btn, s)
+	back_btn.pressed.connect(_on_play_back)
+	vbox.add_child(back_btn)
+
+	return bg
+
+
 # ── Button handlers ────────────────────────────────────────────────────────────
 
-func _on_new_game() -> void:
+func _on_play() -> void:
+	_push_focus()
+	_center_container.visible = false
+	_play_panel.visible       = true
+	_focus_panel.call_deferred(_play_panel)
+
+func _on_play_back() -> void:
+	_play_panel.visible       = false
+	_center_container.visible = true
+	_pop_focus(_center_container)
+
+func _on_freeplay() -> void:
 	# Tutorial is a one-time, first-launch-only screen: once any song has a
 	# registered high score, the player has already played, so skip straight
 	# to song select on every later launch.
@@ -995,8 +1078,11 @@ func _on_new_game() -> void:
 	else:
 		get_tree().change_scene_to_file("res://scenes/HowToPlay.tscn")
 
+func _on_new_game() -> void:
+	pass  # Story mode — locked until it exists
+
 func _on_continue() -> void:
-	pass  # Not yet implemented
+	pass  # Story mode — locked until it exists
 
 func _on_options() -> void:
 	_push_focus()
@@ -1271,3 +1357,6 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif _options_panel != null and _options_panel.visible:
 		get_viewport().set_input_as_handled()
 		_on_options_back()
+	elif _play_panel != null and _play_panel.visible:
+		get_viewport().set_input_as_handled()
+		_on_play_back()
