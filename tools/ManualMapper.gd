@@ -63,7 +63,7 @@ var _analyzer_dbg_last_progress_key: String = ""
 # ============================================================
 # External tools
 # ============================================================
-@export var python_executable: String = ProjectSettings.globalize_path("res://tools/.venv/Scripts/pythonw.exe")
+@export var python_executable: String = ProjectSettings.globalize_path("res://tools/.venv-fusion/Scripts/pythonw.exe")
 @export var analyzer_script_path: String = "res://tools/BeatmapAnalyzer.py"
 @export var analysis_output_dir: String = "res://data/Analysis/" # auto-fallback to user://analysis/ if not writable
 
@@ -72,28 +72,25 @@ var _analyzer_dbg_last_progress_key: String = ""
 # ============================================================
 var analyzer_settings_popup: PopupPanel
 
-var analyzer_backend: String = "madmom" # madmom | librosa | auto
-var analyzer_percussive: bool = true
-var analyzer_accurate: bool = true
-var analyzer_safe_mode: bool = false
-var analyzer_max_confidence: bool = true
-
-var analyzer_max_passes: int = 5
-var analyzer_no_improve_limit: int = 18
-var analyzer_improve_epsilon: float = 0.0015
-var analyzer_force_full_passes: bool = true
-
-var analyzer_min_bpm: float = 90.0
-var analyzer_max_bpm: float = 220.0
+# --- BeatNet + Librosa fusion analyzer settings ---
+# BeatNet supplies the macro grid (tempo + bar phase); librosa does the
+# band-split onset work and the sample-accurate placement.
+# Auto mode lets the analyzer derive the tempo window, per-band onset
+# thresholds and snap window from the audio itself. On by default -- the manual
+# values below are only a fallback for when it is switched off.
+var analyzer_auto: bool = true
+var analyzer_use_beatnet: bool = true
+var analyzer_min_bpm: float = 120.0
+var analyzer_max_bpm: float = 200.0
 var analyzer_ts: int = 4
-var analyzer_refine_ms: int = 220
-var analyzer_normalize: bool = true
-var analyzer_auto_tune: bool = true
+var analyzer_snap_ms: float = 18.0
+var analyzer_onset_delta: float = 0.055
 var analyzer_quick_seconds: int = 0
 
 # MapGen (mixed-lane beatmap generation)
 var analyzer_mapgen: bool = true
 var analyzer_map_diff: int = 5 # 1..10
+var analyzer_map_lanes: int = 2 # 2 = beats lane + melody lane
 var analyzer_map_min_gap_ms: int = 85
 var analyzer_map_allow_chords: bool = false
 
@@ -219,7 +216,8 @@ var af_cb_quantize: CheckBox
 var af_cb_beats: CheckBox
 var af_cb_downbeats: CheckBox
 var af_cb_onsets: CheckBox
-var af_cb_mapgen: CheckBox # NEW: use analyzer map_notes (mixed lanes)
+var af_cb_mapgen: CheckBox # use analyzer map_notes
+var af_cb_two_lane: CheckBox # lane 0 = beats (pink), lane 1 = melody (blue)
 
 var af_sb_beats_every: SpinBox
 var af_sb_lane_sep_ms: SpinBox
@@ -232,6 +230,10 @@ var autofinish_lane_map: Array[String] = [] # len lane_count, values: "off","bea
 
 var autofinish_apply_quantize: bool = true
 var autofinish_use_mapgen: bool = true # NEW: default on
+# Two-lane charting: lane 0 = beats (pink), lane 1 = melody (blue). The
+# analyzer already classifies every note, so with this on there is nothing
+# left to configure -- no per-lane beats/downbeats/onsets decisions.
+var autofinish_two_lane: bool = true
 
 # ============================================================
 # Beatmap data
@@ -443,6 +445,8 @@ var analysis_onsetenv_v: Array[float] = []
 
 # NEW: MapGen notes (mixed-lane beatmap)
 var analysis_map_notes: Array[Dictionary] = [] # [{t,lane,kind,basis,intensity,...}]
+var analysis_bars: Array[Dictionary] = []      # v3: per-bar features + tags
+var analysis_sections: Array[Dictionary] = []  # v3: drop / breakdown / buildup / fake_drop
 
 var show_analysis_guides: bool = true
 var show_analysis_envelopes: bool = true
@@ -461,7 +465,10 @@ var autofinish_include_onsets: bool = true
 
 # Map density controls
 var autofinish_beats_every: int = 1 # 1=every beat, 2=every other beat, 4=quarter notes only, etc.
-var autofinish_lane_min_sep_ms: int = 150 # per-lane minimum spacing to prevent spam
+# Per-lane minimum spacing. Kept just under a 1/16 note at hard-dance tempo
+# (~97 ms at 154 BPM) so it removes genuine duplicates without deleting the
+# kick rolls and triplets the analyzer went to the trouble of finding.
+var autofinish_lane_min_sep_ms: int = 90
 
 # Onset filtering
 var autofinish_onset_strength_min: float = 0.72
@@ -500,10 +507,24 @@ var _flash_ok_until: Array[float] = [0.0, 0.0, 0.0, 0.0]
 var _flash_bad_until: Array[float] = [0.0, 0.0, 0.0, 0.0]
 
 const CAPTURE_PASS_COLORS := {
-	"beats": Color(1.0, 0.0, 0.667, 1.0),   # orange/red
-	"melody": Color(0.20, 0.85, 1.00, 1.0),  # cyan/blue
-	"fx": Color(0.0, 1.0, 0.167, 1.0),      # purple/pink
+	"beats": Color(1.0, 0.0, 0.667, 1.0),    # pink
+	"melody": Color(0.20, 0.85, 1.00, 1.0),  # blue
+	"fx": Color(0.0, 1.0, 0.167, 1.0),       # green
 }
+
+# Analyzer role classes, coloured to match the capture passes above so the two
+# systems read the same way: pink is the pulse, blue is the tune.
+const ROLE_CLASS_COLORS := {
+	"beat": Color(1.00, 0.00, 0.667, 1.0),   # pink  -- kick / gated kick / hats
+	"melody": Color(0.20, 0.85, 1.00, 1.0),  # blue  -- screech / lead
+}
+
+# Which editor lane each analyzer role class owns in a two-lane chart.
+const ROLE_CLASS_LANE := {"beat": 0, "melody": 1}
+
+# Role class -> capture_pass. The game runtime keys off capture_pass alone:
+# "beats" become tapped gameplay events, "melody" and "fx" become world FX.
+const ROLE_CLASS_PASS := {"beat": "beats", "melody": "melody"}
 
 # ============================================================
 # Mouse hover / ghost preview
@@ -1760,77 +1781,59 @@ func _build_analyzer_settings_popup() -> void:
 	analyzer_settings_popup.add_child(vb)
 
 	var title: Label = Label.new()
-	title.text = "Analyzer Settings"
+	title.text = "Analyzer Settings — BeatNet + Librosa fusion"
 	vb.add_child(title)
 
-	var hb_backend := HBoxContainer.new()
-	vb.add_child(hb_backend)
-
-	var lbl_backend := Label.new()
-	lbl_backend.text = "Backend:"
-	hb_backend.add_child(lbl_backend)
-
-	var ob_backend := OptionButton.new()
-	ob_backend.add_item("madmom")
-	ob_backend.add_item("librosa")
-	ob_backend.add_item("auto")
-	ob_backend.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	hb_backend.add_child(ob_backend)
+	var sub: Label = Label.new()
+	sub.text = "BeatNet locks tempo and bar phase; librosa splits the bands and places notes on real transients."
+	sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	sub.modulate = Color(1, 1, 1, 0.65)
+	vb.add_child(sub)
 
 	var hb_flags := HBoxContainer.new()
 	vb.add_child(hb_flags)
 
-	var cb_perc := CheckBox.new()
-	cb_perc.text = "Percussive"
-	hb_flags.add_child(cb_perc)
+	var cb_auto := CheckBox.new()
+	cb_auto.text = "Auto settings (recommended)"
+	cb_auto.tooltip_text = "Work the tempo window, onset thresholds and snap window out from the audio. Leave this on and ignore everything below."
+	hb_flags.add_child(cb_auto)
 
-	var cb_acc := CheckBox.new()
-	cb_acc.text = "Accurate"
-	hb_flags.add_child(cb_acc)
-
-	var cb_safe := CheckBox.new()
-	cb_safe.text = "Safe"
-	hb_flags.add_child(cb_safe)
-
-	var cb_conf := CheckBox.new()
-	cb_conf.text = "Max confidence"
-	hb_flags.add_child(cb_conf)
-
-	var hb_flags2 := HBoxContainer.new()
-	vb.add_child(hb_flags2)
-
-	var cb_norm := CheckBox.new()
-	cb_norm.text = "Normalize"
-	hb_flags2.add_child(cb_norm)
-
-	var cb_tune := CheckBox.new()
-	cb_tune.text = "Auto-tune"
-	hb_flags2.add_child(cb_tune)
+	var cb_beatnet := CheckBox.new()
+	cb_beatnet.text = "Use BeatNet grid"
+	cb_beatnet.tooltip_text = "Off = librosa-only. BeatNet supplies the tempo seed and downbeat phase."
+	hb_flags.add_child(cb_beatnet)
 
 	var grid := GridContainer.new()
 	grid.columns = 2
 	vb.add_child(grid)
 
-	# ✅ Godot-safe local helper (lambda stored in a var)
-	var add_spin = func(lbl: String, minv: float, maxv: float, step: float) -> SpinBox:
+	var add_spin = func(lbl: String, minv: float, maxv: float, step: float, tip: String) -> SpinBox:
 		var l := Label.new()
 		l.text = lbl
+		l.tooltip_text = tip
 		grid.add_child(l)
 
 		var sb := SpinBox.new()
 		sb.min_value = minv
 		sb.max_value = maxv
 		sb.step = step
+		sb.tooltip_text = tip
 		sb.custom_minimum_size = Vector2(160, 0)
 		grid.add_child(sb)
 		return sb
 
-	var sb_min_bpm: SpinBox = add_spin.call("Min BPM", 50, 280, 1)
-	var sb_max_bpm: SpinBox = add_spin.call("Max BPM", 60, 320, 1)
-	var sb_ts: SpinBox = add_spin.call("Time Sig (3/4)", 3, 4, 1)
-	var sb_refine: SpinBox = add_spin.call("Refine (ms)", 60, 520, 1)
-	var sb_passes: SpinBox = add_spin.call("Max passes", 1, 200, 1)
-	var sb_quick: SpinBox = add_spin.call("Quick seconds (0=full)", 0, 120, 1)
+	var sb_min_bpm: SpinBox = add_spin.call("Min BPM", 60, 300, 1,
+		"Lower bound of the tempo search.")
+	var sb_max_bpm: SpinBox = add_spin.call("Max BPM", 60, 320, 1,
+		"Upper bound of the tempo search. Keep the window tight for hard dance.")
+	var sb_ts: SpinBox = add_spin.call("Time Sig (3/4)", 3, 4, 1,
+		"Beats per bar.")
+	var sb_snap: SpinBox = add_spin.call("Snap window (ms)", 0, 60, 1,
+		"How far a beat may move onto a kick transient. Small is safer: a wide window grabs the loudest neighbour, not the right one.")
+	var sb_delta: SpinBox = add_spin.call("Onset threshold", 0.005, 0.400, 0.005,
+		"Peak-pick threshold per band. Lower finds more onsets (and more noise).")
+	var sb_quick: SpinBox = add_spin.call("Quick seconds (0=full)", 0, 300, 1,
+		"Analyze only the first N seconds. Use for a fast preview.")
 
 	var sep := HSeparator.new()
 	vb.add_child(sep)
@@ -1872,11 +1875,22 @@ func _build_analyzer_settings_popup() -> void:
 	hb_map2.add_child(lbl_gap)
 
 	var sb_gap := SpinBox.new()
-	sb_gap.min_value = 25
-	sb_gap.max_value = 250
+	sb_gap.min_value = 20
+	sb_gap.max_value = 400
 	sb_gap.step = 1
 	sb_gap.custom_minimum_size = Vector2(120, 0)
 	hb_map2.add_child(sb_gap)
+
+	var lbl_lanes := Label.new()
+	lbl_lanes.text = "Lanes:"
+	hb_map2.add_child(lbl_lanes)
+
+	var sb_lanes := SpinBox.new()
+	sb_lanes.min_value = 1
+	sb_lanes.max_value = 8
+	sb_lanes.step = 1
+	sb_lanes.custom_minimum_size = Vector2(90, 0)
+	hb_map2.add_child(sb_lanes)
 
 	var cb_chords := CheckBox.new()
 	cb_chords.text = "Allow chords (rare)"
@@ -1898,25 +1912,39 @@ func _build_analyzer_settings_popup() -> void:
 	)
 
 	# store refs
-	analyzer_settings_popup.set_meta("ob_backend", ob_backend)
-	analyzer_settings_popup.set_meta("cb_perc", cb_perc)
-	analyzer_settings_popup.set_meta("cb_acc", cb_acc)
-	analyzer_settings_popup.set_meta("cb_safe", cb_safe)
-	analyzer_settings_popup.set_meta("cb_conf", cb_conf)
-	analyzer_settings_popup.set_meta("cb_norm", cb_norm)
-	analyzer_settings_popup.set_meta("cb_tune", cb_tune)
+	# When auto is on these are derived from the audio, so showing them as
+	# editable would invite tweaking values that get overwritten anyway.
+	var _sync_auto := func(on: bool) -> void:
+		sb_min_bpm.editable = not on
+		sb_max_bpm.editable = not on
+		sb_snap.editable = not on
+		sb_delta.editable = not on
+		var dim: float = 0.45 if on else 1.0
+		sb_min_bpm.modulate.a = dim
+		sb_max_bpm.modulate.a = dim
+		sb_snap.modulate.a = dim
+		sb_delta.modulate.a = dim
+	cb_auto.toggled.connect(_sync_auto)
+	analyzer_settings_popup.set_meta("sync_auto", _sync_auto)
+
+	analyzer_settings_popup.set_meta("cb_auto", cb_auto)
+	analyzer_settings_popup.set_meta("cb_beatnet", cb_beatnet)
 	analyzer_settings_popup.set_meta("sb_min_bpm", sb_min_bpm)
 	analyzer_settings_popup.set_meta("sb_max_bpm", sb_max_bpm)
 	analyzer_settings_popup.set_meta("sb_ts", sb_ts)
-	analyzer_settings_popup.set_meta("sb_refine", sb_refine)
-	analyzer_settings_popup.set_meta("sb_passes", sb_passes)
+	analyzer_settings_popup.set_meta("sb_snap", sb_snap)
+	analyzer_settings_popup.set_meta("sb_delta", sb_delta)
 	analyzer_settings_popup.set_meta("sb_quick", sb_quick)
 	analyzer_settings_popup.set_meta("cb_mapgen", cb_mapgen)
 	analyzer_settings_popup.set_meta("sl_diff", sl_diff)
 	analyzer_settings_popup.set_meta("sb_gap", sb_gap)
+	analyzer_settings_popup.set_meta("sb_lanes", sb_lanes)
 	analyzer_settings_popup.set_meta("cb_chords", cb_chords)
 
 	btn_run.pressed.connect(Callable(self, "_on_analyzer_settings_run"))
+
+	_sync_auto.call(analyzer_auto)
+
 
 func _read_analyzer_progress_file() -> void:
 	if _analyzer_progress_path == "" or not FileAccess.file_exists(_analyzer_progress_path):
@@ -2055,8 +2083,8 @@ func _looks_like_analysis_json(vpath: String) -> bool:
 	if d.has("pct") and d.has("msg"):
 		return false
 
-	# Accept v2 schema
-	if String(d.get("schema", "")) == "beatmap_analyzer_v2":
+	# Accept fusion (v3) and legacy v2 schemas
+	if _is_supported_schema(String(d.get("schema", ""))):
 		return true
 
 	# Accept older schema style
@@ -2268,21 +2296,49 @@ func _build_autofinish_popup() -> void:
 	af_cb_quantize.button_pressed = true
 	vb.add_child(af_cb_quantize)
 
-	# ✅ NEW: MapGen mode
+	# Analyzer MapGen mode
 	af_cb_mapgen = CheckBox.new()
-	af_cb_mapgen.text = "Use Analyzer MapGen notes (mixed lanes)"
+	af_cb_mapgen.text = "Use Analyzer notes (recommended)"
+	af_cb_mapgen.tooltip_text = "Place the notes the analyzer generated, instead of raw beats/onsets."
 	af_cb_mapgen.button_pressed = true
 	vb.add_child(af_cb_mapgen)
 
-	af_cb_mapgen.toggled.connect(func(on: bool) -> void:
+	af_cb_two_lane = CheckBox.new()
+	af_cb_two_lane.text = "Two lanes: beats (pink) / melody (blue)"
+	af_cb_two_lane.tooltip_text = "The analyzer classifies every note, so lane 0 gets the kick and lane 1 gets the screeches and leads. Nothing to configure below."
+	af_cb_two_lane.button_pressed = true
+	vb.add_child(af_cb_two_lane)
+
+	var lbl_auto: Label = Label.new()
+	lbl_auto.text = "Analyzer notes already carry their own meaning — the source and lane options below only apply when \"Use Analyzer notes\" is off."
+	lbl_auto.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl_auto.modulate = Color(1, 1, 1, 0.6)
+	vb.add_child(lbl_auto)
+
+	var hb_src: HBoxContainer = HBoxContainer.new()
+	vb.add_child(hb_src)
+
+	# The manual source/lane pickers are meaningless in analyzer mode, so they
+	# are disabled rather than left inviting a decision that has no effect.
+	var _sync_af_mode := func(on: bool) -> void:
 		if af_cb_quantize != null:
 			if on:
 				af_cb_quantize.button_pressed = false
 			af_cb_quantize.disabled = on
-	)
+		if af_cb_two_lane != null:
+			af_cb_two_lane.disabled = not on
+		if af_cb_beats != null:
+			af_cb_beats.disabled = on
+		if af_cb_downbeats != null:
+			af_cb_downbeats.disabled = on
+		if af_cb_onsets != null:
+			af_cb_onsets.disabled = on
+		for ob in af_lane_opts:
+			if ob != null:
+				ob.disabled = on
 
-	var hb_src: HBoxContainer = HBoxContainer.new()
-	vb.add_child(hb_src)
+	af_cb_mapgen.toggled.connect(_sync_af_mode)
+	autofinish_popup.set_meta("sync_af_mode", _sync_af_mode)
 
 	af_cb_beats = CheckBox.new()
 	af_cb_beats.text = "Beats"
@@ -2349,10 +2405,10 @@ func _build_autofinish_popup() -> void:
 	hb_params.add_child(lbl_sep)
 
 	af_sb_lane_sep_ms = SpinBox.new()
-	af_sb_lane_sep_ms.min_value = 40
+	af_sb_lane_sep_ms.min_value = 20
 	af_sb_lane_sep_ms.max_value = 250
 	af_sb_lane_sep_ms.step = 1
-	af_sb_lane_sep_ms.value = 85
+	af_sb_lane_sep_ms.value = autofinish_lane_min_sep_ms
 	af_sb_lane_sep_ms.custom_minimum_size = Vector2(90, 0)
 	hb_params.add_child(af_sb_lane_sep_ms)
 
@@ -2411,6 +2467,9 @@ func _build_autofinish_popup() -> void:
 		if autofinish_popup != null:
 			autofinish_popup.hide()
 	)
+
+	# Apply the initial enabled/disabled state now that every control exists.
+	_sync_af_mode.call(af_cb_mapgen.button_pressed)
 
 # ============================================================
 # RAP SECTIONS POPUP
@@ -3099,6 +3158,7 @@ func _open_autofinish_popup(clear_default: bool) -> void:
 func _on_autofinish_apply() -> void:
 	autofinish_apply_quantize = (af_cb_quantize != null and af_cb_quantize.button_pressed)
 	autofinish_use_mapgen = (af_cb_mapgen != null and af_cb_mapgen.button_pressed)
+	autofinish_two_lane = (af_cb_two_lane != null and af_cb_two_lane.button_pressed)
 
 	var include_beats: bool = (af_cb_beats != null and af_cb_beats.button_pressed)
 	var include_down: bool = (af_cb_downbeats != null and af_cb_downbeats.button_pressed)
@@ -4939,6 +4999,16 @@ func _ensure_event_ids_and_fields() -> void:
 		if not e.has("category"): e["category"] = "generic"
 		if not e.has("role"): e["role"] = String(ROLES_BY_CATEGORY["generic"][0])
 
+		# The runtime drops any event without a capture_pass it recognises, so a
+		# chart missing it loads as an empty level. Backfill from role_class if
+		# the note has one, otherwise from the lane it sits in.
+		if String(e.get("capture_pass", "")) == "":
+			var rc_e: String = String(e.get("role_class", ""))
+			if ROLE_CLASS_PASS.has(rc_e):
+				e["capture_pass"] = ROLE_CLASS_PASS[rc_e]
+			else:
+				e["capture_pass"] = "melody" if int(e.get("lane", 0)) == 1 else "beats"
+
 	_next_event_id = max(_next_event_id, max_id + 1)
 	_events_dirty = true
 
@@ -4974,7 +5044,7 @@ func _save_chart() -> void:
 
 	var bm: Dictionary = {
 		"song_path": song_path,
-		"bpm": int(bpm),
+		"bpm": roundi(bpm),
 		"offset_ms": offset_ms,
 		"lane_schema": lane_schema,
 		"analysis_path": analysis_path,
@@ -5262,29 +5332,23 @@ func _open_analyzer_settings_popup() -> void:
 		return
 
 	# Sync UI from vars
-	var ob_backend := analyzer_settings_popup.get_meta("ob_backend") as OptionButton
-	if ob_backend != null:
-		for i in range(ob_backend.item_count):
-			if ob_backend.get_item_text(i) == analyzer_backend:
-				ob_backend.selected = i
-
-	(analyzer_settings_popup.get_meta("cb_perc") as CheckBox).button_pressed = analyzer_percussive
-	(analyzer_settings_popup.get_meta("cb_acc") as CheckBox).button_pressed = analyzer_accurate
-	(analyzer_settings_popup.get_meta("cb_safe") as CheckBox).button_pressed = analyzer_safe_mode
-	(analyzer_settings_popup.get_meta("cb_conf") as CheckBox).button_pressed = analyzer_max_confidence
-	(analyzer_settings_popup.get_meta("cb_norm") as CheckBox).button_pressed = analyzer_normalize
-	(analyzer_settings_popup.get_meta("cb_tune") as CheckBox).button_pressed = analyzer_auto_tune
+	(analyzer_settings_popup.get_meta("cb_auto") as CheckBox).button_pressed = analyzer_auto
+	(analyzer_settings_popup.get_meta("cb_beatnet") as CheckBox).button_pressed = analyzer_use_beatnet
+	var sync_auto: Callable = analyzer_settings_popup.get_meta("sync_auto")
+	if sync_auto.is_valid():
+		sync_auto.call(analyzer_auto)
 
 	(analyzer_settings_popup.get_meta("sb_min_bpm") as SpinBox).value = analyzer_min_bpm
 	(analyzer_settings_popup.get_meta("sb_max_bpm") as SpinBox).value = analyzer_max_bpm
 	(analyzer_settings_popup.get_meta("sb_ts") as SpinBox).value = analyzer_ts
-	(analyzer_settings_popup.get_meta("sb_refine") as SpinBox).value = analyzer_refine_ms
-	(analyzer_settings_popup.get_meta("sb_passes") as SpinBox).value = analyzer_max_passes
+	(analyzer_settings_popup.get_meta("sb_snap") as SpinBox).value = analyzer_snap_ms
+	(analyzer_settings_popup.get_meta("sb_delta") as SpinBox).value = analyzer_onset_delta
 	(analyzer_settings_popup.get_meta("sb_quick") as SpinBox).value = analyzer_quick_seconds
 
 	(analyzer_settings_popup.get_meta("cb_mapgen") as CheckBox).button_pressed = analyzer_mapgen
 	(analyzer_settings_popup.get_meta("sl_diff") as HSlider).value = analyzer_map_diff
 	(analyzer_settings_popup.get_meta("sb_gap") as SpinBox).value = analyzer_map_min_gap_ms
+	(analyzer_settings_popup.get_meta("sb_lanes") as SpinBox).value = analyzer_map_lanes
 	(analyzer_settings_popup.get_meta("cb_chords") as CheckBox).button_pressed = analyzer_map_allow_chords
 
 	analyzer_settings_popup.popup_centered(Vector2(760, 560))
@@ -5294,32 +5358,24 @@ func _on_analyzer_settings_run() -> void:
 	if analyzer_settings_popup == null:
 		return
 
-	var ob_backend := analyzer_settings_popup.get_meta("ob_backend") as OptionButton
-	if ob_backend != null:
-		analyzer_backend = ob_backend.get_item_text(ob_backend.selected)
-
-	analyzer_percussive = (analyzer_settings_popup.get_meta("cb_perc") as CheckBox).button_pressed
-	analyzer_accurate = (analyzer_settings_popup.get_meta("cb_acc") as CheckBox).button_pressed
-	analyzer_safe_mode = (analyzer_settings_popup.get_meta("cb_safe") as CheckBox).button_pressed
-	analyzer_max_confidence = (analyzer_settings_popup.get_meta("cb_conf") as CheckBox).button_pressed
-	analyzer_normalize = (analyzer_settings_popup.get_meta("cb_norm") as CheckBox).button_pressed
-	analyzer_auto_tune = (analyzer_settings_popup.get_meta("cb_tune") as CheckBox).button_pressed
+	analyzer_auto = (analyzer_settings_popup.get_meta("cb_auto") as CheckBox).button_pressed
+	analyzer_use_beatnet = (analyzer_settings_popup.get_meta("cb_beatnet") as CheckBox).button_pressed
 
 	analyzer_min_bpm = float((analyzer_settings_popup.get_meta("sb_min_bpm") as SpinBox).value)
 	analyzer_max_bpm = float((analyzer_settings_popup.get_meta("sb_max_bpm") as SpinBox).value)
 	analyzer_ts = int((analyzer_settings_popup.get_meta("sb_ts") as SpinBox).value)
-	analyzer_refine_ms = int((analyzer_settings_popup.get_meta("sb_refine") as SpinBox).value)
-	analyzer_max_passes = int((analyzer_settings_popup.get_meta("sb_passes") as SpinBox).value)
+	analyzer_snap_ms = float((analyzer_settings_popup.get_meta("sb_snap") as SpinBox).value)
+	analyzer_onset_delta = float((analyzer_settings_popup.get_meta("sb_delta") as SpinBox).value)
 	analyzer_quick_seconds = int((analyzer_settings_popup.get_meta("sb_quick") as SpinBox).value)
 
 	analyzer_mapgen = (analyzer_settings_popup.get_meta("cb_mapgen") as CheckBox).button_pressed
 	analyzer_map_diff = int((analyzer_settings_popup.get_meta("sl_diff") as HSlider).value)
 	analyzer_map_min_gap_ms = int((analyzer_settings_popup.get_meta("sb_gap") as SpinBox).value)
+	analyzer_map_lanes = int((analyzer_settings_popup.get_meta("sb_lanes") as SpinBox).value)
 	analyzer_map_allow_chords = (analyzer_settings_popup.get_meta("cb_chords") as CheckBox).button_pressed
 
 	analyzer_settings_popup.hide()
 	_analyze_current_song_with_settings()
-
 
 func _request_cancel_analyzer() -> void:
 	if _analyzer_pid == -1 or (not OS.is_process_running(_analyzer_pid)):
@@ -5389,7 +5445,7 @@ func _analyze_current_song_with_settings() -> void:
 	_analyzer_cancel_requested = false
 	_analyzer_dbg_last_progress_print_ms = -999999
 
-	# Build CLI args from settings vars
+	# Build CLI args for the BeatNet + Librosa fusion analyzer
 	var args: Array[String] = [
 		"-u",
 		script_abs,
@@ -5399,50 +5455,29 @@ func _analyze_current_song_with_settings() -> void:
 		"--progress-file", prog_abs,
 		"--cancel-file", cancel_abs,
 
-		"--backend", analyzer_backend,
 		"--min-bpm", str(analyzer_min_bpm),
 		"--max-bpm", str(analyzer_max_bpm),
 		"--ts", str(analyzer_ts),
-		"--refine-ms", str(analyzer_refine_ms),
-		"--max-passes", str(analyzer_max_passes),
-		"--no-improve-limit", str(analyzer_no_improve_limit),
-		"--improve-epsilon", str(analyzer_improve_epsilon),
+		"--snap-ms", str(analyzer_snap_ms),
+		"--onset-delta", str(analyzer_onset_delta),
 		"--quick-seconds", str(analyzer_quick_seconds),
 	]
 
-	if analyzer_force_full_passes:
-		args.append("--force-full-passes")
-
-	if analyzer_percussive:
-		args.append("--percussive")
-	if analyzer_safe_mode:
-		args.append("--safe-mode")
-
-	if analyzer_accurate:
-		args.append("--accurate")
+	if analyzer_auto:
+		args.append("--auto")
 	else:
-		args.append("--fast")
+		args.append("--no-auto")
 
-	if analyzer_normalize:
-		args.append("--normalize")
-	else:
-		args.append("--no-normalize")
-
-	if analyzer_auto_tune:
-		args.append("--auto-tune")
-	else:
-		args.append("--no-auto-tune")
-
-	if analyzer_max_confidence:
-		args.append("--max-confidence")
-	else:
-		args.append("--no-max-confidence")
+	if not analyzer_use_beatnet:
+		args.append("--no-beatnet")
 
 	# MapGen
 	if analyzer_mapgen:
 		args.append("--mapgen")
 		args.append("--map-diff")
 		args.append(str(analyzer_map_diff))
+		args.append("--map-lanes")
+		args.append(str(analyzer_map_lanes))
 		args.append("--map-min-gap-ms")
 		args.append(str(analyzer_map_min_gap_ms))
 		if analyzer_map_allow_chords:
@@ -5459,12 +5494,16 @@ func _analyze_current_song_with_settings() -> void:
 	_analyzer_dbg(" out(abs)=" + out_abs)
 	_analyzer_dbg(" progress=" + prog_abs)
 	_analyzer_dbg(" cancel=" + cancel_abs)
-	_analyzer_dbg(" settings backend=%s perc=%s accurate=%s mapgen=%s diff=%d gap=%d" % [
-		analyzer_backend,
-		str(analyzer_percussive),
-		str(analyzer_accurate),
+	_analyzer_dbg(" settings beatnet=%s bpm=%.0f-%.0f ts=%d snap=%.0fms delta=%.3f mapgen=%s diff=%d lanes=%d gap=%d" % [
+		str(analyzer_use_beatnet),
+		analyzer_min_bpm,
+		analyzer_max_bpm,
+		analyzer_ts,
+		analyzer_snap_ms,
+		analyzer_onset_delta,
 		str(analyzer_mapgen),
 		analyzer_map_diff,
+		analyzer_map_lanes,
 		analyzer_map_min_gap_ms
 	])
 
@@ -5515,6 +5554,8 @@ func _unload_analysis() -> void:
 	analysis_onsetenv_t_ms.clear()
 	analysis_onsetenv_v.clear()
 	analysis_map_notes.clear()
+	analysis_bars.clear()
+	analysis_sections.clear()
 
 	assist_index = 0
 	info.text = "Analysis unloaded."
@@ -5574,12 +5615,13 @@ func _load_analysis_json(p: String) -> void:
 	analysis_data = parsed as Dictionary
 
 	# ------------------------------------------------------------
-	# Beatmap Analyzer v2 schema (seconds-based arrays)
-	# schema: "beatmap_analyzer_v2"
-	# beats/downbeats/onsets are arrays of seconds (floats)
+	# Beatmap Analyzer schema (seconds-based arrays)
+	#   "beatmap_analyzer_v3" -- BeatNet + Librosa fusion (current)
+	#   "beatmap_analyzer_v2" -- legacy, same array layout
+	# beats/downbeats are arrays of seconds; onsets are dicts in v3.
 	# ------------------------------------------------------------
 	var schema: String = String(analysis_data.get("schema", ""))
-	if schema == "beatmap_analyzer_v2":
+	if _is_supported_schema(schema):
 		var beats_s: Variant = analysis_data.get("beats", [])
 		if beats_s is Array:
 			for t in (beats_s as Array):
@@ -5593,25 +5635,52 @@ func _load_analysis_json(p: String) -> void:
 		var on_s: Variant = analysis_data.get("onsets", [])
 		if on_s is Array:
 			for it in (on_s as Array):
-				# analyzer v2 uses float seconds, but accept dicts too just in case
+				# v3 onsets are dicts carrying band/role/section as well as time.
+				# Keep every field: the extra ones drive role-aware mapping.
 				if it is Dictionary:
 					var d: Dictionary = (it as Dictionary).duplicate(true)
-					if d.has("t_ms"):
-						analysis_onsets.append(d)
-					elif d.has("t"):
-						analysis_onsets.append({
-							"t_ms": int(round(float(d.get("t", 0.0)) * 1000.0)),
-							"strength": float(d.get("strength", 1.0)),
-							"band": String(d.get("band", "all")),
-							"src": String(d.get("src", "analyzer")),
-						})
+					if not d.has("t_ms"):
+						d["t_ms"] = int(round(float(d.get("t", 0.0)) * 1000.0))
+					if not d.has("strength"):
+						d["strength"] = 1.0
+					if not d.has("band"):
+						d["band"] = "all"
+					if not d.has("src"):
+						d["src"] = "analyzer"
+					analysis_onsets.append(d)
 				else:
+					# legacy: bare float seconds
 					analysis_onsets.append({
 						"t_ms": int(round(float(it) * 1000.0)),
+						"t": float(it),
 						"strength": 1.0,
 						"band": "all",
 						"src": "analyzer",
 					})
+
+		# Structural read (v3): bars carry tags, sections name drop/breakdown/etc.
+		analysis_bars.clear()
+		var bl: Variant = analysis_data.get("bars", [])
+		if bl is Array:
+			for it3 in (bl as Array):
+				if it3 is Dictionary:
+					analysis_bars.append((it3 as Dictionary).duplicate(true))
+
+		analysis_sections.clear()
+		var sl: Variant = analysis_data.get("sections", [])
+		if sl is Array:
+			for it4 in (sl as Array):
+				if it4 is Dictionary:
+					analysis_sections.append((it4 as Dictionary).duplicate(true))
+
+		# Adopt the detected tempo. Leaving the editor on its 150 default meant
+		# every analyzed chart saved a BPM that was simply wrong, and the value
+		# is written into the beatmap the game loads.
+		var det_bpm: float = float(analysis_data.get("bpm", 0.0))
+		if det_bpm > 20.0 and det_bpm < 400.0:
+			bpm = det_bpm
+			if bpm_edit != null:
+				bpm_edit.text = "%.2f" % det_bpm
 
 			# MapGen notes (if present)
 		var mn: Variant = analysis_data.get("map_notes", [])
@@ -5714,6 +5783,9 @@ func _load_analysis_json(p: String) -> void:
 
 	_update_analysis_popup_text()
 
+func _is_supported_schema(s: String) -> bool:
+	return s == "beatmap_analyzer_v3" or s == "beatmap_analyzer_v2"
+
 func _sort_onsets_by_t(a: Dictionary, b: Dictionary) -> bool:
 	return int(a.get("t_ms", 0)) < int(b.get("t_ms", 0))
 	
@@ -5723,6 +5795,22 @@ func _sort_autofinish_candidate(a: Dictionary, b: Dictionary) -> bool:
 	if ta == tb:
 		return int(a.get("lane", 0)) < int(b.get("lane", 0))
 	return ta < tb
+
+func _sort_map_note_by_t(a: Dictionary, b: Dictionary) -> bool:
+	return float(a.get("t", 0.0)) < float(b.get("t", 0.0))
+
+func _role_class_fallback(basis: String, band: String) -> String:
+	# Older analyses (schema v2) have no role_class, so derive one from
+	# whatever they do carry rather than dropping the note on the floor.
+	var bs: String = basis.to_lower()
+	if bs.begins_with("kick") or bs.begins_with("gated") or bs == "hat":
+		return "beat"
+	if bs.begins_with("screech") or bs.begins_with("lead"):
+		return "melody"
+	var bd: String = band.to_lower()
+	if bd == "mid":
+		return "melody"
+	return "beat"
 
 func _autofinish_lane_for_onset_band(band: String) -> int:
 	var b: String = band.to_lower()
@@ -5799,55 +5887,12 @@ func _autofinish(clear_first: bool) -> void:
 	if autofinish_use_mapgen:
 		if analysis_map_notes.is_empty():
 			_commit_action()
-			info.text = "AutoFinish: MapGen enabled but analysis has no map_notes. Re-run Analyze with MapGen enabled."
+			info.text = "AutoFinish: no map_notes in the analysis. Re-run Analyze (F12) with MapGen enabled."
 			return
 
-		# Build candidates + count raw lanes
-		var candidates: Array[Dictionary] = []
-		var raw_lane_counts: Dictionary = {} # src_lane -> count
-
-		for n in analysis_map_notes:
-			var t_raw: float = float(n.get("t", 0.0))
-			var src_lane: int = int(n.get("lane", 0))
-			raw_lane_counts[src_lane] = int(raw_lane_counts.get(src_lane, 0)) + 1
-			candidates.append({
-				"t": t_raw,
-				"src_lane": src_lane,
-				"meta": n
-			})
-
-		if candidates.is_empty():
-			_commit_action()
-			info.text = "AutoFinish (mapgen): no valid notes."
-			return
-
-		candidates.sort_custom(Callable(self, "_sort_autofinish_candidate"))
-
-		# Decide how to spread raw lanes across editor lanes
-		var unique_src: Array[int] = []
-		for k in raw_lane_counts.keys():
-			unique_src.append(int(k))
-		unique_src.sort()
-
-		var src_to_targets: Dictionary = {} # src_lane -> Array[int]
-		if unique_src.size() <= 1:
-			# only one lane in source -> spread across all lanes
-			var all: Array[int] = []
-			for i in range(lane_count):
-				all.append(i)
-			src_to_targets[unique_src[0]] = all
-		elif unique_src.size() == 2 and lane_count >= 4:
-			# classic 2->4 spread
-			src_to_targets[unique_src[0]] = [0, 2]
-			src_to_targets[unique_src[1]] = [1, 3]
-		else:
-			# fallback: map each unique source lane to a single lane (wrapping)
-			for i in range(unique_src.size()):
-				src_to_targets[unique_src[i]] = [i % lane_count]
-
-		var next_pick: Dictionary = {} # src_lane -> idx
-		for src in unique_src:
-			next_pick[src] = 0
+		var min_sep_s: float = float(autofinish_lane_min_sep_ms) / 1000.0
+		var corr_s: float = float(analysis_data.get("offset_correction_s", 0.0))
+		var snap_ms: int = 18
 
 		var used_lane_ms: Dictionary = {}
 		var last_lane_t: Array[float] = []
@@ -5855,28 +5900,39 @@ func _autofinish(clear_first: bool) -> void:
 		for i in range(lane_count):
 			last_lane_t[i] = -1e9
 
-		var mapped_lane_counts: Array[int] = []
-		mapped_lane_counts.resize(lane_count)
+		var placed_lane_counts: Array[int] = []
+		placed_lane_counts.resize(lane_count)
 		for i in range(lane_count):
-			mapped_lane_counts[i] = 0
+			placed_lane_counts[i] = 0
 
-		var min_sep_s: float = float(autofinish_lane_min_sep_ms) / 1000.0
-		var corr_s: float = float(analysis_data.get("offset_correction_s", 0.0))
-		var snap_ms: int = 18
+		var class_counts: Dictionary = {}
+		var added: int = 0
 		var snapped: int = 0
 		var skip_lane: int = 0
-		var skip_global: int = 0
+		var no_class: int = 0
 
-		var added: int = 0
+		# Sort by time so the per-lane separation check sees notes in order.
+		var ordered: Array[Dictionary] = analysis_map_notes.duplicate()
+		ordered.sort_custom(Callable(self, "_sort_map_note_by_t"))
 
-		for c in candidates:
-			var src_lane2: int = int(c.get("src_lane", 0))
-			var targets: Array = src_to_targets.get(src_lane2, [clamp(src_lane2, 0, lane_count - 1)])
-			var pick_i: int = int(next_pick.get(src_lane2, 0))
-			var lane2: int = int(targets[pick_i % targets.size()])
-			next_pick[src_lane2] = pick_i + 1
+		for n in ordered:
+			# The analyzer already decided what each note IS. In two-lane mode
+			# that decision is the lane, so there is nothing left to configure:
+			# beats go left, melody goes right.
+			var rc: String = String(n.get("role_class", ""))
+			if rc == "":
+				rc = _role_class_fallback(String(n.get("basis", "")), String(n.get("band", "")))
+				no_class += 1
 
-			var t_raw2: float = float(c.get("t", 0.0)) + corr_s
+			var lane2: int
+			if autofinish_two_lane:
+				lane2 = int(ROLE_CLASS_LANE.get(rc, 0))
+			else:
+				lane2 = int(n.get("lane", 0))
+			if lane2 < 0 or lane2 >= lane_count:
+				lane2 = clamp(lane2, 0, lane_count - 1)
+
+			var t_raw2: float = float(n.get("t", 0.0)) + corr_s
 
 			# optional micro-snap to detected beats
 			if analysis_beats_ms.size() > 0 and snap_ms > 0:
@@ -5887,6 +5943,8 @@ func _autofinish(clear_first: bool) -> void:
 					snapped += 1
 
 			var t_place: float = _q(t_raw2) if autofinish_apply_quantize else t_raw2
+			if t_place < 0.0:
+				continue
 
 			var ms: int = int(round(t_place * 1000.0))
 			var key: String = "%d:%d" % [lane2, ms]
@@ -5903,36 +5961,50 @@ func _autofinish(clear_first: bool) -> void:
 			e["src"] = "mapgen"
 
 			# IMPORTANT: don't let meta overwrite lane/t
-			var meta: Dictionary = (c.get("meta", {}) as Dictionary).duplicate(true)
-			meta["src_lane"] = src_lane2
+			var meta: Dictionary = n.duplicate(true)
 			meta.erase("lane")
 			meta.erase("t")
 			meta.erase("t_ms")
-
 			e.merge(meta, true)
 
-			# EXTRA SAFETY: enforce lane/t after merge anyway
+			# role_class drives both the lane and the note colour, so make sure
+			# it survives the merge even for legacy notes that lacked one.
+			e["role_class"] = rc
+
+			# capture_pass is what the RUNTIME routes on: Section_BeatRunner3d
+			# sends "beats" to gameplay and "melody"/"fx" to world FX, and
+			# silently drops anything else. Without it an analyzer chart loads
+			# as a completely empty level, so it is written for every note.
+			e["capture_pass"] = ROLE_CLASS_PASS.get(rc, "beats")
+
 			e["lane"] = lane2
 			e["t"] = t_place
 
 			events.append(e)
 			used_lane_ms[key] = true
 			last_lane_t[lane2] = t_place
-			mapped_lane_counts[lane2] += 1
+			placed_lane_counts[lane2] += 1
+			class_counts[rc] = int(class_counts.get(rc, 0)) + 1
 			added += 1
 
 		_events_dirty = true
 		_commit_action()
 
-		print("[AutoFinishDBG] MapGen placed=%d mapped_lane_counts=%s raw_lane_counts=%s corr_s=%.3f snap_ms=%d snapped=%d skip_global=%d skip_lane=%d"
-			% [added, str(mapped_lane_counts), str(raw_lane_counts), corr_s, snap_ms, snapped, skip_global, skip_lane])
+		print("[AutoFinishDBG] mapgen placed=%d two_lane=%s lanes=%s classes=%s corr=%.3fs snapped=%d skip_lane=%d inferred_class=%d"
+			% [added, str(autofinish_two_lane), str(placed_lane_counts), str(class_counts), corr_s, snapped, skip_lane, no_class])
 
-		info.text = "AutoFinish (mapgen %s): +%d | lanes=%s | corr=%.3fs | snap=%dms" % [
-			mode_label, added, str(mapped_lane_counts), corr_s, snap_ms
-		]
+		var beats_n: int = int(class_counts.get("beat", 0))
+		var mel_n: int = int(class_counts.get("melody", 0))
+		if autofinish_two_lane:
+			info.text = "AutoFinish (%s): +%d — lane 0 beats %d (pink), lane 1 melody %d (blue)" % [
+				mode_label, added, beats_n, mel_n
+			]
+		else:
+			info.text = "AutoFinish (%s): +%d | lanes=%s | beats %d / melody %d" % [
+				mode_label, added, str(placed_lane_counts), beats_n, mel_n
+			]
 		queue_redraw()
 		return
-
 	# ============================================================
 	# Legacy beats/downbeats/onsets path (your existing behavior)
 	# ============================================================
@@ -6429,6 +6501,12 @@ func _color_for_event(e: Dictionary) -> Color:
 			var lane_col: Color = LANE_COLS[clamp(lane, 0, LANE_COLS.size() - 1)]
 			return pass_col.lerp(lane_col, 0.18)
 
+	# Analyzer notes carry their own meaning, so colour by what the note IS
+	# (beat or melody) rather than by which lane it happens to sit in.
+	var rc: String = String(e.get("role_class", ""))
+	if ROLE_CLASS_COLORS.has(rc):
+		return ROLE_CLASS_COLORS[rc]
+
 	var cat: String = String(e.get("category", "generic"))
 	var fill: Color = _cat_base(cat)
 	var lane2: int = int(e.get("lane", 0))
@@ -6443,6 +6521,12 @@ func _border_color_for_event(e: Dictionary) -> Color:
 			var b: Color = CAPTURE_PASS_COLORS[pass_id].darkened(0.18)
 			b.a = 0.85
 			return b
+
+	var rc2: String = String(e.get("role_class", ""))
+	if ROLE_CLASS_COLORS.has(rc2):
+		var rb: Color = (ROLE_CLASS_COLORS[rc2] as Color).darkened(0.20)
+		rb.a = 0.90
+		return rb
 
 	var cat: String = String(e.get("category","generic"))
 	var c: Color = _cat_base(cat).darkened(0.15)
@@ -7066,7 +7150,7 @@ func _update_analysis_popup_text() -> void:
 
 	var schema: String = String(analysis_data.get("schema", ""))
 
-	if schema == "beatmap_analyzer_v2":
+	if _is_supported_schema(schema):
 		var app: Dictionary = analysis_data.get("app", {}) as Dictionary
 		if not app.is_empty():
 			analysis_label.append_text("%s %s\n" % [String(app.get("name", "Beatmap Analyzer")), String(app.get("version", ""))])
@@ -7091,6 +7175,61 @@ func _update_analysis_popup_text() -> void:
 		if notes != "":
 			analysis_label.append_text("notes: %s\n" % notes)
 
+		# --- fusion detail (v3) ---
+		var ex: Dictionary = analysis_data.get("extra", {}) as Dictionary
+		if not ex.is_empty():
+			var au: Dictionary = ex.get("auto", {}) as Dictionary
+			if not au.is_empty() and bool(au.get("applied", false)):
+				var win: Array = au.get("bpm_window", []) as Array
+				if win.size() == 2:
+					analysis_label.append_text("[color=lightgreen]auto settings:[/color] tempo window %.1f-%.1f BPM, snap %.1f ms\n" % [
+						float(win[0]), float(win[1]), float(au.get("snap_window_ms", 0.0))])
+				var bd: Dictionary = au.get("band_deltas", {}) as Dictionary
+				if not bd.is_empty():
+					var bp: Array[String] = []
+					for bk in bd.keys():
+						bp.append("%s %.3f" % [String(bk), float(bd[bk])])
+					analysis_label.append_text("auto onset thresholds: %s\n" % ", ".join(bp))
+			else:
+				analysis_label.append_text("[color=khaki]auto settings: off (manual values used)[/color]\n")
+
+			var tp: Dictionary = ex.get("tempo", {}) as Dictionary
+			if not tp.is_empty():
+				analysis_label.append_text("tempo lock: %.4f BPM via %s (strength %.4f)\n" % [
+					float(tp.get("bpm", 0.0)), String(tp.get("source", "?")), float(tp.get("strength", 0.0))])
+
+			var bnn: Dictionary = ex.get("beatnet", {}) as Dictionary
+			if not bnn.is_empty():
+				if bool(bnn.get("ok", false)):
+					analysis_label.append_text("BeatNet: ok, %d beats, seed %.2f BPM\n" % [
+						int(bnn.get("beats", 0)), float(bnn.get("bpm", 0.0))])
+				else:
+					analysis_label.append_text("[color=khaki]BeatNet: unavailable (librosa-only grid)[/color]\n")
+
+			var gr: Dictionary = ex.get("grid", {}) as Dictionary
+			if not gr.is_empty():
+				analysis_label.append_text("grid: tightness %s, snapped %s, score %.3f\n" % [
+					str(gr.get("chosen_tightness", 0)), str(gr.get("chosen_snapped", false)),
+					float(gr.get("chosen_score", 0.0))])
+
+			var roles: Dictionary = ex.get("onset_roles", {}) as Dictionary
+			if not roles.is_empty():
+				var parts: Array[String] = []
+				for k in roles.keys():
+					parts.append("%s %d" % [String(k), int(roles[k])])
+				analysis_label.append_text("onset roles: %s\n" % ", ".join(parts))
+
+			var secs: Dictionary = ex.get("section_counts", {}) as Dictionary
+			if not secs.is_empty():
+				var sp: Array[String] = []
+				for k2 in secs.keys():
+					sp.append("%s %d" % [String(k2), int(secs[k2])])
+				analysis_label.append_text("sections: %s\n" % ", ".join(sp))
+
+			analysis_label.append_text("frame resolution: %.2f ms\n" % float(ex.get("resolution_ms", 0.0)))
+
+		if analysis_bars.size() > 0:
+			analysis_label.append_text("bars: %d | map_notes: %d\n" % [analysis_bars.size(), analysis_map_notes.size()])
 	else:
 		var ver := int(analysis_data.get("analysis_version", 0))
 		analysis_label.append_text("analysis_version: %d\n" % ver)

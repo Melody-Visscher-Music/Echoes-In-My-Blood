@@ -1,106 +1,140 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Beatmap Analyzer -- BeatNet + Librosa fusion.
+
+Built for Rawstyle / hard dance, where generic beat trackers fail: gated kicks,
+heavy distortion, reversed basslines and fake drops swamp ordinary onset
+detectors, which see a wall of noise instead of a clean transient.
+
+The fusion, and why each half is here:
+
+  BeatNet   supplies the macro grid. Its CNN+DBN is rock solid on tempo and bar
+            phase, but its frames are 20 ms wide, so its beat times are far too
+            coarse to place notes against, and it knows nothing about structure.
+
+  Librosa   supplies everything BeatNet lacks: a frequency-band split that
+            separates the kick from the screech from the hats, sample-accurate
+            transient snapping, and the structural read (drops, buildups,
+            breakdowns, fake drops, gated-kick rolls).
+
+Pipeline:
+    1. decode -> mono float32 at 44.1 kHz (analysis) + 22.05 kHz wav (BeatNet)
+    2. BeatNet offline DBN            -> tempo seed + bar phase
+    3. DFT comb on the kick band      -> exact global BPM
+    4. librosa DP tracker, kick band  -> per-beat placement that follows the kick
+    5. transient snap                 -> sample-accurate beat times
+    6. band-split onset detection     -> kick / mid / high events
+    7. structural read                -> sections, drops, gated kicks, screeches
+    8. map generation                 -> playable notes on the fused grid
+
+CLI (this is how Godot drives it):
+    python BeatmapAnalyzer.py --cli --audio SONG --out OUT.json \
+        --progress-file P.json --cancel-file C.json --mapgen --map-diff 6
+"""
 
 from __future__ import annotations
 
 import os
 import sys
-import re
 import json
 import time
 import math
-import queue
-import shutil
 import ctypes
 import hashlib
-import traceback
-import platform
-import subprocess
-import colorsys
 import argparse
-import bisect
-import random
-from dataclasses import dataclass, asdict
+import traceback
+import warnings
+from dataclasses import dataclass, asdict, field
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
+warnings.filterwarnings("ignore")
+
 # ============================================================
-# App identity
+# Identity
 # ============================================================
 
 APP_NAME = "Beatmap Analyzer"
-APP_VERSION = "v0.8.3"
-APP_ID = f"{APP_NAME} {APP_VERSION}"
+APP_VERSION = "v1.0.0-fusion"
+APP_ID = "%s %s" % (APP_NAME, APP_VERSION)
+SCHEMA = "beatmap_analyzer_v3"
 
 ProgressCB = Callable[[int, str], None]
 
-
-# ============================================================
-# Paths / Defaults
-# ============================================================
-
-def _home() -> str:
-    return os.path.expanduser("~")
-
-SCRIPT_PATH = os.path.abspath(__file__)
-SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
-
-# project root = one level above /tools
+SCRIPT_DIR = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-
-DEFAULT_OUT_DIR = os.path.join(
-    PROJECT_ROOT,
-    "data",
-    "Analysis",
-)
-
+DEFAULT_OUT_DIR = os.path.join(PROJECT_ROOT, "data", "Analysis")
 CACHE_DIR = os.path.join(SCRIPT_DIR, ".cache")
-os.makedirs(CACHE_DIR, exist_ok=True)
 
-RECENTS_PATH = os.path.join(CACHE_DIR, "recent_files.json")
-VENV_CACHE_PATH = os.path.join(CACHE_DIR, "venv_python_path.txt")
+# The fusion venv. Kept first so we never accidentally relaunch into the old
+# madmom-only environment.
+VENV_NAMES = (".venv-fusion",)
 
 
 # ============================================================
-# Crash shield: always log fatal errors
+# Venv bootstrap
 # ============================================================
 
-def _crash_log_file() -> str:
+def _venv_python(venv_dir: str) -> Optional[str]:
+    for rel in (("Scripts", "python.exe"), ("bin", "python")):
+        p = os.path.join(venv_dir, *rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def find_fusion_python() -> Optional[str]:
+    for name in VENV_NAMES:
+        p = _venv_python(os.path.join(SCRIPT_DIR, name))
+        if p:
+            return p
+    return None
+
+
+def _have_stack() -> bool:
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        import numpy  # noqa: F401
+        import librosa  # noqa: F401
+        from BeatNet.BeatNet import BeatNet  # noqa: F401
+        return True
     except Exception:
-        pass
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    return os.path.join(CACHE_DIR, f"crash_{ts}.log")
+        return False
 
-def _write_text(path: str, text: str) -> None:
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-    except Exception:
-        pass
 
-def _show_fatal_popup(title: str, message: str) -> None:
-    if os.name == "nt":
-        try:
-            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)  # MB_ICONERROR
-            return
-        except Exception:
-            pass
+def relaunch_into_venv_if_needed() -> None:
+    """If the current interpreter can't import the stack, re-exec in the venv."""
+    if os.environ.get("BEATMAP_ANALYZER_RELAUNCHED") == "1":
+        return
+    if _have_stack():
+        return
+    py = find_fusion_python()
+    if not py or os.path.normcase(py) == os.path.normcase(sys.executable):
+        return
+    env = dict(os.environ)
+    env["BEATMAP_ANALYZER_RELAUNCHED"] = "1"
+    import subprocess
     try:
-        print(message, file=sys.stderr)
+        sys.exit(subprocess.call([py, os.path.abspath(__file__)] + sys.argv[1:], env=env))
+    except SystemExit:
+        raise
     except Exception:
-        pass
+        return
 
 
 # ============================================================
-# Progress file for Godot UI
+# Progress / crash reporting
 # ============================================================
 
-def write_progress_file(path: Optional[str], pct: int, msg: str, extra: Optional[Dict[str, Any]] = None) -> None:
+def write_progress_file(path: Optional[str], pct: int, msg: str,
+                        extra: Optional[Dict[str, Any]] = None) -> None:
     if not path:
         return
     try:
-        payload = {"pct": int(max(0, min(100, int(pct)))), "msg": str(msg), "t": time.time()}
+        payload: Dict[str, Any] = {
+            "pct": int(max(0, min(100, int(pct)))),
+            "msg": str(msg),
+            "t": time.time(),
+        }
         if extra:
             payload.update(extra)
         tmp = path + ".tmp"
@@ -111,2358 +145,1768 @@ def write_progress_file(path: Optional[str], pct: int, msg: str, extra: Optional
         pass
 
 
-# ============================================================
-# Venv auto-find + relaunch (works even when script elsewhere)
-# ============================================================
-
-def _in_venv() -> bool:
-    return getattr(sys, "base_prefix", sys.prefix) != sys.prefix
-
-def _norm(p: str) -> str:
-    return os.path.abspath(p).replace("/", "\\").lower()
-
-def _venv_python_from_venv_dir(venv_dir: str) -> Optional[str]:
-    if not venv_dir:
-        return None
-    if os.name == "nt":
-        cand = os.path.join(venv_dir, "Scripts", "python.exe")
-    else:
-        cand = os.path.join(venv_dir, "bin", "python")
-    return cand if os.path.isfile(cand) else None
-
-def _candidate_venvs_in_dir(base: str) -> List[str]:
-    names = [".venv", "venv", "env"]
-    out = []
-    for n in names:
-        p = os.path.join(base, n)
-        py = _venv_python_from_venv_dir(p)
-        if py:
-            out.append(py)
-    return out
-
-def _walk_parents(start: str, max_levels: int = 10) -> List[str]:
-    start = os.path.abspath(start)
-    out = []
-    cur = start
-    for _ in range(max_levels):
-        out.append(cur)
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return out
-
-def _load_cached_venv_python() -> Optional[str]:
+def _crash_log(text: str) -> str:
     try:
-        if os.path.isfile(VENV_CACHE_PATH):
-            p = open(VENV_CACHE_PATH, "r", encoding="utf-8").read().strip()
-            if p and os.path.isfile(p):
-                return p
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        p = os.path.join(CACHE_DIR, "crash_%s.log" % time.strftime("%Y%m%d_%H%M%S"))
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text)
+        return p
     except Exception:
-        pass
-    return None
+        return ""
 
-def _save_cached_venv_python(p: str) -> None:
-    try:
-        with open(VENV_CACHE_PATH, "w", encoding="utf-8") as f:
-            f.write(p.strip())
-    except Exception:
-        pass
-
-def _scan_for_venv_python_windows(max_seconds: float = 6.0) -> Optional[str]:
-    """
-    Optional deeper search (time-limited) for a .venv on Windows.
-    This is NOT a full disk crawl; it stops after max_seconds.
-    """
-    if os.name != "nt":
-        return None
-
-    start = time.time()
-    roots = []
-
-    # Prioritize user profile locations first (fast + most likely).
-    try:
-        roots.append(_home())
-        roots.append(os.path.join(_home(), "BeatmapAnalyzer"))
-        roots.append(os.path.join(_home(), "Documents"))
-        roots.append(os.path.join(_home(), "Desktop"))
-    except Exception:
-        pass
-
-    # Then C:\Users (still usually manageable, but time-limited).
-    roots.append(r"C:\Users")
-
-    seen = set()
-    for root in roots:
-        root = os.path.abspath(root)
-        if not os.path.isdir(root) or root in seen:
-            continue
-        seen.add(root)
-
-        for dirpath, dirnames, filenames in os.walk(root):
-            if (time.time() - start) > max_seconds:
-                return None
-
-            # prune heavy/system dirs
-            dlow = dirpath.lower()
-            if any(x in dlow for x in [
-                r"\appdata\local\packages", r"\windows", r"\program files", r"\program files (x86)",
-                r"\node_modules", r"\.git", r"\.godot", r"\library", r"\temp"
-            ]):
-                dirnames[:] = []
-                continue
-
-            # quick check: ".venv\Scripts\python.exe"
-            if os.path.basename(dirpath).lower() in (".venv", "venv", "env"):
-                py = _venv_python_from_venv_dir(dirpath)
-                if py:
-                    return py
-
-            # prune depth a bit (keeps it snappy)
-            rel_depth = dirpath[len(root):].count(os.sep)
-            if rel_depth > 7:
-                dirnames[:] = []
-                continue
-
-    return None
-
-def find_best_venv_python(allow_scan: bool = False) -> Optional[str]:
-    # 1) hard-priority: local project venv inside /tools/.venv
-    local_tools_venv = os.path.join(SCRIPT_DIR, ".venv")
-    py = _venv_python_from_venv_dir(local_tools_venv)
-    if py:
-        return py
-
-    # 2) explicit env vars
-    env_py = os.environ.get("BEATMAP_ANALYZER_PY", "").strip()
-    if env_py and os.path.isfile(env_py):
-        return env_py
-
-    env_venv = os.environ.get("BEATMAP_ANALYZER_VENV", "").strip()
-    if env_venv:
-        py = _venv_python_from_venv_dir(env_venv)
-        if py:
-            return py
-
-    # 3) cached venv path
-    cached = _load_cached_venv_python()
-    if cached:
-        return cached
-
-    # 4) walk upward from script dir
-    for base in _walk_parents(SCRIPT_DIR, max_levels=12):
-        cands = _candidate_venvs_in_dir(base)
-        if cands:
-            return cands[0]
-
-    # 5) walk upward from cwd
-    try:
-        cwd = os.getcwd()
-    except Exception:
-        cwd = SCRIPT_DIR
-
-    for base in _walk_parents(cwd, max_levels=12):
-        cands = _candidate_venvs_in_dir(base)
-        if cands:
-            return cands[0]
-
-    # 6) optional old home fallback
-    common = os.path.join(_home(), "BeatmapAnalyzer", ".venv")
-    py = _venv_python_from_venv_dir(common)
-    if py:
-        return py
-
-    # 7) optional deeper scan
-    if allow_scan or os.environ.get("BEATMAP_ANALYZER_SCAN_VENV", "").strip() in ("1", "true", "True"):
-        py2 = _scan_for_venv_python_windows(max_seconds=6.0)
-        if py2:
-            return py2
-
-    return None
-
-def relaunch_into_found_venv_if_needed(allow_scan: bool = False) -> None:
-    if os.name != "nt":
-        return
-    if "--no-relaunch" in sys.argv:
-        return
-
-    want = find_best_venv_python(allow_scan=allow_scan)
-    if not want:
-        return
-
-    try:
-        cur = _norm(sys.executable)
-        wantn = _norm(want)
-        cur_dir = _norm(os.path.dirname(sys.executable))
-        want_dir = _norm(os.path.dirname(want))
-        same_folder = (cur_dir == want_dir)
-    except Exception:
-        return
-
-    if cur != wantn and not same_folder:
-        _save_cached_venv_python(want)
-        args = [want, SCRIPT_PATH] + [a for a in sys.argv[1:] if a != "--no-relaunch"] + ["--no-relaunch"]
-        try:
-            subprocess.Popen(args, cwd=os.getcwd())
-        except Exception:
-            tb = traceback.format_exc()
-            logp = _crash_log_file()
-            _write_text(logp, tb)
-            _show_fatal_popup(APP_ID, f"Failed to relaunch into venv.\n\nCrash log:\n{logp}\n\n{tb[-1600:]}")
-        raise SystemExit(0)
-
-
-# ============================================================
-# Dependency bootstrap
-# ============================================================
-
-def _pip_cmd() -> List[str]:
-    return [sys.executable, "-m", "pip"]
-
-def _run(cmd: List[str]) -> Tuple[bool, str]:
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        out = (p.stdout or "") + ("\n" + (p.stderr or "") if p.stderr else "")
-        return (p.returncode == 0), out.strip()
-    except Exception:
-        return False, traceback.format_exc()
-
-def _try_import(name: str) -> Tuple[bool, str]:
-    try:
-        __import__(name)
-        return True, ""
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-def _py_version_tuple() -> Tuple[int, int]:
-    return (sys.version_info.major, sys.version_info.minor)
-
-def _pin_set_for_current_python() -> Dict[str, str]:
-    maj, mi = _py_version_tuple()
-    pins = {
-        "pip": "pip",
-        "setuptools": "setuptools<81",
-        "wheel": "wheel",
-        "numpy": "numpy==1.23.5",
-        "scipy": "scipy==1.10.1",
-        "cython": "Cython==0.29.37",
-        "mido": "mido>=1.3.3",
-        "madmom": "madmom==0.16.1",
-        "librosa": "librosa==0.10.1",
-        "soundfile": "soundfile>=0.12",
-        "audioread": "audioread>=3.0",
-    }
-    if (maj, mi) >= (3, 12):
-        pins["numpy"] = "numpy<2"
-        pins["scipy"] = "scipy<2"
-    return pins
-
-def ensure_dependencies(force: bool = False, progress_cb: Optional[ProgressCB] = None) -> Dict[str, Any]:
-    pins = _pin_set_for_current_python()
-    report: Dict[str, Any] = {
-        "python": sys.version,
-        "executable": sys.executable,
-        "platform": platform.platform(),
-        "venv": _in_venv(),
-        "steps": [],
-        "ok": True,
-        "warning": None,
-    }
-
-    maj, mi = _py_version_tuple()
-    if (maj, mi) >= (3, 12):
-        report["warning"] = "Python 3.12+ detected; madmom can be harder to build. Python 3.9 is the safest on Windows."
-
-    def ping(p: int, m: str) -> None:
-        if progress_cb:
-            progress_cb(int(p), m)
-
-    def step(title: str, cmd: List[str], pct: int) -> None:
-        ping(pct, title)
-        ok, out = _run(cmd)
-        report["steps"].append({"title": title, "ok": ok, "cmd": cmd, "log": out[-9000:]})
-        if not ok:
-            report["ok"] = False
-
-    base_ok = all(_try_import(m)[0] for m in ["numpy", "scipy", "Cython"])
-    mad_ok = _try_import("madmom")[0]
-    lib_ok = _try_import("librosa")[0]
-    sf_ok = _try_import("soundfile")[0]
-
-    if base_ok and (mad_ok or lib_ok) and sf_ok and not force:
-        report["ok"] = True
-        return report
-
-    step("Upgrade pip tooling (pip/setuptools<81/wheel)", _pip_cmd() + ["install", "-U", pins["pip"], pins["setuptools"], pins["wheel"]], 10)
-    step("Install pinned numpy/scipy/Cython/mido", _pip_cmd() + ["install", pins["numpy"], pins["scipy"], pins["cython"], pins["mido"]], 30)
-    step("Install madmom (no-build-isolation)", _pip_cmd() + ["install", "--no-build-isolation", pins["madmom"]], 58)
-    step("Install fallback libs (librosa/soundfile/audioread)", _pip_cmd() + ["install", pins["soundfile"], pins["audioread"], pins["librosa"]], 78)
-
-    ping(90, "Verifying imports…")
-    checks = ["numpy", "scipy", "Cython", "mido", "madmom", "librosa", "soundfile", "tkinter"]
-    for mod in checks:
-        ok, err = _try_import(mod)
-        report["steps"].append({"title": f"Import check: {mod}", "ok": ok, "log": "OK" if ok else err})
-        if not ok and mod in ["numpy", "scipy", "Cython"]:
-            report["ok"] = False
-
-    ping(100, "Dependency check done.")
-    return report
-
-
-# ============================================================
-# Audio helpers
-# ============================================================
-
-def _hash_for_cache(path: str) -> str:
-    st = os.stat(path)
-    h = hashlib.sha1()
-    h.update(os.path.abspath(path).encode("utf-8", "ignore"))
-    h.update(str(st.st_size).encode())
-    h.update(str(int(st.st_mtime)).encode())
-    return h.hexdigest()[:12]
-
-def _find_ffmpeg() -> Optional[str]:
-    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    return shutil.which(exe)
-
-def _ffmpeg_convert_to_wav(
-    src: str,
-    dst_wav: str,
-    *,
-    quick_seconds: int = 0,
-) -> Tuple[bool, str]:
-    ffmpeg = _find_ffmpeg()
-    if not ffmpeg:
-        return False, "ffmpeg not found in PATH."
-
-    cmd = [ffmpeg, "-y", "-nostdin"]
-    if quick_seconds and quick_seconds > 0:
-        cmd += ["-t", str(int(quick_seconds))]
-    cmd += ["-i", src, "-vn", "-ac", "1", "-ar", "44100", "-f", "wav", dst_wav]
-
-    ok, out = _run(cmd)
-    if ok and os.path.isfile(dst_wav) and os.path.getsize(dst_wav) > 44:
-        return True, out
-    return False, out
 
 def _safe_mkdir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
+    if p:
+        try:
+            os.makedirs(p, exist_ok=True)
+        except Exception:
+            pass
 
-def _sanitize_filename(name: str) -> str:
-    name = re.sub(r"[<>:\"/\\|?*\x00-\x1F]", "_", name)
-    name = name.strip().strip(".")
-    return name or "analysis"
+
+def _audio_hash(path: str) -> str:
+    h = hashlib.sha1()
+    try:
+        st = os.stat(path)
+        h.update(os.path.basename(path).encode("utf-8", "ignore"))
+        h.update(str(st.st_size).encode())
+        h.update(str(int(st.st_mtime)).encode())
+        with open(path, "rb") as f:
+            h.update(f.read(1 << 20))
+    except Exception:
+        h.update(path.encode("utf-8", "ignore"))
+    return h.hexdigest()[:16]
 
 
 # ============================================================
-# Data structures
+# Config
 # ============================================================
 
 @dataclass
 class AnalysisConfig:
-    backend: str  # "auto" | "madmom" | "librosa"
-    min_bpm: float = 90.0
-    max_bpm: float = 220.0
-    prefer_time_signature: int = 4
-    onset_refine_ms: int = 200
-    onset_threshold_mode: str = "auto"  # "auto" | "fixed"
-    onset_threshold_fixed: float = 0.35
-    accurate_mode: bool = True
-    onset_percentile: Optional[int] = None
-    onset_factor: Optional[float] = None
-
-@dataclass
-class AnalysisOptions:
-    safe_mode: bool = False
+    min_bpm: float = 120.0
+    max_bpm: float = 200.0
+    time_signature: int = 4
+    # Rawstyle band split (Hz). The kick lives in sub+punch; screeches in mid.
+    sub_band: Tuple[float, float] = (35.0, 120.0)
+    punch_band: Tuple[float, float] = (120.0, 260.0)
+    mid_band: Tuple[float, float] = (700.0, 3500.0)
+    high_band: Tuple[float, float] = (5000.0, 12000.0)
+    snap_window_ms: float = 18.0
+    onset_delta: float = 0.055
+    tightness: float = 400.0
+    use_beatnet: bool = True
     quick_seconds: int = 0
-    use_cache: bool = True
-    normalize_audio: bool = True
-    auto_tune: bool = True
-    percussive_assist: bool = False
-    maximize_confidence: bool = True
-    max_passes: int = 20
-    no_improve_limit: int = 6
-    improve_epsilon: float = 0.002
-    force_full_passes: bool = False  # NEW: run all passes even if plateau
+    auto: bool = True
+    # Filled in by auto_tune(): per-band onset thresholds. Empty means "use
+    # onset_delta for every band".
+    band_deltas: Dict[str, float] = field(default_factory=dict)
 
-@dataclass
-class AnalysisResult:
-    ok: bool
-    backend_used: str
-    notes: str
-    audio_path: str
-    bpm: Optional[float] = None
-    beats: Optional[List[float]] = None
-    downbeats: Optional[List[float]] = None
-    onsets: Optional[List[float]] = None
-    offset_correction_s: float = 0.0
-    extra: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-
-# ============================================================
-# MapGen (mixed-lane beatmap suggestion)
-# ============================================================
 
 @dataclass
 class MapGenConfig:
     enabled: bool = True
-    difficulty: int = 5            # 1..10 (higher = denser + more complex)
+    difficulty: int = 5
     lane_count: int = 4
-    seed: int = 0                  # 0 = deterministic from audio hash
-    min_gap_ms: int = 85           # minimum gap between consecutive notes (global)
+    seed: int = 0
+    min_gap_ms: int = 85
     allow_chords: bool = False
-    chord_prob: float = 0.10       # only used if allow_chords + high difficulty
+    chord_prob: float = 0.18
+    allow_triplets: bool = True
 
 
-def _subdiv_for_diff(diff: int) -> int:
-    d = max(1, min(10, int(diff)))
-    if d <= 3:
-        return 1     # quarters
-    if d <= 6:
-        return 2     # eighths
-    return 4         # sixteenths
+@dataclass
+class FusionResult:
+    ok: bool = False
+    bpm: Optional[float] = None
+    beats: List[float] = field(default_factory=list)
+    downbeats: List[float] = field(default_factory=list)
+    onsets: List[Dict[str, Any]] = field(default_factory=list)
+    bars: List[Dict[str, Any]] = field(default_factory=list)
+    sections: List[Dict[str, Any]] = field(default_factory=list)
+    offset_correction_s: float = 0.0
+    duration_s: float = 0.0
+    notes: str = ""
+    error: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+    # The config actually used, after auto-tuning. Reported instead of the
+    # requested one so the JSON never claims settings that were overridden.
+    config_used: Optional["AnalysisConfig"] = None
+    # In-process only, never serialised: the band bank, so map generation can
+    # ask how much energy each grid slot actually has.
+    bands: Any = None
 
 
-def _nearest_in_sorted(xs: List[float], x: float) -> Tuple[float, float]:
-    # returns (nearest_value, abs_distance)
-    if not xs:
-        return (x, 1e9)
-    i = bisect.bisect_left(xs, x)
-    best = xs[min(i, len(xs) - 1)]
-    best_d = abs(best - x)
-    if i > 0:
-        cand = xs[i - 1]
-        d = abs(cand - x)
-        if d < best_d:
-            best, best_d = cand, d
-    return best, best_d
+# ============================================================
+# Audio + band-split features
+# ============================================================
+
+ANALYSIS_SR = 44100
+BEATNET_SR = 22050
+HOP = 128          # 2.9 ms at 44.1 kHz. Accuracy is worth the extra work.
+NFFT = 1024
 
 
-def _grid_from_beats(beats: List[float], subdiv: int) -> List[float]:
-    beats = _dedupe_sorted(_clamp_events_nonnegative(beats or []), eps=1e-4)
-    if len(beats) < 2:
-        return beats
-    subdiv = max(1, int(subdiv))
-    out: List[float] = []
-    for i in range(len(beats) - 1):
-        a = beats[i]
-        b = beats[i + 1]
-        dt = b - a
-        if dt <= 1e-4:
+class Bands:
+    """Frequency-split feature bank.
+
+    The low bands are filtered in the time domain rather than read off the
+    STFT. At any FFT size cheap enough to run at this hop, a 35-120 Hz kick
+    occupies two or three bins -- far too coarse to time a transient. A
+    zero-phase Butterworth bandpass keeps full sample resolution and, being
+    zero-phase, introduces no group delay that would shift every kick late.
+
+    The mid and high bands have no such problem, so they come off one STFT.
+    `flux_*` are half-wave-rectified: rise-only energy change, which is what
+    an onset physically is.
+    """
+
+    def __init__(self, y, sr: int, cfg: AnalysisConfig):
+        import numpy as np
+        import librosa
+
+        self.sr = int(sr)
+        self.hop = HOP
+        self.fps = float(sr) / float(HOP)
+        self.y = y
+        self.duration = float(len(y)) / float(sr)
+
+        S = np.abs(librosa.stft(y, n_fft=NFFT, hop_length=HOP)).astype(np.float32)
+        self.S = S
+        self.freqs = librosa.fft_frequencies(sr=sr, n_fft=NFFT)
+        self.n_frames = S.shape[1]
+        self.times = librosa.frames_to_time(
+            np.arange(self.n_frames), sr=sr, hop_length=HOP)
+
+        def stft_band(lo: float, hi: float):
+            m = (self.freqs >= lo) & (self.freqs < hi)
+            if not m.any():
+                m = np.zeros_like(self.freqs, dtype=bool)
+                m[min(1, len(m) - 1)] = True
+            return S[m, :].sum(axis=0).astype(np.float64)
+
+        self.e_sub = self._time_band(y, sr, *cfg.sub_band)
+        self.e_punch = self._time_band(y, sr, *cfg.punch_band)
+        self.e_mid = stft_band(*cfg.mid_band)
+        self.e_high = stft_band(*cfg.high_band)
+        self.e_all = S.sum(axis=0).astype(np.float64)
+
+        self.flux_sub = self._flux(self.e_sub)
+        self.flux_punch = self._flux(self.e_punch)
+        self.flux_mid = self._flux(self.e_mid)
+        self.flux_high = self._flux(self.e_high)
+        self.flux_all = self._flux(self.e_all)
+
+        # Kick drive: sub and punch rising together. The product suppresses
+        # bass-only rumble and mid-only stabs, a discrimination that a plain
+        # full-band flux cannot make on a distorted track.
+        self.flux_kick = self._norm(
+            np.sqrt(np.maximum(self.flux_sub * self.flux_punch, 0.0)))
+
+        # Distortion cue: Rawstyle screeches are broadband and noisy, so high
+        # spectral flatness in the mid band separates a screech from a clean
+        # melodic lead.
+        self.flatness = librosa.feature.spectral_flatness(S=S, power=1.0)[0].astype(np.float64)
+        self.rms = librosa.feature.rms(
+            S=S, frame_length=NFFT, hop_length=HOP)[0].astype(np.float64)
+
+    def _time_band(self, y, sr: int, lo: float, hi: float):
+        """Zero-phase bandpass -> rectified -> smoothed -> sampled on frames."""
+        import numpy as np
+        from scipy.signal import butter, sosfiltfilt
+        from scipy.ndimage import uniform_filter1d
+
+        nyq = 0.5 * float(sr)
+        lo_n = max(1e-4, float(lo) / nyq)
+        hi_n = min(0.999, float(hi) / nyq)
+        if hi_n <= lo_n:
+            hi_n = min(0.999, lo_n * 1.5)
+        sos = butter(4, [lo_n, hi_n], btype="band", output="sos")
+        xb = sosfiltfilt(sos, np.asarray(y, dtype=np.float64))
+        env = np.abs(xb)
+        env = uniform_filter1d(env, size=max(3, int(0.004 * sr)))
+        idx = np.arange(self.n_frames) * self.hop
+        idx = np.clip(idx, 0, env.size - 1)
+        return env[idx]
+
+    @staticmethod
+    def _flux(e):
+        import numpy as np
+        f = np.diff(e, prepend=e[0])
+        f[f < 0.0] = 0.0
+        return f
+
+    @staticmethod
+    def _norm(x):
+        import numpy as np
+        mx = float(np.max(x)) if x.size else 0.0
+        return x / mx if mx > 0 else x
+
+    def frame_at(self, t: float) -> int:
+        i = int(round(float(t) * self.fps))
+        return max(0, min(self.n_frames - 1, i))
+
+    def mean_between(self, arr, t0: float, t1: float) -> float:
+        import numpy as np
+        a = self.frame_at(t0)
+        b = max(a + 1, self.frame_at(t1))
+        seg = arr[a:b]
+        return float(np.mean(seg)) if seg.size else 0.0
+
+
+def load_audio(path: str, quick_seconds: int = 0):
+    """Decode to mono float32. librosa handles wav/flac/ogg via soundfile and
+    mp3/m4a via audioread, so no ffmpeg shell-out is needed."""
+    import librosa
+    dur = float(quick_seconds) if quick_seconds and quick_seconds > 0 else None
+    y, sr = librosa.load(path, sr=ANALYSIS_SR, mono=True, duration=dur)
+    return y, int(sr)
+
+
+def _write_beatnet_wav(y, sr: int, dst: str) -> str:
+    import librosa
+    import soundfile as sf
+    import numpy as np
+    y22 = librosa.resample(y, orig_sr=sr, target_sr=BEATNET_SR)
+    peak = float(np.max(np.abs(y22))) if y22.size else 0.0
+    if peak > 0:
+        y22 = (y22 / peak) * 0.95
+    sf.write(dst, y22.astype("float32"), BEATNET_SR)
+    return dst
+
+
+# ============================================================
+# Stage 1 -- BeatNet macro grid
+# ============================================================
+
+def beatnet_grid(y, sr: int, cache_dir: str,
+                 progress: Optional[ProgressCB] = None) -> Dict[str, Any]:
+    """Run BeatNet offline (CNN activations + DBN decoding).
+
+    Returns beat times and bar positions (1 == downbeat). These are quantised
+    to BeatNet's 20 ms frame rate, so we use them for tempo and bar phase only
+    -- never for final note placement.
+    """
+    import numpy as np
+    out: Dict[str, Any] = {"ok": False, "beats": [], "positions": [],
+                           "bpm": None, "error": None}
+    tmp_wav = os.path.join(cache_dir, "beatnet_input.wav")
+    try:
+        _write_beatnet_wav(y, sr, tmp_wav)
+        if progress:
+            progress(22, "BeatNet: loading model…")
+        from BeatNet.BeatNet import BeatNet
+        est = BeatNet(1, mode="offline", inference_model="DBN",
+                      plot=[], thread=False, device="cpu")
+        if progress:
+            progress(26, "BeatNet: decoding beat grid…")
+        raw = np.asarray(est.process(tmp_wav))
+        if raw.ndim != 2 or raw.shape[0] < 4:
+            out["error"] = "BeatNet returned too few beats."
+            return out
+        beats = raw[:, 0].astype(float)
+        pos = raw[:, 1].astype(int)
+        ibi = np.diff(beats)
+        ibi = ibi[(ibi > 0.15) & (ibi < 1.2)]
+        if ibi.size < 3:
+            out["error"] = "BeatNet beat spacing implausible."
+            return out
+        out["ok"] = True
+        out["beats"] = beats.tolist()
+        out["positions"] = pos.tolist()
+        out["bpm"] = float(60.0 / float(np.median(ibi)))
+    except Exception:
+        out["error"] = traceback.format_exc()[-4000:]
+    finally:
+        try:
+            if os.path.isfile(tmp_wav):
+                os.remove(tmp_wav)
+        except Exception:
+            pass
+    return out
+
+
+# ============================================================
+# Stage 2 -- exact tempo from the kick band
+# ============================================================
+
+def _decimate_env(env, fps: float, target_fps: float = 200.0):
+    """Shrink an envelope for tempo work.
+
+    Tempo is a property of the whole track, so it does not need transient
+    resolution -- but the correlation cost is linear in frame count, and at
+    2.9 ms frames a five-minute track is 100k samples per candidate tempo.
+    Block-summing to ~5 ms preserves every periodicity below 100 BPM-equivalent
+    while cutting the work by an order of magnitude.
+    """
+    import numpy as np
+    env = np.asarray(env, dtype=np.float64)
+    factor = max(1, int(round(float(fps) / float(target_fps))))
+    if factor <= 1:
+        return env, float(fps)
+    n = (env.size // factor) * factor
+    if n <= 0:
+        return env, float(fps)
+    small = env[:n].reshape(-1, factor).sum(axis=1)
+    return small, float(fps) / float(factor)
+
+
+def _dft_scan(env, fps: float, bpm_lo: float, bpm_hi: float, n: int):
+    import numpy as np
+    t = np.arange(env.size) / float(fps)
+    bpms = np.linspace(float(bpm_lo), float(bpm_hi), int(n))
+    mag = np.empty(bpms.size)
+    ang = np.empty(bpms.size)
+    step = 512
+    for i in range(0, bpms.size, step):
+        chunk = bpms[i:i + step]
+        z = np.exp(-2j * np.pi * np.outer(chunk / 60.0, t)) @ env
+        mag[i:i + step] = np.abs(z)
+        ang[i:i + step] = np.angle(z)
+    return bpms, mag, ang
+
+
+def dft_tempo(env, fps: float, bpm_lo: float, bpm_hi: float,
+              n: int = 4000) -> Tuple[float, float, float]:
+    """Comb/DFT tempo estimate, coarse to fine.
+
+    Correlating the kick envelope against a complex exponential at each
+    candidate tempo yields, in one shot, how periodic the track is at that
+    tempo (magnitude) and where beat one sits (phase), weighted by onset
+    strength. Over a full track this resolves tempo far finer than counting
+    inter-beat intervals -- which BeatNet's 20 ms frames cap at roughly 2 BPM.
+
+    The scan runs twice: coarse over the whole range, then a narrow refinement
+    around the winner at full precision.
+    """
+    import numpy as np
+    env = np.asarray(env, dtype=np.float64)
+    if env.size < 16:
+        return (0.0, 0.0, 0.0)
+
+    small, sfps = _decimate_env(env, fps)
+    total = float(np.sum(small)) + 1e-9
+
+    bpms, mag, ang = _dft_scan(small, sfps, bpm_lo, bpm_hi, n)
+    k = int(np.argmax(mag))
+    coarse = float(bpms[k])
+
+    span = max(0.6, (float(bpm_hi) - float(bpm_lo)) / float(n) * 8.0)
+    b2, m2, a2 = _dft_scan(small, sfps,
+                           max(float(bpm_lo), coarse - span),
+                           min(float(bpm_hi), coarse + span), 3000)
+    k2 = int(np.argmax(m2))
+    if m2[k2] >= mag[k]:
+        return (float(b2[k2]), float(m2[k2] / total), float(a2[k2]))
+    return (coarse, float(mag[k] / total), float(ang[k]))
+
+
+def refine_tempo(bands: Bands, cfg: AnalysisConfig,
+                 seed_bpm: Optional[float]) -> Dict[str, Any]:
+    """Lock the exact BPM, using BeatNet's estimate only to pick the octave."""
+    import numpy as np
+
+    env = bands.flux_kick
+    if float(np.sum(env)) <= 0:
+        env = Bands._norm(bands.flux_all)
+
+    lo, hi = float(cfg.min_bpm), float(cfg.max_bpm)
+    wide_bpm, wide_mag, wide_ang = dft_tempo(env, bands.fps, lo, hi, 6000)
+
+    chosen, mag, ang = wide_bpm, wide_mag, wide_ang
+    source = "dft_wide"
+
+    if seed_bpm and seed_bpm > 0:
+        # Search tightly around BeatNet's seed and its octaves, then take
+        # whichever is genuinely most periodic.
+        cands = [(chosen, mag, ang, source)]
+        for mult, tag in ((1.0, "dft_at_beatnet"), (0.5, "dft_half"), (2.0, "dft_double")):
+            c = float(seed_bpm) * mult
+            if not (lo * 0.6 <= c <= hi * 1.4):
+                continue
+            b, m, a = dft_tempo(env, bands.fps, max(lo * 0.6, c - 8.0),
+                                min(hi * 1.4, c + 8.0), 2500)
+            cands.append((b, m, a, tag))
+        # A doubled tempo always scores some energy, so the seed octave only
+        # loses on a clear win, not a marginal one.
+        best = max(cands, key=lambda c: c[1])
+        near = [c for c in cands if abs(c[0] - float(seed_bpm)) < 0.12 * float(seed_bpm)]
+        if near:
+            ns = max(near, key=lambda c: c[1])
+            if ns[1] >= best[1] * 0.72:
+                best = ns
+        chosen, mag, ang, source = best
+
+    period = 60.0 / chosen if chosen > 0 else 0.0
+    phase = float(np.mod(ang / (2.0 * np.pi) * period, period)) if period > 0 else 0.0
+    return {"bpm": float(chosen), "period": float(period), "phase": phase,
+            "strength": float(mag), "source": source,
+            "wide_bpm": float(wide_bpm), "wide_strength": float(wide_mag)}
+
+
+# ============================================================
+# Stage 3 -- beat placement on the kick band
+# ============================================================
+
+def track_beats(bands: Bands, cfg: AnalysisConfig, bpm: float) -> List[float]:
+    """Dynamic-programming beat tracking driven by the kick band.
+
+    Feeding the tracker the kick-drive curve instead of a full-band onset
+    envelope is what makes this survive Rawstyle: the distorted mid/high wall
+    never gets a vote, so screeches and reverse basses cannot pull the grid.
+    """
+    import numpy as np
+    import librosa
+
+    env = bands.flux_kick
+    if float(np.sum(env)) <= 0:
+        env = Bands._norm(bands.flux_all)
+
+    try:
+        _tempo, frames = librosa.beat.beat_track(
+            onset_envelope=env, sr=bands.sr, hop_length=bands.hop,
+            start_bpm=float(bpm), tightness=float(cfg.tightness),
+            trim=False, units="frames")
+        beats = librosa.frames_to_time(
+            np.asarray(frames), sr=bands.sr, hop_length=bands.hop)
+        return [float(t) for t in np.atleast_1d(beats)]
+    except Exception:
+        return []
+
+
+def synth_grid(period: float, phase: float, duration: float) -> List[float]:
+    if period <= 0:
+        return []
+    n = int(math.floor((duration - phase) / period)) + 1
+    if n <= 0:
+        return []
+    return [float(phase + period * i) for i in range(n)]
+
+
+def fuse_beats(tracked: List[float], period: float, phase: float,
+               duration: float,
+               max_dev_ratio: float = 0.28) -> Tuple[List[float], Dict[str, Any]]:
+    """Reconcile the DP beats with the ideal constant-tempo grid.
+
+    The DP tracker follows the music but wobbles and drops beats wherever the
+    kick disappears (breakdowns). The ideal grid is perfectly regular but deaf.
+    Using the grid as the skeleton and pulling each slot onto a nearby tracked
+    beat yields a grid that is both complete and musically anchored.
+    """
+    import numpy as np
+    ideal = synth_grid(period, phase, duration)
+    if not ideal:
+        return (sorted(tracked), {"mode": "tracked_only", "matched": 0})
+    if not tracked:
+        return (ideal, {"mode": "ideal_only", "matched": 0})
+
+    tr = np.asarray(sorted(tracked), dtype=float)
+    tol = period * float(max_dev_ratio)
+    fused: List[float] = []
+    matched = 0
+    for g in ideal:
+        j = int(np.searchsorted(tr, g))
+        best = None
+        bestd = 1e9
+        for jj in (j - 1, j, j + 1):
+            if 0 <= jj < tr.size:
+                d = abs(float(tr[jj]) - g)
+                if d < bestd:
+                    bestd, best = d, float(tr[jj])
+        if best is not None and bestd <= tol:
+            fused.append(best)
+            matched += 1
+        else:
+            fused.append(float(g))
+
+    fused = sorted(fused)
+    # Enforce spacing so a bad pull cannot collapse two beats together.
+    cleaned: List[float] = []
+    for t in fused:
+        if cleaned and (t - cleaned[-1]) < period * 0.45:
             continue
-        for s in range(subdiv):
-            out.append(a + dt * (float(s) / float(subdiv)))
-    out.append(beats[-1])
-    return _dedupe_sorted(out, eps=1e-4)
+        cleaned.append(t)
+    return (cleaned, {"mode": "fused", "matched": matched,
+                      "ideal": len(ideal), "tracked": len(tracked)})
 
 
-def _quantize_to_grid(t: float, grid: List[float], tol_s: float) -> Optional[float]:
-    if t is None or not math.isfinite(t) or t < 0.0 or not grid:
-        return None
-    nearest, dist = _nearest_in_sorted(grid, float(t))
-    return nearest if dist <= tol_s else None
+def snap_to_transients(times: List[float], bands: Bands,
+                       window_ms: float = 18.0) -> Tuple[List[float], float]:
+    """Align a grid to the kick transients without destroying its regularity.
+
+    Snapping each beat independently to its nearest flux peak looks right per
+    beat and is wrong overall: neighbouring kick-roll hits pull individual
+    beats off by up to the window width, and the grid ends up jittering by more
+    than it was ever misaligned. Electronic tracks are machine-timed, so the
+    true correction is smooth -- a fixed latency plus, at most, slow drift.
+
+    So we measure the per-beat deviation, then apply a running median of it.
+    Outliers (a beat that landed on a roll hit) are voted down by their
+    neighbours, while a genuine shared offset survives intact.
+    """
+    import numpy as np
+    if not times:
+        return ([], 0.0)
+
+    env = bands.flux_kick
+    w = max(1, int(round((float(window_ms) / 1000.0) * bands.fps)))
+    n = len(times)
+
+    devs = np.full(n, np.nan, dtype=float)
+    floor = float(np.percentile(env, 90)) * 0.15
+    for i, t in enumerate(times):
+        c = bands.frame_at(t)
+        a = max(0, c - w)
+        b = min(bands.n_frames, c + w + 1)
+        if b - a < 2:
+            continue
+        seg = env[a:b]
+        peak = float(np.max(seg))
+        if peak <= max(1e-9, floor):
+            continue          # no transient here (breakdown) -- leave the beat alone
+        k = a + int(np.argmax(seg))
+        devs[i] = float(k) / bands.fps - float(t)
+
+    if not np.any(np.isfinite(devs)):
+        return (list(times), 0.0)
+
+    med = float(np.nanmedian(devs))
+    smooth = _running_nanmedian(devs, win=17, fallback=med)
+
+    out = [float(t) + float(s) for t, s in zip(times, smooth)]
+    out.sort()
+    return (out, med)
 
 
-def _difficulty_density_per_beat(diff: int, bpm: Optional[float]) -> float:
-    d = max(1, min(10, int(diff)))
-    # 1..10 -> 0.55..1.85 notes/beat
-    base = 0.55 + (float(d - 1) / 9.0) * 1.30
-    if bpm and bpm > 1e-3:
-        # high bpm gets a small density reduction, low bpm a small boost
-        scale = max(0.75, min(1.20, 160.0 / float(bpm)))
-        base *= scale
-    return base
+def _running_nanmedian(x, win: int = 17, fallback: float = 0.0):
+    """Median filter that ignores gaps, so breakdowns don't drag the curve."""
+    import numpy as np
+    x = np.asarray(x, dtype=float)
+    n = x.size
+    half = max(1, int(win) // 2)
+    out = np.empty(n, dtype=float)
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n, i + half + 1)
+        seg = x[a:b]
+        seg = seg[np.isfinite(seg)]
+        out[i] = float(np.median(seg)) if seg.size else float(fallback)
+    return out
 
 
-def _jack_gap_ms_for_diff(diff: int) -> int:
-    d = max(1, min(10, int(diff)))
-    # 1..10 -> 210..75
-    return int(max(75, min(220, 225 - d * 15)))
+def assign_downbeats(beats: List[float], bn_beats: List[float],
+                     bn_pos: List[int], bands: Optional[Bands] = None,
+                     ts: int = 4) -> Tuple[List[float], int]:
+    """Carry BeatNet's bar phase onto the fused beats.
+
+    BeatNet's downbeat call is its real strength -- it hears the bar even when
+    the kick pattern gives nothing away -- so we keep its phase and re-time it
+    onto our own, more accurate beats.
+    """
+    import numpy as np
+    if not beats:
+        return ([], 0)
+    ts = 4 if int(ts) not in (3, 4) else int(ts)
+    ba = np.asarray(beats, dtype=float)
+
+    if bn_beats and bn_pos and len(bn_beats) == len(bn_pos):
+        votes = np.zeros(ts, dtype=float)
+        for t, p in zip(bn_beats, bn_pos):
+            i = int(np.argmin(np.abs(ba - float(t))))
+            if abs(float(ba[i]) - float(t)) < 0.18:
+                votes[(i - (int(p) - 1)) % ts] += 1.0
+        if float(votes.sum()) > 0:
+            off = int(np.argmax(votes))
+            return ([float(beats[i]) for i in range(off, len(beats), ts)], off)
+
+    # No usable BeatNet phase: pick the offset whose beats hit hardest.
+    if bands is not None:
+        best_off, best_score = 0, -1.0
+        for off in range(ts):
+            idx = list(range(off, len(beats), ts))
+            if not idx:
+                continue
+            s = float(np.mean([bands.flux_kick[bands.frame_at(beats[i])] for i in idx]))
+            if s > best_score:
+                best_score, best_off = s, off
+        return ([float(beats[i]) for i in range(best_off, len(beats), ts)], best_off)
+
+    return ([float(beats[i]) for i in range(0, len(beats), ts)], 0)
 
 
-def _choose_lane(
-    *,
-    t_ms: int,
-    basis: str,
-    intensity: float,
-    lane_count: int,
-    last_lane: int,
-    last_t_by_lane: List[int],
-    jack_gap_ms: int,
-    rng: random.Random,
-) -> int:
-    best_lane = 0
-    best_score = -1e18
+# ============================================================
+# Stage 4 -- band-split onset detection
+# ============================================================
 
-    outer = {0, lane_count - 1} if lane_count >= 2 else {0}
-    mid_l = max(0, (lane_count // 2) - 1)
-    mid_r = min(lane_count - 1, (lane_count // 2))
-
-    for ln in range(lane_count):
-        s = 0.0
-
-        # basis preferences
-        if basis == "downbeat":
-            s += 1.0 if ln in outer else 0.35
-        elif basis == "beat":
-            s += 0.80 if (ln == mid_l or ln == mid_r) else 0.55
-        else:  # onset/other
-            s += 0.78
-
-        # movement flow
-        if last_lane >= 0:
-            dist = abs(ln - last_lane)
-            s += 0.50 - 0.16 * float(dist)  # prefer nearby lanes
-            if intensity > 0.65:
-                s += 0.04 * float(dist)      # but allow bigger jumps in busy parts
-
-            # light encouragement to alternate parity (feels like L/R hands)
-            if (ln % 2) != (last_lane % 2):
-                s += 0.10
-
-        # anti-jack
-        dt = t_ms - last_t_by_lane[ln]
-        if dt < jack_gap_ms:
-            s -= 2.2 * (1.0 - float(dt) / float(jack_gap_ms))
-
-        # tiny random jitter to break ties consistently (seeded)
-        s += (rng.random() - 0.5) * 0.02
-
-        if s > best_score:
-            best_score = s
-            best_lane = ln
-
-    return best_lane
+# Minimum spacing per band, as a fraction of one beat. The kick can roll at
+# 1/8 but never faster in practice; hats and screeches can go to 1/16.
+BAND_SPEC = (
+    # One kick detector, not two. Sub and punch fire together on every
+    # Rawstyle kick, so peak-picking them separately double-counts each hit
+    # and makes plain four-to-the-floor look like a gated roll. flux_kick is
+    # already the coincidence of both, and it is the same curve the beat grid
+    # is built on, so onsets and beats agree by construction.
+    ("kick", "flux_kick", 0.42),
+    ("mid",  "flux_mid",  0.22),
+    ("high", "flux_high", 0.22),
+)
 
 
-def generate_map_notes(
-    *,
-    audio_path: str,
-    beats: List[float],
-    downbeats: List[float],
-    onsets: List[float],
-    bpm: Optional[float],
-    time_signature: int,
-    cfg: MapGenConfig,
-) -> List[Dict[str, Any]]:
-    beats = _dedupe_sorted(_clamp_events_nonnegative(beats or []), eps=1e-4)
-    if len(beats) < 2:
+def detect_band_onsets(bands: Bands, cfg: AnalysisConfig,
+                       period: float) -> List[Dict[str, Any]]:
+    """Peak-pick each band separately, then merge.
+
+    Splitting first is the whole point: a full-band detector on Rawstyle sees
+    the distorted kick and the screech as one continuous smear. Per band, each
+    element has its own noise floor and its own plausible rate.
+    """
+    import numpy as np
+    import librosa
+
+    events: List[Dict[str, Any]] = []
+    fps = bands.fps
+
+    for name, attr, beat_frac in BAND_SPEC:
+        env = np.asarray(getattr(bands, attr), dtype=np.float64)
+        mx = float(np.max(env)) if env.size else 0.0
+        if mx <= 0:
+            continue
+        env = env / mx
+
+        wait = max(1, int(round(period * beat_frac * fps))) if period > 0 else 4
+        try:
+            pk = librosa.util.peak_pick(
+                env,
+                pre_max=max(1, int(0.020 * fps)),
+                post_max=max(1, int(0.020 * fps)),
+                pre_avg=max(1, int(0.100 * fps)),
+                post_avg=max(1, int(0.100 * fps)),
+                delta=float(cfg.band_deltas.get(name, cfg.onset_delta)),
+                wait=wait)
+        except Exception:
+            continue
+
+        for k in np.atleast_1d(np.asarray(pk, dtype=int)):
+            k = int(k)
+            if k < 0 or k >= env.size:
+                continue
+            events.append({
+                "t": round(float(k) / fps, 5),
+                "strength": round(float(env[k]), 4),
+                "band": name,
+                "src": "librosa",
+            })
+
+    events.sort(key=lambda e: (e["t"], e["band"]))
+    return events
+
+
+def merge_close_onsets(events: List[Dict[str, Any]],
+                       eps: float = 0.012) -> List[Dict[str, Any]]:
+    """De-duplicate near-simultaneous events inside each band.
+
+    Bands stay separate: a screech landing on a kick is genuinely two things
+    the chart may want to place, so only repeats within one band collapse.
+    """
+    if not events:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for band in ("kick", "mid", "high"):
+        same = sorted([e for e in events if e["band"] == band], key=lambda x: x["t"])
+        keep: List[Dict[str, Any]] = []
+        for e in same:
+            if keep and (e["t"] - keep[-1]["t"]) <= eps:
+                # Same hit seen twice: keep the earlier time (the true attack)
+                # and the stronger reading.
+                keep[-1]["strength"] = max(keep[-1]["strength"], e["strength"])
+                continue
+            keep.append(dict(e))
+        out.extend(keep)
+
+    order = {"kick": 0, "mid": 1, "high": 2}
+    out.sort(key=lambda e: (e["t"], order.get(e["band"], 9)))
+    return out
+
+
+# ============================================================
+# Auto-tuning -- derive settings from the audio instead of the user
+# ============================================================
+
+def auto_tune(bands: Bands, cfg: AnalysisConfig,
+              seed_bpm: Optional[float]) -> Tuple[AnalysisConfig, Dict[str, Any]]:
+    """Pick the analysis settings from the audio itself.
+
+    Every knob here has a defensible automatic value, so leaving them to be
+    guessed by hand only invites a bad tempo window or a threshold that mutes
+    half the track. What each one is derived from:
+
+      tempo window  BeatNet's own estimate, widened just enough to cover a
+                    half/double error, so the DFT never has to search a range
+                    the track cannot possibly be in.
+      onset delta   the spread of each band's own flux distribution -- a
+                    heavily limited master and a dynamic one need very
+                    different absolute thresholds to mean the same thing.
+      snap window   a fraction of one beat, so it scales with tempo instead of
+                    being a fixed millisecond count that is generous at 120 BPM
+                    and reckless at 180.
+    """
+    import numpy as np
+
+    out = AnalysisConfig(**asdict(cfg))
+    notes: Dict[str, Any] = {"applied": True}
+
+    # --- tempo window ---
+    if seed_bpm and seed_bpm > 0:
+        lo = max(60.0, float(seed_bpm) * 0.62)
+        hi = min(260.0, float(seed_bpm) * 1.62)
+    else:
+        # No BeatNet: fall back to librosa's own global estimate.
+        try:
+            import librosa
+            est = float(np.atleast_1d(librosa.feature.tempo(
+                onset_envelope=bands.flux_kick, sr=bands.sr,
+                hop_length=bands.hop, aggregate=np.median))[0])
+        except Exception:
+            est = 150.0
+        lo = max(60.0, est * 0.62)
+        hi = min(260.0, est * 1.62)
+    out.min_bpm, out.max_bpm = float(lo), float(hi)
+    notes["bpm_window"] = [round(lo, 2), round(hi, 2)]
+
+    # --- onset threshold, per band ---
+    deltas: Dict[str, float] = {}
+    for name, attr, _frac in BAND_SPEC:
+        env = np.asarray(getattr(bands, attr), dtype=np.float64)
+        mx = float(np.max(env)) if env.size else 0.0
+        if mx <= 0:
+            deltas[name] = float(cfg.onset_delta)
+            continue
+        env = env / mx
+        spread = float(np.percentile(env, 96) - np.percentile(env, 55))
+        deltas[name] = float(min(0.20, max(0.020, spread * 0.55)))
+    out.band_deltas = deltas
+    notes["band_deltas"] = {k: round(v, 4) for k, v in deltas.items()}
+
+    return out, notes
+
+
+def auto_snap_window_ms(period: float, fallback: float) -> float:
+    """Snap window as a share of one beat, clamped to sane millisecond bounds."""
+    if period <= 0:
+        return float(fallback)
+    return float(min(26.0, max(8.0, period * 1000.0 * 0.045)))
+
+# ============================================================
+# Stage 5 -- structural read (what BeatNet cannot see)
+# ============================================================
+
+def _pct(arr, q: float) -> float:
+    import numpy as np
+    a = np.asarray(arr, dtype=float)
+    return float(np.percentile(a, q)) if a.size else 0.0
+
+
+def analyze_bars(bands: Bands, beats: List[float], downbeats: List[float],
+                 onsets: List[Dict[str, Any]], period: float,
+                 ts: int = 4) -> List[Dict[str, Any]]:
+    """Per-bar feature table. Everything structural is derived from this."""
+    import numpy as np
+    if not downbeats:
+        return []
+
+    sub_ref = _pct(bands.e_sub, 95) + 1e-9
+    mid_ref = _pct(bands.e_mid, 95) + 1e-9
+    high_ref = _pct(bands.e_high, 95) + 1e-9
+    rms_ref = _pct(bands.rms, 95) + 1e-9
+
+    kick_t = np.asarray([o["t"] for o in onsets
+                         if o["band"] == "kick"], dtype=float)
+    mid_t = np.asarray([o["t"] for o in onsets if o["band"] == "mid"], dtype=float)
+
+    bars: List[Dict[str, Any]] = []
+    for i, t0 in enumerate(downbeats):
+        t1 = downbeats[i + 1] if i + 1 < len(downbeats) else min(
+            bands.duration, t0 + period * ts)
+        if t1 <= t0:
+            continue
+        span = t1 - t0
+        nk = int(np.sum((kick_t >= t0) & (kick_t < t1)))
+        nm = int(np.sum((mid_t >= t0) & (mid_t < t1)))
+        bars.append({
+            "index": i,
+            "t": round(float(t0), 5),
+            "t_end": round(float(t1), 5),
+            "sub": round(bands.mean_between(bands.e_sub, t0, t1) / sub_ref, 4),
+            "mid": round(bands.mean_between(bands.e_mid, t0, t1) / mid_ref, 4),
+            "high": round(bands.mean_between(bands.e_high, t0, t1) / high_ref, 4),
+            "rms": round(bands.mean_between(bands.rms, t0, t1) / rms_ref, 4),
+            "flatness": round(bands.mean_between(bands.flatness, t0, t1), 5),
+            "kicks": nk,
+            "kicks_per_beat": round(nk / max(1e-6, span / period), 3),
+            "mid_hits": nm,
+        })
+    return bars
+
+
+def tag_bars(bars: List[Dict[str, Any]]) -> None:
+    """Label each bar with what the track is doing there.
+
+    Rawstyle structure is legible from three signals: how much sub is present
+    (kick on or off), how fast the kick is repeating (gated rolls), and how
+    noisy the mid band is (screeches). Read together they separate a real drop
+    from a breakdown, a buildup, or a fake drop.
+    """
+    import numpy as np
+    if not bars:
+        return
+
+    sub = np.asarray([b["sub"] for b in bars], dtype=float)
+    rms = np.asarray([b["rms"] for b in bars], dtype=float)
+    kpb = np.asarray([b["kicks_per_beat"] for b in bars], dtype=float)
+    flat = np.asarray([b["flatness"] for b in bars], dtype=float)
+    mid = np.asarray([b["mid"] for b in bars], dtype=float)
+
+    sub_hi = float(np.percentile(sub, 62))
+    sub_lo = float(np.percentile(sub, 32))
+    rms_hi = float(np.percentile(rms, 60))
+    flat_hi = float(np.percentile(flat, 70))
+    mid_hi = float(np.percentile(mid, 62))
+
+    # Hysteresis on the kick decision. Percentile thresholds sit right in the
+    # middle of the data, so bars hovering near the boundary flip on and off
+    # and shred the section list into one-bar fragments. Requiring a bar to
+    # clear a higher bar to switch on than to stay on keeps runs intact.
+    sub_on = float(np.percentile(sub, 66))
+    sub_off = float(np.percentile(sub, 46))
+    kicking_prev = False
+
+    # An absolute floor for "there is a kick here at all", so a filtered or
+    # side-chained intro kick is not mistaken for silence.
+    sub_floor = float(np.percentile(sub, 22))
+
+    for i, b in enumerate(bars):
+        tags: List[str] = []
+        thresh = sub_off if kicking_prev else sub_on
+        kick_rate_ok = (kpb[i] >= (0.45 if kicking_prev else 0.6))
+        # Energy OR rate. Intro and breakdown kicks are deliberately quiet, so
+        # judging on sub energy alone labelled busy sections "no_kick" -- which
+        # then suppressed their rolls and left them out of the chart entirely.
+        kicking = ((sub[i] >= thresh) and kick_rate_ok) or                   (kpb[i] >= 0.9 and sub[i] >= sub_floor)
+        kicking_prev = kicking
+
+        if kicking:
+            tags.append("kick")
+            # A gated kick chops one hit into a burst; more than ~1.6 kick
+            # events per beat means a roll rather than a four-to-the-floor.
+            if kpb[i] >= 1.6:
+                tags.append("gated_kick")
+            if kpb[i] >= 2.6:
+                tags.append("kick_roll")
+        elif sub[i] <= sub_lo:
+            tags.append("no_kick")
+
+        if (mid[i] >= mid_hi) and (flat[i] >= flat_hi):
+            tags.append("screech")
+
+        if (not kicking) and rms[i] < rms_hi:
+            tags.append("breakdown")
+
+        # Buildup: energy climbing with the kick thinning out.
+        if i >= 2 and i + 1 < len(bars):
+            rising = rms[i] > rms[i - 1] > rms[i - 2]
+            if rising and kpb[i] < 0.6 and sub[i] < sub_hi:
+                tags.append("buildup")
+
+        b["tags"] = tags
+        b["intensity"] = round(float(
+            0.55 * min(1.0, rms[i]) + 0.30 * min(1.0, sub[i]) +
+            0.15 * min(1.0, mid[i])), 4)
+
+
+def find_sections(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group tagged bars into named sections and flag fake drops.
+
+    A fake drop is the pattern that breaks naive trackers: the track hits full
+    energy for a bar or two, then yanks it away again instead of sustaining.
+    Detecting it needs a look at how long a drop *lasts*, which is why this
+    runs over bar runs rather than instantaneous energy.
+    """
+    if not bars:
+        return []
+
+    def kind_of(b: Dict[str, Any]) -> str:
+        tags = b.get("tags", [])
+        if "buildup" in tags:
+            return "buildup"
+        if "kick" in tags:
+            return "drop" if b.get("intensity", 0.0) >= 0.45 else "groove"
+        if "breakdown" in tags or "no_kick" in tags:
+            return "breakdown"
+        return "groove"
+
+    runs: List[Dict[str, Any]] = []
+    for b in bars:
+        k = kind_of(b)
+        if runs and runs[-1]["kind"] == k:
+            runs[-1]["t_end"] = b["t_end"]
+            runs[-1]["bars"] += 1
+        else:
+            runs.append({"kind": k, "t": b["t"], "t_end": b["t_end"], "bars": 1})
+
+    # A "drop" that survives fewer than 2 bars and falls back into low energy
+    # is a fake drop, not a section.
+    for i, r in enumerate(runs):
+        if r["kind"] == "drop" and r["bars"] <= 2:
+            nxt = runs[i + 1] if i + 1 < len(runs) else None
+            if nxt is not None and nxt["kind"] in ("breakdown", "buildup"):
+                r["kind"] = "fake_drop"
+
+    for r in runs:
+        r["t"] = round(float(r["t"]), 5)
+        r["t_end"] = round(float(r["t_end"]), 5)
+    return runs
+
+
+def tag_onsets(onsets: List[Dict[str, Any]], bars: List[Dict[str, Any]],
+               beats: List[float], period: float) -> None:
+    """Attach musical role and grid position to every onset.
+
+    `role` is what the map generator keys off: a sub hit on a downbeat during a
+    drop should not be treated like a hat during a breakdown.
+    """
+    import numpy as np
+    if not onsets:
+        return
+    bt = np.asarray(beats, dtype=float) if beats else np.zeros(0)
+    bar_starts = np.asarray([b["t"] for b in bars], dtype=float) if bars else np.zeros(0)
+
+    for o in onsets:
+        t = float(o["t"])
+        # Which bar are we in, and what is that bar doing?
+        tags: List[str] = []
+        if bar_starts.size:
+            bi = int(np.searchsorted(bar_starts, t, side="right")) - 1
+            bi = max(0, min(len(bars) - 1, bi))
+            tags = list(bars[bi].get("tags", []))
+            o["bar"] = int(bi)
+            o["intensity"] = float(bars[bi].get("intensity", 0.5))
+        else:
+            o["bar"] = -1
+            o["intensity"] = 0.5
+
+        # Distance to the nearest beat, in fractions of a beat.
+        if bt.size and period > 0:
+            j = int(np.argmin(np.abs(bt - t)))
+            dev = (t - float(bt[j])) / period
+            o["beat_index"] = int(j)
+            o["beat_dev"] = round(float(dev), 4)
+            o["on_beat"] = bool(abs(dev) <= 0.10)
+        else:
+            o["beat_index"] = -1
+            o["beat_dev"] = 0.0
+            o["on_beat"] = False
+
+        band = o.get("band", "all")
+        if band == "kick":
+            # Test on-beat FIRST. A gated bar still has a kick on the beat, and
+            # calling that "gated" throws away the one distinction the chart
+            # cares about most -- the pulse you actually step on. Only the
+            # off-beat hits in a gated bar are the roll.
+            if o["on_beat"]:
+                o["role"] = "kick"
+            elif "gated_kick" in tags or "kick_roll" in tags:
+                o["role"] = "gated_kick"
+            else:
+                o["role"] = "kick_offbeat"
+        elif band == "mid":
+            o["role"] = "screech" if "screech" in tags else "lead"
+        else:
+            o["role"] = "hat"
+
+        if "breakdown" in tags:
+            o["section"] = "breakdown"
+        elif "buildup" in tags:
+            o["section"] = "buildup"
+        elif "kick" in tags:
+            o["section"] = "drop"
+        else:
+            o["section"] = "groove"
+
+
+# ============================================================
+# Stage 6 -- map generation
+# ============================================================
+
+def _density_for_diff(diff: int) -> float:
+    """Target notes per beat, across both lanes.
+
+    Calibrated against a hand-authored chart for this game: ~2.4 notes per beat
+    total (0.87 on the beat lane, 1.5 on the melody lane). The melody lane
+    drives world FX rather than taps, so high totals here stay playable -- the
+    earlier curve topped out below what a real chart uses and left songs sparse.
+    """
+    return {1: 0.50, 2: 0.80, 3: 1.10, 4: 1.50, 5: 1.90,
+            6: 2.30, 7: 2.70, 8: 3.10, 9: 3.60, 10: 4.20}.get(int(diff), 2.3)
+
+
+# How the note budget splits between the two lanes, and how much a slot is
+# discounted for being an ornament rather than the backbone. Measured against
+# the hand-authored reference: 635 beat notes to 1108 melody notes, of which
+# 69% of beat gaps are exactly one beat.
+# The two-lane split the editor charts against: everything you feel as the
+# pulse goes left, everything you hear as the tune goes right.
+BEAT_LANE = 0
+MELODY_LANE = 1
+
+BEAT_LANE_SHARE = 0.37
+MELODY_LANE_SHARE = 0.63
+ROLL_WEIGHT = 0.55
+# A slot quieter than this fraction of the band's own median is treated as
+# silence and never charted, however favourable its local ratio looks.
+SILENCE_FLOOR = 0.30
+MEL_DIV_WEIGHT = {1: 1.00, 2: 0.92, 4: 0.72, 8: 0.50}
+# Triplet slots are offered as candidates but weighted below their binary
+# neighbours, so they only win where the mid band genuinely peaks off the
+# binary grid. The reference chart is binary throughout; a song that actually
+# swings still gets them.
+TRIPLET_DIVS = {3: 0.62, 6: 0.44}
+
+
+def _local_reference(bands, arr, duration: float,
+                     win_s: float = 7.0, pct: float = 80.0):
+    """Rolling loudness reference for one band, sampled once per second.
+
+    Scoring grid slots on absolute energy makes the whole track compete against
+    its own loudest passages, so an intro or breakdown that is quiet but busy
+    loses every slot to the drops and comes out empty. Dividing by a local
+    reference asks "is this loud *for around here*", which keeps quiet sections
+    charted at their own scale.
+    """
+    import numpy as np
+    n = max(1, int(math.ceil(duration)))
+    per_sec = np.empty(n, dtype=float)
+    for i in range(n):
+        per_sec[i] = bands.mean_between(arr, float(i), float(i) + 1.0)
+
+    half = max(1, int(round(win_s)))
+    ref = np.empty(n, dtype=float)
+    for i in range(n):
+        a = max(0, i - half)
+        b = min(n, i + half + 1)
+        seg = per_sec[a:b]
+        ref[i] = float(np.percentile(seg, pct)) if seg.size else 0.0
+    return ref
+
+
+def _ref_at(ref, t: float) -> float:
+    import numpy as np
+    if ref is None or len(ref) == 0:
+        return 1.0
+    i = int(min(len(ref) - 1, max(0, int(t))))
+    return float(ref[i])
+
+
+def _slot_energy(bands, arr, t: float, half_win: float) -> float:
+    return bands.mean_between(arr, t - half_win, t + half_win)
+
+
+def _snap_to_onset(t: float, cand, tol: float) -> float:
+    """Move a grid slot onto a real transient if one is close enough."""
+    import numpy as np
+    if cand is None or len(cand) == 0:
+        return t
+    j = int(np.searchsorted(cand, t))
+    best, bestd = t, 1e9
+    for jj in (j - 1, j, j + 1):
+        if 0 <= jj < len(cand):
+            d = abs(float(cand[jj]) - t)
+            if d < bestd:
+                bestd, best = d, float(cand[jj])
+    return best if bestd <= tol else t
+
+
+def _section_of(tags: List[str]) -> str:
+    if "breakdown" in tags:
+        return "breakdown"
+    if "buildup" in tags:
+        return "buildup"
+    if "kick" in tags:
+        return "drop"
+    return "groove"
+
+
+def _take_budget(cands: List[Dict[str, Any]], budget: int,
+                 min_gap: float) -> List[Dict[str, Any]]:
+    """Keep the highest-energy slots, then enforce spacing in time order."""
+    if budget <= 0 or not cands:
+        return []
+    ranked = sorted(cands, key=lambda c: -float(c["score"]))[:budget]
+    ranked.sort(key=lambda c: float(c["t"]))
+    out: List[Dict[str, Any]] = []
+    last = -1e9
+    for c in ranked:
+        t = float(c["t"])
+        if (t - last) < min_gap:
+            continue
+        out.append(c)
+        last = t
+    return out
+
+
+def generate_map_notes(*, onsets: List[Dict[str, Any]], beats: List[float],
+                       downbeats: List[float], period: float,
+                       audio_hash: str, cfg: MapGenConfig,
+                       bands: Optional["Bands"] = None,
+                       bars: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Fill the rhythmic grid wherever the music is active.
+
+    Charts for this game are grid backbones, not transcriptions of every
+    detected transient. Measured against the hand-authored reference, 69% of
+    beat-lane gaps are exactly one beat and the melody lane runs on eighths and
+    sixteenths. That chart also places 635 beat notes where onset detection
+    finds only 404 kicks -- the author charts the *pulse*, which carries on
+    through bars where no clean transient survives the distortion.
+
+    So a slot is chosen by band energy ("is the kick playing here?"), and
+    detected onsets are used only to snap a chosen slot onto the real
+    transient. Ranking onsets by strength instead made notes clump into loud
+    sections and scored barely above chance against the reference.
+    """
+    import numpy as np
+
+    if not beats or period <= 0 or len(beats) < 4:
         return []
 
     lane_count = max(1, int(cfg.lane_count))
-    ts = 4 if int(time_signature) not in (3, 4) else int(time_signature)
-
-    # deterministic seed if 0
-    if int(cfg.seed) == 0:
-        try:
-            seed = int(_hash_for_cache(audio_path), 16) & 0x7FFFFFFF
-        except Exception:
-            seed = 1337
-    else:
-        seed = int(cfg.seed) & 0x7FFFFFFF
-    rng = random.Random(seed)
-
     diff = max(1, min(10, int(cfg.difficulty)))
-    subdiv = _subdiv_for_diff(diff)
+    min_gap = float(cfg.min_gap_ms) / 1000.0
 
-    # quantize tolerance tightens with difficulty
-    tol_ms = 36 if diff <= 3 else (26 if diff <= 6 else 18)
-    tol_s = float(tol_ms) / 1000.0
+    ba = np.asarray(beats, dtype=float)
+    n_beats = float(len(ba))
+    total_density = _density_for_diff(diff)
+    beat_budget = int(round(total_density * BEAT_LANE_SHARE * n_beats))
+    mel_budget = int(round(total_density * MELODY_LANE_SHARE * n_beats))
 
-    grid = _grid_from_beats(beats, subdiv=subdiv)
+    down = set(round(float(t), 3) for t in downbeats)
+    by_band: Dict[str, Any] = {}
+    for b in ("kick", "mid", "high"):
+        v = sorted(float(o["t"]) for o in onsets if o.get("band") == b)
+        by_band[b] = np.asarray(v, dtype=float) if v else np.zeros(0)
 
-    # slot flags keyed by quantized grid time
-    slot: Dict[float, Dict[str, Any]] = {t: {"beat": False, "down": False, "onset_n": 0} for t in grid}
+    bar_starts = np.asarray([b["t"] for b in bars], dtype=float) if bars else np.zeros(0)
 
-    # mark beats/downbeats
-    for t in beats:
-        qt = _quantize_to_grid(t, grid, tol_s)
-        if qt is not None and qt in slot:
-            slot[qt]["beat"] = True
+    def _bar_at(t: float) -> Optional[Dict[str, Any]]:
+        if bar_starts.size == 0 or not bars:
+            return None
+        i = int(np.searchsorted(bar_starts, t, side="right")) - 1
+        return bars[max(0, min(len(bars) - 1, i))]
 
-    for t in (downbeats or []):
-        qt = _quantize_to_grid(float(t), grid, tol_s)
-        if qt is not None and qt in slot:
-            slot[qt]["down"] = True
+    def bar_tags(t: float) -> List[str]:
+        b = _bar_at(t)
+        return list(b.get("tags", [])) if b else []
 
-    # count onsets per slot (after quantize)
-    onsets_q: List[float] = []
-    for t in (onsets or []):
-        qt = _quantize_to_grid(float(t), grid, tol_s)
-        if qt is not None and qt in slot:
-            slot[qt]["onset_n"] = int(slot[qt]["onset_n"]) + 1
-            onsets_q.append(qt)
-    onsets_q = sorted(onsets_q)
+    def bar_intensity(t: float) -> float:
+        b = _bar_at(t)
+        return float(b.get("intensity", 0.5)) if b else 0.5
 
-    # intensity per grid slot based on local onset density (simple + effective)
-    # intensity = onsets in a ~1.2s window mapped to 0..1
-    def intensity_at(t: float) -> float:
-        if not onsets_q:
+    e_kick = bands.e_sub if bands is not None else None
+    e_mid = bands.e_mid if bands is not None else None
+    snap_tol = period * 0.14
+
+    # Rolling references, plus an absolute floor per band so genuine silence
+    # still stays empty rather than being scaled up into notes.
+    ref_kick = ref_mid = None
+    floor_kick = floor_mid = 0.0
+    if bands is not None:
+        import numpy as _np
+        dur_s = float(bands.duration)
+        ref_kick = _local_reference(bands, e_kick, dur_s)
+        ref_mid = _local_reference(bands, e_mid, dur_s)
+        floor_kick = float(_np.percentile(e_kick, 55)) * SILENCE_FLOOR
+        floor_mid = float(_np.percentile(e_mid, 55)) * SILENCE_FLOOR
+
+    def energy(arr, t: float, half: float) -> float:
+        if bands is None or arr is None:
+            return 1.0
+        return _slot_energy(bands, arr, t, half)
+
+    def rel_energy(arr, ref, floor: float, t: float, half: float) -> float:
+        """Loudness of this slot relative to its own neighbourhood."""
+        if bands is None or arr is None:
+            return 1.0
+        e = _slot_energy(bands, arr, t, half)
+        if e <= floor:
             return 0.0
-        w = 0.60  # seconds each side
-        lo = t - w
-        hi = t + w
-        i0 = bisect.bisect_left(onsets_q, lo)
-        i1 = bisect.bisect_right(onsets_q, hi)
-        n = max(0, i1 - i0)
-        return max(0.0, min(1.0, float(n) / 8.0))
+        return e / (_ref_at(ref, t) + 1e-9)
 
-    notes_per_beat = _difficulty_density_per_beat(diff, bpm)
-    p_per_slot = min(0.98, max(0.02, notes_per_beat / float(subdiv)))
-    global_gap = max(45, int(cfg.min_gap_ms))
+    # ---------------- beat lane: quarter-note backbone ----------------
+    beat_cands: List[Dict[str, Any]] = []
+    half = period * 0.30
+    for t in ba:
+        beat_cands.append({"t": float(t), "div": 1, "triplet": False,
+                           "role": "kick", "band": "kick",
+                           "score": rel_energy(e_kick, ref_kick, floor_kick, float(t), half),
+                           "on_beat": True})
 
-    jack_gap_ms = _jack_gap_ms_for_diff(diff)
+    # Rolls only inside bars the structural pass called gated, and only where a
+    # kick transient is genuinely present -- otherwise a roll is invented.
+    if diff >= 3:
+        divs = [2] if diff < 6 else [2, 4]
+        kc = by_band["kick"]
+        for i in range(len(ba) - 1):
+            t0, t1 = float(ba[i]), float(ba[i + 1])
+            tags = bar_tags(t0)
+            if "gated_kick" not in tags and "kick_roll" not in tags:
+                continue
+            for d in divs:
+                step = (t1 - t0) / float(d)
+                for k in range(1, d):
+                    st = t0 + step * k
+                    if kc.size == 0:
+                        continue
+                    j = max(1, min(len(kc) - 1, int(np.searchsorted(kc, st))))
+                    if min(abs(st - kc[j - 1]), abs(st - kc[j])) > period * 0.10:
+                        continue
+                    beat_cands.append({
+                        "t": st, "div": d, "triplet": False,
+                        "role": "gated_kick", "band": "kick",
+                        "score": rel_energy(e_kick, ref_kick, floor_kick, st, half * 0.6) * ROLL_WEIGHT,
+                        "on_beat": False})
 
-    last_t_ms = -10**9
-    last_lane = -1
-    last_t_by_lane = [-10**9 for _ in range(lane_count)]
+    beat_notes = _take_budget(beat_cands, beat_budget, min_gap)
 
+    # ---------------- melody lane: eighth/sixteenth backbone ----------------
+    mel_cands: List[Dict[str, Any]] = []
+    mel_divs = [1, 2] if diff < 4 else ([1, 2, 4] if diff < 8 else [1, 2, 4, 8])
+    trip_divs: List[int] = []
+    if bool(cfg.allow_triplets) and diff >= 5:
+        trip_divs = [3] if diff < 8 else [3, 6]
+    seen: set = set()
+    half_m = period * 0.20
+    for i in range(len(ba) - 1):
+        t0, t1 = float(ba[i]), float(ba[i + 1])
+        for d in mel_divs + trip_divs:
+            is_trip = d in TRIPLET_DIVS
+            w = TRIPLET_DIVS[d] if is_trip else MEL_DIV_WEIGHT.get(d, 0.6)
+            step = (t1 - t0) / float(d)
+            for k in range(d):
+                st = t0 + step * k
+                key = round(st, 4)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mel_cands.append({
+                    "t": st, "div": d, "triplet": is_trip,
+                    "role": "screech" if "screech" in bar_tags(st) else "lead",
+                    "band": "mid",
+                    "score": rel_energy(e_mid, ref_mid, floor_mid, st, half_m) * w,
+                    "on_beat": (k == 0)})
+
+    mel_notes = _take_budget(mel_cands, mel_budget, min_gap)
+
+    # ---------------- assemble ----------------
     out: List[Dict[str, Any]] = []
+    for chosen, rc in ((beat_notes, "beat"), (mel_notes, "melody")):
+        cand_arr = by_band["kick"] if rc == "beat" else by_band["mid"]
+        lane = BEAT_LANE if rc == "beat" else min(MELODY_LANE, lane_count - 1)
+        lane = max(0, min(lane_count - 1, lane))
+        for n in chosen:
+            t = _snap_to_onset(float(n["t"]), cand_arr, snap_tol)
+            out.append({
+                "t": round(t, 5),
+                "t_ms": int(round(t * 1000.0)),
+                "lane": int(lane),
+                "kind": "tap",
+                "basis": n["role"],
+                "role_class": rc,
+                "band": n["band"],
+                "section": _section_of(bar_tags(float(n["t"]))),
+                "div": int(n["div"]),
+                "triplet": bool(n.get("triplet", False)),
+                "intensity": round(bar_intensity(float(n["t"])), 3),
+                "on_beat": bool(n["on_beat"]),
+                "downbeat": bool(round(float(n["t"]), 3) in down),
+            })
 
-    # Iterate grid in order
-    for gt in grid:
-        flags = slot.get(gt, None)
-        if flags is None:
-            continue
-
-        beat_flag = bool(flags.get("beat", False))
-        down_flag = bool(flags.get("down", False))
-        onset_n = int(flags.get("onset_n", 0))
-
-        # Decide basis/priority for this slot
-        basis = "none"
-        if down_flag:
-            basis = "downbeat"
-        elif onset_n > 0:
-            basis = "onset"
-        elif beat_flag:
-            basis = "beat"
-
-        if basis == "none":
-            continue
-
-        t_ms = int(round(gt * 1000.0))
-        if (t_ms - last_t_ms) < global_gap:
-            continue
-
-        inten = intensity_at(gt)
-
-        # Selection rules
-        pick = False
-        if basis == "downbeat":
-            pick = True
-        elif basis == "beat":
-            # calm sections = fewer beats on low difficulty
-            mult = 0.85 + 0.25 * inten
-            if diff <= 3:
-                mult *= 0.75
-            pick = (rng.random() < (p_per_slot * mult))
-        else:  # onset
-            # onsets become more important at higher diff + higher intensity
-            mult = 0.95 + 0.55 * inten + 0.06 * float(max(0, diff - 4))
-            if diff <= 2 and inten < 0.55:
-                mult *= 0.55
-            pick = (rng.random() < min(0.98, p_per_slot * mult))
-
-        if not pick:
-            continue
-
-        lane = _choose_lane(
-            t_ms=t_ms,
-            basis=basis,
-            intensity=inten,
-            lane_count=lane_count,
-            last_lane=last_lane,
-            last_t_by_lane=last_t_by_lane,
-            jack_gap_ms=jack_gap_ms,
-            rng=rng,
-        )
-
-        # optional chord (very controlled)
-        chord = False
-        if cfg.allow_chords and diff >= 9 and inten > 0.72 and basis in ("downbeat", "onset"):
-            if rng.random() < float(cfg.chord_prob):
-                chord = True
-
-        out.append({
-            "t": float(gt),
-            "lane": int(lane),
-            "kind": "tap",
-            "basis": basis,
-            "intensity": round(float(inten), 3),
-        })
-
-        last_t_ms = t_ms
-        last_lane = lane
-        last_t_by_lane[lane] = t_ms
-
-        if chord and lane_count >= 2:
-            # pick a second lane far-ish from the first
-            other_choices = [ln for ln in range(lane_count) if ln != lane]
-            other_choices.sort(key=lambda ln: -abs(ln - lane))
-            lane2 = other_choices[0] if other_choices else lane
-            # respect jack gap on lane2 too
-            if (t_ms - last_t_by_lane[lane2]) >= max(40, jack_gap_ms // 2):
-                out.append({
-                    "t": float(gt),
-                    "lane": int(lane2),
-                    "kind": "tap",
-                    "basis": basis + "_chord",
-                    "intensity": round(float(inten), 3),
-                })
-                last_t_by_lane[lane2] = t_ms
-
-    # final sort (time then lane)
-    out.sort(key=lambda d: (float(d.get("t", 0.0)), int(d.get("lane", 0))))
+    out.sort(key=lambda d: (d["t"], d["lane"]))
     return out
 
 
 # ============================================================
-# Core math helpers
+# Grid scoring -- pick the best candidate instead of the first
 # ============================================================
 
-def _clamp_events_nonnegative(times: List[float]) -> List[float]:
-    return [t for t in times if t is not None and t >= 0.0 and math.isfinite(t)]
+def score_grid(beats: List[float], bands: Bands, period: float) -> Dict[str, float]:
+    """How well does this grid explain the kick track?
 
-def _dedupe_sorted(times: List[float], eps: float = 1e-4) -> List[float]:
-    if not times:
-        return []
-    times = sorted(times)
-    out = [times[0]]
-    for t in times[1:]:
-        if (t - out[-1]) > eps:
-            out.append(t)
-    return out
+    Three things matter and they trade off, so we score all three: how much
+    kick energy the beats actually land on, how regular the spacing is, and
+    how completely the grid covers the track.
+    """
+    import numpy as np
+    if len(beats) < 8 or period <= 0:
+        return {"score": -1.0, "energy": 0.0, "regularity": 0.0, "coverage": 0.0}
 
-def _median_bpm_from_beats(beats: List[float]) -> Optional[float]:
-    if not beats or len(beats) < 6:
-        return None
-    intervals = [beats[i + 1] - beats[i] for i in range(len(beats) - 1)]
-    intervals = [x for x in intervals if x > 1e-3]
-    if not intervals:
-        return None
-    intervals.sort()
-    mid = intervals[len(intervals) // 2]
-    if mid <= 0:
-        return None
-    return 60.0 / mid
+    env = bands.flux_kick
+    ref = float(np.mean(env)) + 1e-9
+    hit = np.asarray([env[bands.frame_at(t)] for t in beats], dtype=float)
+    energy = float(np.mean(hit) / ref)
 
-def _beat_interval_stats(beats: List[float]) -> Dict[str, float]:
-    if not beats or len(beats) < 8:
-        return {"mean": 0.0, "std": 0.0, "cv": 1.0}
-    ints = [beats[i + 1] - beats[i] for i in range(len(beats) - 1)]
-    ints = [x for x in ints if 0.1 <= x <= 2.0]
-    if len(ints) < 6:
-        return {"mean": 0.0, "std": 0.0, "cv": 1.0}
-    m = sum(ints) / len(ints)
-    v = sum((x - m) ** 2 for x in ints) / max(1, len(ints) - 1)
-    s = math.sqrt(v)
-    cv = (s / m) if m > 1e-9 else 1.0
-    return {"mean": float(m), "std": float(s), "cv": float(cv)}
+    d = np.diff(np.asarray(beats, dtype=float))
+    med = float(np.median(d)) if d.size else period
+    regularity = float(np.mean(np.abs(d - med) <= 0.006)) if d.size else 0.0
 
-def _sample_activation_at_times(act: "Any", times: List[float], fps: float) -> List[float]:
-    try:
-        import numpy as np
-        a = np.asarray(act).astype(float).ravel()
-        if a.size < 5:
-            return []
-        out = []
-        max_t = (a.size - 1) / float(fps)
-        for t in times:
-            if 0.0 <= t <= max_t:
-                idx = int(round(t * float(fps)))
-                idx = max(0, min(idx, a.size - 1))
-                out.append(float(a[idx]))
-        return out
-    except Exception:
-        return []
+    expected = max(1.0, bands.duration / period)
+    coverage = float(min(1.0, len(beats) / expected))
 
-def _confidence_from_madmom_outputs(
-    beats: List[float],
-    downbeats: List[float],
-    onsets: List[float],
-    beat_act: "Any",
-    onset_act: "Any",
-    fps: float,
-) -> Dict[str, Any]:
-    try:
-        import numpy as np
+    # Regularity leads. A grid that sits on more kick energy but wanders is
+    # worse to play than a steady one slightly off: the player feels spacing,
+    # not absolute alignment, and a constant offset is correctable downstream.
+    score = (0.34 * min(energy / 6.0, 1.0) + 0.51 * regularity + 0.15 * coverage)
+    return {"score": round(score, 5), "energy": round(energy, 4),
+            "regularity": round(regularity, 4), "coverage": round(coverage, 4)}
 
-        beats = beats or []
-        downbeats = downbeats or []
-        onsets = onsets or []
 
-        bi = _beat_interval_stats(beats)
-        cv = float(bi["cv"])
+def build_grid(bands: Bands, cfg: AnalysisConfig, tempo: Dict[str, Any],
+               progress: Optional[ProgressCB] = None) -> Tuple[List[float], Dict[str, Any]]:
+    """Try several grid strategies and keep the best-scoring one.
 
-        beat_samples = _sample_activation_at_times(beat_act, beats, fps)
-        onset_samples_on_beats = _sample_activation_at_times(onset_act, beats, fps)
+    Accuracy matters more than runtime here, so rather than trusting one
+    tracker configuration we build all of them and let the kick track decide.
+    """
+    period = float(tempo["period"])
+    phase = float(tempo["phase"])
+    attempts: List[Dict[str, Any]] = []
 
-        def safe_mean(xs: List[float]) -> float:
-            return float(sum(xs) / len(xs)) if xs else 0.0
+    for tight in (600.0, 400.0, 200.0, 100.0):
+        c2 = AnalysisConfig(**{**asdict(cfg), "tightness": tight})
+        tracked = track_beats(bands, c2, tempo["bpm"])
+        if not tracked:
+            continue
+        fused, info = fuse_beats(tracked, period, phase, bands.duration)
+        for snap_on in (True, False):
+            g = fused
+            moved = 0.0
+            if snap_on:
+                g, moved = snap_to_transients(fused, bands, cfg.snap_window_ms)
+            sc = score_grid(g, bands, period)
+            attempts.append({"beats": g, "score": sc["score"], "detail": sc,
+                             "tightness": tight, "snapped": snap_on,
+                             "fuse": info, "snap_shift": round(moved, 5)})
+        if progress:
+            progress(58, "Grid search: tightness %d…" % int(tight))
 
-        beat_mean = safe_mean(beat_samples)
-        onset_on_beat_mean = safe_mean(onset_samples_on_beats)
+    # Always include the pure metronome grid as a floor.
+    ideal = synth_grid(period, phase, bands.duration)
+    if ideal:
+        gi, mi = snap_to_transients(ideal, bands, cfg.snap_window_ms)
+        for g, lab, mv in ((ideal, False, 0.0), (gi, True, mi)):
+            sc = score_grid(g, bands, period)
+            attempts.append({"beats": g, "score": sc["score"], "detail": sc,
+                             "tightness": 0.0, "snapped": lab,
+                             "fuse": {"mode": "ideal"}, "snap_shift": round(mv, 5)})
 
-        ba = np.asarray(beat_act).astype(float).ravel()
-        oa = np.asarray(onset_act).astype(float).ravel()
+    if not attempts:
+        return (ideal, {"mode": "ideal_fallback"})
 
-        ba_mean = float(np.mean(ba)) if ba.size else 0.0
-        ba_std = float(np.std(ba)) if ba.size else 1.0
-        oa_mean = float(np.mean(oa)) if oa.size else 0.0
-        oa_std = float(np.std(oa)) if oa.size else 1.0
+    best = max(attempts, key=lambda a: a["score"])
+    return (best["beats"], {
+        "chosen_tightness": best["tightness"],
+        "chosen_snapped": best["snapped"],
+        "chosen_score": best["score"],
+        "chosen_detail": best["detail"],
+        "snap_shift_s": best["snap_shift"],
+        "fuse": best["fuse"],
+        "candidates": [{"tightness": a["tightness"], "snapped": a["snapped"],
+                        "score": a["score"], "n": len(a["beats"])}
+                       for a in attempts],
+    })
 
-        beat_z = (beat_mean - ba_mean) / (ba_std + 1e-9)
-        onset_z = (onset_on_beat_mean - oa_mean) / (oa_std + 1e-9)
 
-        db_ratio = 0.0
-        if beats:
-            db_ratio = min(1.0, len(downbeats) / max(1.0, len(beats) / 4.0))
+# ============================================================
+# Orchestrator
+# ============================================================
 
-        cv_score = 1.0 - min(1.0, max(0.0, (cv - 0.02) / 0.18))
-        beat_score = min(1.0, max(0.0, (beat_z + 0.2) / 3.2))
-        onset_score = min(1.0, max(0.0, (onset_z + 0.2) / 3.2))
-        n_score = min(1.0, max(0.0, (len(beats) - 16) / 120.0))
-
-        score = (0.36 * beat_score + 0.22 * onset_score + 0.18 * cv_score + 0.12 * db_ratio + 0.12 * n_score)
-        score = float(min(1.0, max(0.0, score)))
-
-        return {
-            "score": score,
-            "beat_score": beat_score,
-            "onset_score": onset_score,
-            "cv_score": cv_score,
-            "db_ratio": db_ratio,
-            "n_beats": len(beats),
-            "cv": cv,
-            "beat_z": float(beat_z),
-            "onset_z": float(onset_z),
-        }
-    except Exception:
-        return {"score": 0.0, "error": "confidence calc failed"}
-
-def _refine_offset_with_onset_activation(
-    event_times: List[float],
-    onset_activation: "Any",
-    fps: float,
-    search_ms: int
-) -> float:
+def analyze(audio_path: str, cfg: AnalysisConfig,
+            progress_cb: Optional[ProgressCB] = None,
+            cancel_cb: Optional[Callable[[], bool]] = None) -> FusionResult:
     import numpy as np
 
-    if onset_activation is None or len(event_times) < 10:
-        return 0.0
-
-    act = np.asarray(onset_activation).astype(float).ravel()
-    if act.size < 40:
-        return 0.0
-    if float(np.max(act)) <= 1e-6:
-        return 0.0
-
-    times = np.asarray(event_times, dtype=float)
-    max_t = (act.size - 1) / float(fps)
-    times = times[(times >= 0.0) & (times <= max_t)]
-    if times.size < 10:
-        return 0.0
-
-    lags = np.arange(-search_ms, search_ms + 1, 1, dtype=float) / 1000.0
-    best_lag = 0.0
-    best_score = -1e18
-
-    for lag in lags:
-        t = times + lag
-        t = t[(t >= 0.0) & (t <= max_t)]
-        if t.size < 10:
-            continue
-        idx = np.clip(np.rint(t * float(fps)).astype(int), 0, act.size - 1)
-        score = float(np.sum(act[idx]))
-        if score > best_score:
-            best_score = score
-            best_lag = float(lag)
-
-    return best_lag
-
-
-# ============================================================
-# Backends
-# ============================================================
-
-def analyze_with_madmom(
-    audio_path: str,
-    cfg: AnalysisConfig,
-    *,
-    progress_cb: Optional[ProgressCB] = None,
-) -> AnalysisResult:
-    import warnings
-    warnings.filterwarnings("ignore", message="pkg_resources is deprecated.*")
-    warnings.filterwarnings("ignore", message="Creating an ndarray from ragged nested sequences.*")
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-    warnings.filterwarnings("ignore", category=FutureWarning)
-
     def ping(p: int, m: str) -> None:
         if progress_cb:
-            progress_cb(int(p), m)
+            progress_cb(int(p), str(m))
 
-    try:
-        import numpy as np
-        from madmom.features.beats import RNNBeatProcessor, DBNBeatTrackingProcessor
-        from madmom.features.downbeats import RNNDownBeatProcessor, DBNDownBeatTrackingProcessor
-        from madmom.features.onsets import RNNOnsetProcessor, OnsetPeakPickingProcessor
-    except Exception as e:
-        return AnalysisResult(
-            ok=False,
-            backend_used="madmom",
-            notes="madmom import failed",
-            audio_path=audio_path,
-            error=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
-        )
+    def cancelled() -> bool:
+        return bool(cancel_cb and cancel_cb())
 
-    try:
-        fps = 100
-
-        ping(6, "madmom: Beat activation")
-        beat_act = RNNBeatProcessor()(audio_path)
-
-        ping(24, "madmom: Beat tracking")
-        beat_tracker = DBNBeatTrackingProcessor(
-            fps=fps,
-            min_bpm=float(cfg.min_bpm),
-            max_bpm=float(cfg.max_bpm),
-        )
-        beats = beat_tracker(beat_act)
-        beats = _dedupe_sorted(_clamp_events_nonnegative([float(x) for x in beats]))
-
-        ping(40, "madmom: Downbeat activation")
-        db_act = RNNDownBeatProcessor()(audio_path)
-
-        ping(54, "madmom: Downbeat tracking")
-        beats_per_bar = [int(cfg.prefer_time_signature)]
-        db_tracker = DBNDownBeatTrackingProcessor(
-            beats_per_bar=beats_per_bar,
-            fps=fps,
-            min_bpm=float(cfg.min_bpm),
-            max_bpm=float(cfg.max_bpm),
-        )
-        db = db_tracker(db_act)
-        db = np.asarray(db)
-        downbeats: List[float] = []
-        if db.ndim == 2 and db.shape[1] >= 2:
-            for t, pos in db[:, 0:2]:
-                if int(round(float(pos))) == 1:
-                    downbeats.append(float(t))
-        downbeats = _dedupe_sorted(_clamp_events_nonnegative(downbeats))
-
-        ping(64, "madmom: Onset activation")
-        onset_act = RNNOnsetProcessor()(audio_path)
-
-        ping(74, "madmom: Picking onsets")
-        if cfg.onset_threshold_mode == "fixed":
-            thr = float(cfg.onset_threshold_fixed)
-            thr_meta = {"mode": "fixed", "thr": thr}
-        else:
-            pctl = cfg.onset_percentile if cfg.onset_percentile is not None else (94 if cfg.accurate_mode else 90)
-            pctl = int(max(80, min(98, pctl)))
-            factor = cfg.onset_factor if cfg.onset_factor is not None else (0.55 if cfg.accurate_mode else 0.45)
-            factor = float(max(0.30, min(0.85, factor)))
-
-            thr = float(np.percentile(onset_act, pctl) * factor)
-            thr = max(0.12, min(thr, 0.80))
-            thr_meta = {"mode": "auto", "pctl": pctl, "factor": factor, "thr": thr}
-
-        onset_picker = OnsetPeakPickingProcessor(
-            fps=fps,
-            threshold=thr,
-            combine=0.02 if cfg.accurate_mode else 0.04,
-            pre_max=0.03, post_max=0.03,
-            pre_avg=0.10, post_avg=0.10,
-        )
-        onsets = onset_picker(onset_act)
-        onsets = _dedupe_sorted(_clamp_events_nonnegative([float(x) for x in onsets]))
-
-        ping(86, "madmom: Refining offset")
-        offset = 0.0
-        if cfg.accurate_mode and cfg.onset_refine_ms > 0 and len(beats) >= 10:
-            offset = _refine_offset_with_onset_activation(
-                beats, onset_act, fps=float(fps), search_ms=int(cfg.onset_refine_ms)
-            )
-            if abs(offset) > 1e-6:
-                beats = _dedupe_sorted(_clamp_events_nonnegative([t + offset for t in beats]))
-                downbeats = _dedupe_sorted(_clamp_events_nonnegative([t + offset for t in downbeats]))
-                onsets = _dedupe_sorted(_clamp_events_nonnegative([t + offset for t in onsets]))
-
-        bpm = _median_bpm_from_beats(beats)
-
-        ping(94, "madmom: Confidence scoring")
-        confidence = _confidence_from_madmom_outputs(beats, downbeats, onsets, beat_act, onset_act, fps=float(fps))
-
-        extra = {
-            "fps": fps,
-            "min_bpm": cfg.min_bpm,
-            "max_bpm": cfg.max_bpm,
-            "time_signature": cfg.prefer_time_signature,
-            "onset_threshold": thr_meta,
-            "confidence": confidence,
-        }
-
-        ping(100, "madmom: Done")
-        return AnalysisResult(
-            ok=True,
-            backend_used="madmom",
-            notes="madmom used ✅",
-            audio_path=audio_path,
-            bpm=bpm,
-            beats=beats,
-            downbeats=downbeats,
-            onsets=onsets,
-            offset_correction_s=float(offset),
-            extra=extra,
-        )
-    except Exception as e:
-        return AnalysisResult(
-            ok=False,
-            backend_used="madmom",
-            notes="madmom analysis crashed",
-            audio_path=audio_path,
-            error=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
-        )
-
-def analyze_with_librosa(
-    audio_path: str,
-    cfg: AnalysisConfig,
-    *,
-    progress_cb: Optional[ProgressCB] = None,
-) -> AnalysisResult:
-    def ping(p: int, m: str) -> None:
-        if progress_cb:
-            progress_cb(int(p), m)
-
-    try:
-        import librosa
-    except Exception as e:
-        return AnalysisResult(
-            ok=False,
-            backend_used="librosa",
-            notes="librosa import failed",
-            audio_path=audio_path,
-            error=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
-        )
-
-    try:
-        ping(12, "librosa: Loading audio")
-        y, sr = librosa.load(audio_path, sr=44100, mono=True, duration=None)
-
-        ping(46, "librosa: Beat tracking")
-        tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, start_bpm=150.0, units="frames")
-        beats = librosa.frames_to_time(beat_frames, sr=sr).tolist()
-        beats = _dedupe_sorted(_clamp_events_nonnegative([float(x) for x in beats]))
-
-        ping(74, "librosa: Onset detection")
-        onset_frames = librosa.onset.onset_detect(y=y, sr=sr, backtrack=False, units="frames")
-        onsets = librosa.frames_to_time(onset_frames, sr=sr).tolist()
-        onsets = _dedupe_sorted(_clamp_events_nonnegative([float(x) for x in onsets]))
-
-        downbeats = []
-        if beats:
-            for i, t in enumerate(beats):
-                if i % int(cfg.prefer_time_signature) == 0:
-                    downbeats.append(float(t))
-
-        ping(100, "librosa: Done")
-        return AnalysisResult(
-            ok=True,
-            backend_used="librosa",
-            notes="librosa used (fallback)",
-            audio_path=audio_path,
-            bpm=float(tempo) if tempo else _median_bpm_from_beats(beats),
-            beats=beats,
-            downbeats=_dedupe_sorted(downbeats),
-            onsets=onsets,
-            offset_correction_s=0.0,
-            extra={"sr": sr, "confidence": {"score": 0.45}},
-        )
-    except Exception as e:
-        return AnalysisResult(
-            ok=False,
-            backend_used="librosa",
-            notes="librosa analysis crashed",
-            audio_path=audio_path,
-            error=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}",
-        )
-
-
-# ============================================================
-# Percussive assist (HPSS)
-# ============================================================
-
-def make_percussive_wav(wav_in: str, wav_out: str) -> Tuple[bool, str]:
-    ok, _ = _try_import("librosa")
-    ok2, _ = _try_import("soundfile")
-    if not (ok and ok2):
-        return False, "librosa + soundfile required for percussive assist."
-
-    try:
-        import numpy as np
-        import librosa
-        import soundfile as sf
-
-        y, sr = librosa.load(wav_in, sr=44100, mono=True)
-        _, y_perc = librosa.effects.hpss(y)
-
-        mx = float(np.max(np.abs(y_perc))) if y_perc.size else 0.0
-        if mx > 1e-6:
-            y_perc = (y_perc / mx) * 0.95
-
-        sf.write(wav_out, y_perc, sr, subtype="PCM_16")
-        return True, "OK"
-    except Exception:
-        return False, traceback.format_exc()
-
-
-# ============================================================
-# Auto settings guess (tempo-guided)
-# ============================================================
-
-def auto_guess_settings(audio_path: str) -> Dict[str, Any]:
-    out = {
-        "min_bpm": 90.0,
-        "max_bpm": 220.0,
-        "ts": 4,
-        "refine_ms": 220,
-        "notes": "Default guess",
-        "tempo_est": 140.0,
-    }
-
-    ok, _ = _try_import("librosa")
-    if not ok:
-        out["notes"] = "librosa not available; using defaults."
-        return out
-
-    try:
-        import librosa
-        y, sr = librosa.load(audio_path, sr=44100, mono=True, duration=75.0)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=150.0)
-        tempo = float(tempo) if tempo else 140.0
-
-        cand = tempo
-        while cand > 230:
-            cand *= 0.5
-        while cand < 70:
-            cand *= 2.0
-        if 70 <= cand <= 105:
-            cand2 = cand * 2.0
-            if cand2 <= 240:
-                cand = cand2
-
-        min_bpm = max(60.0, cand * 0.65)
-        max_bpm = min(260.0, cand * 1.35)
-        refine = 280 if cand < 120 else 240 if cand < 170 else 220
-
-        out.update({
-            "min_bpm": float(min_bpm),
-            "max_bpm": float(max_bpm),
-            "ts": 4,
-            "refine_ms": int(refine),
-            "notes": f"Estimated tempo ~{cand:.1f} BPM.",
-            "tempo_est": float(cand),
-        })
-        return out
-    except Exception:
-        out["notes"] = "Auto-guess failed; using defaults."
-        return out
-
-
-# ============================================================
-# Confidence maximizer
-# ============================================================
-
-def _conf_score(res: AnalysisResult) -> float:
-    try:
-        conf = (res.extra or {}).get("confidence", {}) or {}
-        s = float(conf.get("score", 0.0) or 0.0)
-    except Exception:
-        s = 0.0
-    beats_n = len(res.beats or [])
-    return s + min(0.02, beats_n / 20000.0)
-
-def _mutate_from_best(best: AnalysisConfig, step_i: int, tempo_est: float) -> AnalysisConfig:
-    c = AnalysisConfig(**asdict(best))
-
-    recipes = [
-        "widen_bpm", "narrow_bpm", "refine_plus", "refine_minus",
-        "pctl_plus", "pctl_minus", "factor_plus", "factor_minus",
-        "flip_ts", "big_widen",
-    ]
-    r = recipes[step_i % len(recipes)]
-
-    def clamp(x, a, b):
-        return max(a, min(b, x))
-
-    if c.onset_percentile is None:
-        c.onset_percentile = 94 if c.accurate_mode else 90
-    if c.onset_factor is None:
-        c.onset_factor = 0.55 if c.accurate_mode else 0.45
-
-    if r == "widen_bpm":
-        c.min_bpm = clamp(c.min_bpm * 0.92, 50.0, 200.0)
-        c.max_bpm = clamp(c.max_bpm * 1.08, 120.0, 280.0)
-    elif r == "narrow_bpm":
-        mid = (c.min_bpm + c.max_bpm) * 0.5
-        span = max(40.0, (c.max_bpm - c.min_bpm) * 0.80)
-        c.min_bpm = clamp(mid - span * 0.5, 50.0, 240.0)
-        c.max_bpm = clamp(mid + span * 0.5, 90.0, 280.0)
-    elif r == "refine_plus":
-        c.onset_refine_ms = int(clamp(c.onset_refine_ms + 40, 80, 520))
-    elif r == "refine_minus":
-        c.onset_refine_ms = int(clamp(c.onset_refine_ms - 40, 80, 520))
-    elif r == "pctl_plus":
-        c.onset_percentile = int(clamp(c.onset_percentile + 2, 84, 98))
-    elif r == "pctl_minus":
-        c.onset_percentile = int(clamp(c.onset_percentile - 2, 84, 98))
-    elif r == "factor_plus":
-        c.onset_factor = float(clamp(c.onset_factor + 0.05, 0.30, 0.85))
-    elif r == "factor_minus":
-        c.onset_factor = float(clamp(c.onset_factor - 0.05, 0.30, 0.85))
-    elif r == "flip_ts":
-        c.prefer_time_signature = 3 if int(c.prefer_time_signature) == 4 else 4
-    elif r == "big_widen":
-        c.min_bpm = 60.0
-        c.max_bpm = 260.0
-        c.onset_refine_ms = int(clamp(c.onset_refine_ms + 60, 120, 520))
-
-    if c.min_bpm >= c.max_bpm - 5:
-        c.min_bpm = max(50.0, c.max_bpm - 40.0)
-
-    if 80.0 <= tempo_est <= 240.0 and (step_i % 4 == 0):
-        mid = tempo_est
-        span = max(60.0, (c.max_bpm - c.min_bpm))
-        c.min_bpm = clamp(mid - span * 0.55, 50.0, 240.0)
-        c.max_bpm = clamp(mid + span * 0.55, 90.0, 280.0)
-
-    return c
-
-
-# ============================================================
-# Orchestrator (normalize/cache + maximize confidence)
-# ============================================================
-
-def analyze_audio_and_export(
-    audio_path: str,
-    out_json_path: str,
-    cfg: AnalysisConfig,
-    opt: AnalysisOptions,
-    *,
-    progress_cb: Optional[ProgressCB] = None,
-    cancel_flag: Optional[Callable[[], bool]] = None,
-    map_cfg: Optional[MapGenConfig] = None,
-) -> Tuple[AnalysisResult, Dict[str, Any]]:
-    report: Dict[str, Any] = {"steps": [], "ok": True}
-    t0 = time.time()
-
-    def canceled() -> bool:
-        return bool(cancel_flag and cancel_flag())
-
-    def ping(p: int, m: str) -> None:
-        if progress_cb:
-            progress_cb(int(p), m)
-
+    res = FusionResult()
     if not os.path.isfile(audio_path):
-        res = AnalysisResult(False, "none", "No file", audio_path, error="Audio file not found.")
-        report["ok"] = False
-        return res, report
+        res.error = "Audio file not found: %s" % audio_path
+        return res
 
-    _safe_mkdir(os.path.dirname(out_json_path))
+    _safe_mkdir(CACHE_DIR)
 
-    h = _hash_for_cache(audio_path)
-    cache_dir = os.path.join(os.path.dirname(out_json_path), ".beatmap_analyzer_cache")
-    _safe_mkdir(cache_dir)
-    cached_wav = os.path.join(cache_dir, f"{h}.norm.wav")
-    cached_perc = os.path.join(cache_dir, f"{h}.perc.wav")
+    ping(4, "Decoding audio…")
+    y, sr = load_audio(audio_path, cfg.quick_seconds)
+    if y is None or len(y) < sr:
+        res.error = "Audio too short or failed to decode."
+        return res
+    res.duration_s = round(float(len(y)) / float(sr), 3)
+    if cancelled():
+        res.error = "Canceled by user."
+        return res
 
-    analysis_path = audio_path
+    ping(12, "Splitting frequency bands…")
+    bands = Bands(y, sr, cfg)
+    if cancelled():
+        res.error = "Canceled by user."
+        return res
 
-    if opt.normalize_audio:
-        ping(4, "Preparing audio…")
-        if opt.use_cache and os.path.isfile(cached_wav) and os.path.getsize(cached_wav) > 44:
-            analysis_path = cached_wav
-        else:
-            ok, _ = _ffmpeg_convert_to_wav(audio_path, cached_wav, quick_seconds=int(opt.quick_seconds))
-            if ok:
-                analysis_path = cached_wav
+    bn = {"ok": False, "beats": [], "positions": [], "bpm": None, "error": "disabled"}
+    if cfg.use_beatnet:
+        ping(20, "BeatNet: macro beat grid…")
+        bn = beatnet_grid(y, sr, CACHE_DIR, progress_cb)
+    seed_bpm = bn.get("bpm") if bn.get("ok") else None
+    if cancelled():
+        res.error = "Canceled by user."
+        return res
 
-    if canceled():
-        res = AnalysisResult(False, "none", "Canceled", analysis_path, error="Canceled by user.")
-        report["ok"] = False
-        return res, report
+    auto_notes: Dict[str, Any] = {"applied": False}
+    if cfg.auto:
+        ping(30, "Auto-tuning settings from the audio…")
+        cfg, auto_notes = auto_tune(bands, cfg, seed_bpm)
 
-    mad_ok, mad_err = _try_import("madmom")
-    lib_ok, lib_err = _try_import("librosa")
+    ping(34, "Locking tempo on the kick band…")
+    tempo = refine_tempo(bands, cfg, seed_bpm)
+    if tempo["period"] <= 0:
+        res.error = "Tempo estimation failed."
+        return res
 
-    cfg2 = AnalysisConfig(**asdict(cfg))
-    tempo_est = 140.0
+    if cfg.auto:
+        # The snap window depends on tempo, so it can only be set now.
+        cfg.snap_window_ms = auto_snap_window_ms(float(tempo["period"]),
+                                                 cfg.snap_window_ms)
+        auto_notes["snap_window_ms"] = round(cfg.snap_window_ms, 2)
 
-    if opt.auto_tune:
-        ping(10, "Auto-tuning settings…")
-        guess = auto_guess_settings(analysis_path)
-        tempo_est = float(guess.get("tempo_est", tempo_est))
-        cfg2.min_bpm = float(guess["min_bpm"])
-        cfg2.max_bpm = float(guess["max_bpm"])
-        cfg2.prefer_time_signature = int(guess["ts"])
-        cfg2.onset_refine_ms = int(guess["refine_ms"])
-        cfg2.accurate_mode = True
+    ping(44, "Beat grid search…")
+    beats, grid_info = build_grid(bands, cfg, tempo, progress_cb)
+    if not beats:
+        res.error = "Beat tracking produced no beats."
+        return res
+    if cancelled():
+        res.error = "Canceled by user."
+        return res
 
-    percussive_ready = False
-    if opt.percussive_assist:
-        ping(14, "Building percussive assist…")
-        if opt.use_cache and os.path.isfile(cached_perc) and os.path.getsize(cached_perc) > 44:
-            percussive_ready = True
-        else:
-            ok, _ = make_percussive_wav(analysis_path, cached_perc)
-            percussive_ready = ok
+    ping(66, "Locating downbeats…")
+    downbeats, bar_off = assign_downbeats(
+        beats, bn.get("beats", []), bn.get("positions", []),
+        bands, cfg.time_signature)
 
-    def run_once(run_cfg: AnalysisConfig, file_path: str, cb: Optional[ProgressCB]) -> AnalysisResult:
-        backend2 = run_cfg.backend.strip().lower()
+    ping(72, "Detecting band-split onsets…")
+    period = float(tempo["period"])
+    onsets = merge_close_onsets(detect_band_onsets(bands, cfg, period))
+    if cancelled():
+        res.error = "Canceled by user."
+        return res
 
-        if opt.safe_mode and backend2 == "auto":
-            backend2 = "librosa"
+    ping(82, "Reading structure (drops, gates, screeches)…")
+    bars = analyze_bars(bands, beats, downbeats, onsets, period, cfg.time_signature)
+    tag_bars(bars)
+    sections = find_sections(bars)
+    tag_onsets(onsets, bars, beats, period)
 
-        if backend2 == "madmom":
-            if not mad_ok:
-                return AnalysisResult(False, "madmom", "madmom forced but not available", file_path,
-                                     error=f"madmom import failed: {mad_err}")
-            return analyze_with_madmom(file_path, run_cfg, progress_cb=cb)
+    ping(90, "Finalising…")
+    # Median distance from a beat to its kick transient: the residual latency
+    # the game can subtract if a chart still feels early or late.
+    dev = []
+    for t in beats[: min(len(beats), 400)]:
+        c = bands.frame_at(t)
+        a = max(0, c - int(0.02 * bands.fps))
+        b = min(bands.n_frames, c + int(0.02 * bands.fps) + 1)
+        if b - a > 1:
+            k = a + int(np.argmax(bands.flux_kick[a:b]))
+            dev.append(float(k) / bands.fps - float(t))
+    res.offset_correction_s = round(float(np.median(dev)), 5) if dev else 0.0
 
-        if backend2 == "librosa":
-            if not lib_ok:
-                return AnalysisResult(False, "librosa", "librosa forced but not available", file_path,
-                                     error=f"librosa import failed: {lib_err}")
-            return analyze_with_librosa(file_path, run_cfg, progress_cb=cb)
+    res.ok = True
+    res.config_used = cfg
+    res.bands = bands
+    res.bpm = round(float(tempo["bpm"]), 4)
+    res.beats = [round(float(t), 5) for t in beats]
+    res.downbeats = [round(float(t), 5) for t in downbeats]
+    res.onsets = onsets
+    res.bars = bars
+    res.sections = sections
 
-        if mad_ok and not opt.safe_mode:
-            r = analyze_with_madmom(file_path, run_cfg, progress_cb=cb)
-            if r.ok:
-                return r
-            if lib_ok:
-                r2 = analyze_with_librosa(file_path, run_cfg, progress_cb=cb)
-                r2.notes = f"madmom failed, fallback to librosa\nmadmom error: {r.error}"
-                return r2
-            return r
+    counts: Dict[str, int] = {}
+    for o in onsets:
+        counts[o.get("role", "?")] = counts.get(o.get("role", "?"), 0) + 1
+    sec_counts: Dict[str, int] = {}
+    for s in sections:
+        sec_counts[s["kind"]] = sec_counts.get(s["kind"], 0) + 1
 
-        if lib_ok:
-            return analyze_with_librosa(file_path, run_cfg, progress_cb=cb)
-
-        return AnalysisResult(False, "none", "No backend available", file_path,
-                              error=f"madmom: {mad_err}\nlibrosa: {lib_err}")
-
-    def map_progress(start: int, end: int, prefix: str) -> Optional[ProgressCB]:
-        if not progress_cb:
-            return None
-        span = max(1, end - start)
-        def _cb(p: int, m: str):
-            p2 = start + int(span * (max(0, min(100, int(p))) / 100.0))
-            progress_cb(p2, f"{prefix}{m}")
-        return _cb
-
-    def pick_audio_variant(prefer_perc: bool) -> Tuple[str, str]:
-        if prefer_perc and percussive_ready:
-            return cached_perc, "Percussive"
-        return analysis_path, "Full"
-
-    best_res: Optional[AnalysisResult] = None
-    best_cfg: Optional[AnalysisConfig] = None
-    best_variant = "Full"
-    best_score = -1e9
-
-    ping(20, "Analyzing…")
-
-    forced_librosa = (cfg2.backend.strip().lower() == "librosa") or (opt.safe_mode and cfg2.backend.strip().lower() == "auto")
-
-    if not opt.maximize_confidence or forced_librosa:
-        fpath, flavor = pick_audio_variant(prefer_perc=opt.percussive_assist)
-        res = run_once(cfg2, fpath, map_progress(22, 92, f"{flavor}: "))
-        best_res, best_cfg, best_variant = res, cfg2, flavor
-        best_score = _conf_score(res) if res.ok else -1.0
-    else:
-        no_improve = 0
-        total_budget = max(1, int(opt.max_passes))
-        seed_variants = [False] + ([True] if (opt.percussive_assist and percussive_ready) else [])
-        pass_index = 0
-
-        for prefer_perc in seed_variants:
-            if canceled():
-                break
-            pass_index += 1
-            fpath, flavor = pick_audio_variant(prefer_perc=prefer_perc)
-            res = run_once(cfg2, fpath, map_progress(22, 42, f"Seed {pass_index}: {flavor} "))
-            s = _conf_score(res) if res.ok else -1.0
-            if res.ok and s > best_score + 1e-9:
-                best_res, best_cfg, best_variant, best_score = res, AnalysisConfig(**asdict(cfg2)), flavor, s
-                no_improve = 0
-            else:
-                no_improve += 1
-
-        while pass_index < total_budget and not canceled():
-            if best_cfg is None:
-                best_cfg = AnalysisConfig(**asdict(cfg2))
-
-            prefer_perc = (pass_index % 2 == 1) and (opt.percussive_assist and percussive_ready)
-            fpath, flavor = pick_audio_variant(prefer_perc=prefer_perc)
-
-            trial_cfg = _mutate_from_best(best_cfg, pass_index, tempo_est)
-            trial_cfg.backend = cfg2.backend
-            trial_cfg.accurate_mode = True
-
-            pass_index += 1
-            start = 42 + int((92 - 42) * ((pass_index - 1) / max(1, total_budget)))
-            end = 42 + int((92 - 42) * (pass_index / max(1, total_budget)))
-
-            res = run_once(trial_cfg, fpath, map_progress(start, end, f"Pass {pass_index}/{total_budget} {flavor}: "))
-            s = _conf_score(res) if res.ok else -1.0
-
-            if res.ok and s > best_score + float(opt.improve_epsilon):
-                best_res, best_cfg, best_variant, best_score = res, trial_cfg, flavor, s
-                no_improve = 0
-            else:
-                no_improve += 1
-
-            ping(min(92, 42 + int((92 - 42) * (pass_index / max(1, total_budget)))),
-                 f"Best confidence: {best_score:.3f} (no-improve {no_improve}/{opt.no_improve_limit})")
-
-            if (not opt.force_full_passes) and (no_improve >= int(opt.no_improve_limit)):
-                break
-
-    if canceled():
-        res = AnalysisResult(False, "none", "Canceled", analysis_path, error="Canceled by user.")
-        report["ok"] = False
-        return res, report
-
-    res = best_res if best_res is not None else AnalysisResult(False, "none", "All passes failed", analysis_path, error="No successful analysis pass.")
-    cfg_used = best_cfg if best_cfg is not None else cfg2
-
-    extra = dict(res.extra or {})
-    extra["maximize_confidence"] = {
-        "best_score": best_score,
-        "best_variant": best_variant,
-        "stopped_reason": "plateau_or_budget" if not opt.force_full_passes else "budget",
+    res.notes = ("BeatNet+Librosa fusion | %.2f BPM | %d beats | %d bars | %d onsets"
+                 % (res.bpm, len(beats), len(bars), len(onsets)))
+    res.extra = {
+        "auto": auto_notes,
+        "tempo": tempo,
+        "grid": grid_info,
+        "beatnet": {"ok": bool(bn.get("ok")), "bpm": bn.get("bpm"),
+                    "beats": len(bn.get("beats", [])),
+                    "error": (bn.get("error") or None)},
+        "bar_offset": int(bar_off),
+        "onset_roles": counts,
+        "section_counts": sec_counts,
+        "band_hz": {"sub": list(cfg.sub_band), "punch": list(cfg.punch_band),
+                    "mid": list(cfg.mid_band), "high": list(cfg.high_band)},
+        "resolution_ms": round(1000.0 / bands.fps, 3),
     }
-    res.extra = extra
+    return res
 
-        # ----------------------------
-    # MapGen (optional)
-    # ----------------------------
-    map_notes: List[Dict[str, Any]] = []
-    if map_cfg and bool(map_cfg.enabled) and res.ok:
-        try:
-            ping(94, "MapGen (placing notes)…")
-            map_notes = generate_map_notes(
-                audio_path=audio_path,
-                beats=res.beats or [],
-                downbeats=res.downbeats or [],
-                onsets=res.onsets or [],
-                bpm=res.bpm,
-                time_signature=int(cfg_used.prefer_time_signature),
-                cfg=map_cfg,
-            )
-        except Exception:
-            report["steps"].append({"title": "MapGen failed", "ok": False, "log": traceback.format_exc()[-8000:]})
-            map_notes = []
 
-    ping(96, "Saving JSON…")
+# ============================================================
+# Export
+# ============================================================
 
-    payload_json = {
+def build_payload(audio_path: str, res: FusionResult, cfg: AnalysisConfig,
+                  map_cfg: Optional[MapGenConfig],
+                  map_notes: List[Dict[str, Any]], elapsed: float) -> Dict[str, Any]:
+    cfgd = asdict(res.config_used or cfg)
+    for k in ("sub_band", "punch_band", "mid_band", "high_band"):
+        cfgd[k] = list(cfgd[k])
+    return {
         "app": {"name": APP_NAME, "version": APP_VERSION},
-        "schema": "beatmap_analyzer_v2",
+        "schema": SCHEMA,
+        "engine": "beatnet+librosa",
+        "ok": bool(res.ok),
         "audio": os.path.abspath(audio_path),
-        "analysis_audio_used": os.path.abspath(res.audio_path),
-        "backend": res.backend_used,
+        "duration_s": res.duration_s,
+        "backend": "beatnet+librosa",
         "notes": res.notes,
         "bpm": res.bpm,
         "offset_correction_s": res.offset_correction_s,
-        "beats": res.beats or [],
-        "downbeats": res.downbeats or [],
-        "onsets": res.onsets or [],
-        "config": asdict(cfg_used),
-        "options": asdict(opt),
-        "mapgen": asdict(map_cfg) if map_cfg else {},
+        "beats": res.beats,
+        "downbeats": res.downbeats,
+        "onsets": res.onsets,
+        "bars": res.bars,
+        "sections": res.sections,
         "map_notes": map_notes,
-        "extra": res.extra or {},
+        "config": cfgd,
+        "config_requested": {k: (list(v) if isinstance(v, tuple) else v)
+                             for k, v in asdict(cfg).items()},
+        "mapgen": asdict(map_cfg) if map_cfg else {},
+        "extra": res.extra,
+        "error": res.error,
         "generated_at_unix": int(time.time()),
-        "elapsed_s": round(time.time() - t0, 3),
+        "elapsed_s": round(float(elapsed), 3),
     }
 
-    try:
-        with open(out_json_path, "w", encoding="utf-8") as f:
-            json.dump(payload_json, f, indent=2, ensure_ascii=False)
-    except Exception:
-        report["ok"] = False
-        if res.ok:
-            res.ok = False
-            res.error = "JSON write failed:\n" + traceback.format_exc()
 
-    ping(100, "Done ✅")
-    return res, report
+def write_json(path: str, payload: Dict[str, Any]) -> None:
+    _safe_mkdir(os.path.dirname(os.path.abspath(path)))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
-# ============================================================
-# Recents
-# ============================================================
-
-def load_recents() -> List[str]:
-    try:
-        if os.path.isfile(RECENTS_PATH):
-            with open(RECENTS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return [str(x) for x in data if isinstance(x, str)]
-    except Exception:
-        pass
-    return []
-
-def save_recents(paths: List[str]) -> None:
-    try:
-        paths2 = []
-        seen = set()
-        for p in paths:
-            p = os.path.abspath(p)
-            if p not in seen:
-                seen.add(p)
-                paths2.append(p)
-        paths2 = paths2[:8]
-        with open(RECENTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(paths2, f, indent=2)
-    except Exception:
-        pass
-
-def push_recent(path: str) -> List[str]:
-    rec = load_recents()
-    path = os.path.abspath(path)
-    rec = [p for p in rec if os.path.abspath(p) != path]
-    rec.insert(0, path)
-    save_recents(rec)
-    return rec
+def default_out_for(audio_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(audio_path))[0]
+    safe = "".join(ch for ch in stem if ch.isalnum() or ch in " ._-").strip() or "beatmap"
+    return os.path.join(DEFAULT_OUT_DIR, safe + ".analysis.json")
 
 
 # ============================================================
-# CLI (Godot mode)
+# CLI
 # ============================================================
-
-def _default_out_for_audio(audio_path: str) -> str:
-    base = os.path.splitext(os.path.basename(audio_path))[0]
-    base = _sanitize_filename(base)
-    _safe_mkdir(DEFAULT_OUT_DIR)
-    return os.path.join(DEFAULT_OUT_DIR, base + ".analysis.json")
 
 def run_cli(args: argparse.Namespace) -> int:
-    print("[AnalyzerDBG] sys.executable =", sys.executable)
-    print("[AnalyzerDBG] sys.version =", sys.version)
-    print("[AnalyzerDBG] SCRIPT_DIR =", SCRIPT_DIR)
-    print("[AnalyzerDBG] DEFAULT_OUT_DIR =", DEFAULT_OUT_DIR)
-
-    audio_path = (args.audio or "").strip()
-    out_path = (args.out or "").strip()
-    progress_file = (args.progress_file or "").strip() or None
-
-    def ping(p: int, m: str):
-        write_progress_file(progress_file, p, m)
-
-    if not audio_path:
-        print("ERROR: --audio is required for CLI mode.", file=sys.stderr)
-        ping(100, "ERROR: missing --audio")
-        return 2
-
-    if not os.path.isfile(audio_path):
-        print(f"ERROR: Audio file not found: {audio_path}", file=sys.stderr)
-        ping(100, "ERROR: audio not found")
-        return 2
-
-    if not out_path:
-        out_path = _default_out_for_audio(audio_path)
-
-    if args.ensure_deps:
-        ping(3, "Checking/installing dependencies…")
-        rep = ensure_dependencies(force=False, progress_cb=lambda p, m: ping(int(p * 0.20), m))
-        if not rep.get("ok", False):
-            ping(100, "Dependencies failed ❌")
-            print("ERROR: dependencies not OK", file=sys.stderr)
-            return 3
-
-    cfg = AnalysisConfig(
-        backend=str(args.backend).strip(),
-        min_bpm=float(args.min_bpm),
-        max_bpm=float(args.max_bpm),
-        prefer_time_signature=int(args.ts),
-        onset_refine_ms=int(args.refine_ms),
-        accurate_mode=bool(args.accurate),
-    )
-
-    opt = AnalysisOptions(
-        safe_mode=bool(args.safe_mode),
-        quick_seconds=int(args.quick_seconds),
-        use_cache=True,
-        normalize_audio=bool(args.normalize),
-        auto_tune=bool(args.auto_tune),
-        percussive_assist=bool(args.percussive),
-        maximize_confidence=bool(args.max_confidence),
-        max_passes=int(args.max_passes),
-        no_improve_limit=int(args.no_improve_limit),
-        improve_epsilon=float(args.improve_epsilon),
-        force_full_passes=bool(args.force_full_passes),
-    )
-
-    if opt.maximize_confidence:
-        cfg.accurate_mode = True
-        opt.quick_seconds = 0
-
-    # ----------------------------
-    # Cancel file support
-    # ----------------------------
-    cancel_file = (getattr(args, "cancel_file", "") or "").strip() or None
-
-    def cancel_flag() -> bool:
-        if not cancel_file:
-            return False
-        return os.path.isfile(cancel_file)
-
-    # ----------------------------
-    # MapGen config
-    # ----------------------------
-    map_cfg = MapGenConfig(
-        enabled=bool(getattr(args, "mapgen", True)),
-        difficulty=int(getattr(args, "map_diff", 5)),
-        lane_count=4,
-        seed=int(getattr(args, "map_seed", 0)),
-        min_gap_ms=int(getattr(args, "map_min_gap_ms", 85)),
-        allow_chords=bool(getattr(args, "map_allow_chords", False)),
-        chord_prob=0.10,
-    )
-
-    ping(8, "Analyzing…")
-    res, rep2 = analyze_audio_and_export(
-        audio_path, out_path, cfg, opt,
-        progress_cb=lambda p, m: ping(p, m),
-        cancel_flag=cancel_flag,
-        map_cfg=map_cfg,
-    )
-
-    if not res.ok:
-        ping(100, "Failed ❌")
-        print("❌ Failed", file=sys.stderr)
-        print(f"Backend attempted: {res.backend_used}", file=sys.stderr)
-        print(res.error or "Unknown error", file=sys.stderr)
-        return 2
-
-    conf = ((res.extra or {}).get("confidence", {}) or {})
-    conf_score = conf.get("score", None)
-    conf_txt = f"{conf_score:.3f}" if isinstance(conf_score, (int, float)) else "n/a"
-
-    maxi = (res.extra or {}).get("maximize_confidence", {}) or {}
-    best_s = maxi.get("best_score", None)
-    best_s_txt = f"{best_s:.3f}" if isinstance(best_s, (int, float)) else conf_txt
-
-    bpm_txt = f"{res.bpm:.2f}" if res.bpm else "unknown"
-    print("✅ Success")
-    print(f"Backend:        {res.backend_used}")
-    print(f"BPM:            {bpm_txt}")
-    print(f"Confidence:     {conf_txt}")
-    print(f"Best score:     {best_s_txt}")
-    print(f"Beats:          {len(res.beats or [])}")
-    print(f"Downbeats:      {len(res.downbeats or [])}")
-    print(f"Onsets:         {len(res.onsets or [])}")
-    print(f"Offset corr:    {res.offset_correction_s:+.4f}s")
-    print("")
-    print("Saved JSON:")
-    print(out_path)
-
-    ping(100, "Done ✅")
-    write_progress_file(progress_file, 100, "Done ✅", {"out": out_path, "confidence": conf_score, "best_score": best_s})
-    return 0
-
-
-
-# ============================================================
-# GUI
-# ============================================================
-
-def run_gui(prefill_audio: str = "", prefill_out: str = "") -> int:
-    import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
-
-    COLORS = {
-        "bg": "#12001f",
-        "panel": "#1a0030",
-        "panel2": "#0f0024",
-        "text": "#f3eaff",
-        "muted": "#c9b7ff",
-        "border": "#3a1a66",
-        "pink": "#ff6bd6",
-        "pink2": "#ff3fbf",
-        "lav": "#b37cff",
-        "good": "#7CFF9A",
-        "bad": "#FF6B6B",
-        "warn": "#FFD36B",
-        "dark": "#150018",
-    }
-
-    root = tk.Tk()
-    root.title(f"{APP_ID}  •  madmom preferred")
-    root.configure(bg=COLORS["bg"])
-
-    root.geometry("560x740")
-    root.minsize(520, 660)
-
-    try:
-        if os.name == "nt":
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-    style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except Exception:
-        pass
-
-    style.configure("TCombobox", padding=6)
-    style.configure("TNotebook", background=COLORS["bg"], borderwidth=0)
-    style.configure("TNotebook.Tab", padding=[10, 6])
-
-    q: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
-
-    state = {"busy": False, "cancel": False, "last_progress_ts": time.time(), "last_msg": "", "spin_i": 0}
-    prog = {"shown": 0.0, "target": 0}
-    pb_anim = {"phase": 0.0}
-    pb_h = 16
-
-    def set_target(p: int, msg: str = ""):
-        p = max(0, min(100, int(p)))
-        if p > prog["target"]:
-            prog["target"] = p
-        if msg:
-            state["last_msg"] = msg
-            status_var.set(msg)
-        state["last_progress_ts"] = time.time()
-
-    def hsv_to_hex(h: float, s: float, v: float) -> str:
-        r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
-        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
-
-    def draw_rainbow_bar():
-        w = pb_canvas.winfo_width()
-        h = pb_canvas.winfo_height()
-        if w <= 2 or h <= 2:
-            root.after(16, draw_rainbow_bar)
-            return
-
-        pb_canvas.delete("all")
-
-        # background + border
-        pb_canvas.create_rectangle(0, 0, w, h, fill=COLORS["panel2"], outline=COLORS["border"])
-
-        fill_w = int(w * (max(0.0, min(100.0, prog["shown"])) / 100.0))
-        if fill_w > 0:
-            stripe = 10
-            phase = pb_anim["phase"]
-
-            # Rainbow fill
-            for x in range(0, fill_w, stripe):
-                hue = (x / max(1, w)) + phase
-                col = hsv_to_hex(hue, 0.85, 1.0)
-                pb_canvas.create_rectangle(x, 0, min(fill_w, x + stripe), h, fill=col, outline="")
-
-            # Removed the old top "white cap" lines entirely ✅
-            # (You asked to remove the white stuff on top.)
-
-            # Moving vertical installer sheen (inside filled area)
-            sheen_w = max(10, min(22, w // 28))
-            sheen_x = int(((phase * 1.6) % 1.0) * fill_w)
-            x0 = max(0, sheen_x - sheen_w // 2)
-            x1 = min(fill_w, sheen_x + sheen_w // 2)
-
-            # layered shimmer bands (brighter center, softer edges)
-            bands = [
-                ("gray75", 0.22),
-                ("gray50", 0.42),
-                ("gray25", 0.68),
-                ("gray12", 0.92),
-            ]
-            for st, t in bands:
-                bx0 = int(x0 + (x1 - x0) * (0.5 - t / 2.0))
-                bx1 = int(x0 + (x1 - x0) * (0.5 + t / 2.0))
-                bx0 = max(0, bx0)
-                bx1 = min(fill_w, bx1)
-                if bx1 > bx0:
-                    pb_canvas.create_rectangle(bx0, 1, bx1, h - 1, fill="#ffffff", outline="", stipple=st)
-
-            # subtle inner dark edge for crispness (not white)
-            pb_canvas.create_rectangle(1, 1, max(1, fill_w - 1), h - 1, outline="#2a1246")
-
-        pb_canvas.create_text(w - 34, h // 2, text=f"{int(prog['shown'])}%", fill=COLORS["text"], font=("Segoe UI", 9, "bold"))
-        pb_anim["phase"] = (pb_anim["phase"] + 0.0045) % 1.0
-        root.after(16, draw_rainbow_bar)
-
-    def animate_progress():
-        t = float(prog["target"])
-        s = float(prog["shown"])
-
-        # Smooth approach that looks like an installer bar
-        if s < t:
-            s = s + (t - s) * 0.12
-            if (t - s) < 0.12:
-                s = t
-            prog["shown"] = min(s, 100.0)
-
-        if state["busy"]:
-            dt = time.time() - state["last_progress_ts"]
-            if dt > 7.0:
-                state["spin_i"] += 1
-                spinner = ["∙", "•", "●", "•"][state["spin_i"] % 4]
-                status_var.set((state["last_msg"] or "Working") + f" {spinner}")
-
-        root.after(16, animate_progress)
-
-    def card(parent, title_text: str):
-        c = tk.Frame(parent, bg=COLORS["panel"], bd=0, highlightthickness=1, highlightbackground=COLORS["border"])
-        h = tk.Frame(c, bg=COLORS["panel"])
-        h.pack(fill="x", padx=12, pady=(12, 8))
-        tk.Label(h, text=title_text, fg=COLORS["text"], bg=COLORS["panel"], font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        body = tk.Frame(c, bg=COLORS["panel"])
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        return c, body
-
-    def log_append(txt: str):
-        log_box.configure(state="normal")
-        log_box.insert("end", txt.rstrip() + "\n")
-        log_box.see("end")
-        log_box.configure(state="disabled")
-
-    def set_results(txt: str):
-        results_box.configure(state="normal")
-        results_box.delete("1.0", "end")
-        results_box.insert("1.0", txt)
-        results_box.configure(state="disabled")
-
-    def default_out_path_for_audio(ap: str) -> str:
-        base = os.path.splitext(os.path.basename(ap))[0]
-        base = _sanitize_filename(base)
-        _safe_mkdir(DEFAULT_OUT_DIR)
-        return os.path.join(DEFAULT_OUT_DIR, base + ".analysis.json")
-
-    def set_busy(b: bool):
-        state["busy"] = b
-        for w in [btn_install, btn_analyze, btn_cancel, btn_browse, btn_out, btn_open]:
-            try:
-                w.configure(state=("disabled" if b and w not in [btn_cancel] else "normal"))
-            except Exception:
-                pass
-        if not b:
-            btn_cancel.configure(state="disabled")
-        else:
-            btn_cancel.configure(state="normal")
-
-    header = tk.Frame(root, bg=COLORS["bg"])
-    header.pack(fill="x", padx=14, pady=(12, 8))
-    tk.Label(header, text=APP_NAME, fg=COLORS["text"], bg=COLORS["bg"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
-    tk.Label(header, text=f"{APP_VERSION}  •  purple-pink build  •  rainbow loader",
-             fg=COLORS["muted"], bg=COLORS["bg"], font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 0))
-
-    main = tk.Frame(root, bg=COLORS["bg"])
-    main.pack(fill="both", expand=True, padx=14, pady=8)
-
-    file_card, file_body = card(main, "Project")
-    file_card.pack(fill="x", pady=(0, 10))
-
-    audio_var = tk.StringVar(value=prefill_audio or "")
-    out_var = tk.StringVar(value=prefill_out or "")
-    backend_var = tk.StringVar(value="auto")
-
-    recents = load_recents()
-    recent_var = tk.StringVar(value=recents[0] if recents else "")
-    recent_box = ttk.Combobox(file_body, textvariable=recent_var, values=recents, state="readonly")
-    tk.Label(file_body, text="Recent", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(anchor="w")
-    recent_box.pack(fill="x", pady=(6, 10))
-
-    def apply_audio(p: str):
-        if p and os.path.isfile(p):
-            audio_var.set(p)
-            if not out_var.get().strip():
-                out_var.set(default_out_path_for_audio(p))
-
-    def on_recent(_evt=None):
-        apply_audio(recent_var.get().strip())
-    recent_box.bind("<<ComboboxSelected>>", on_recent)
-
-    tk.Label(file_body, text="Audio", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(anchor="w")
-    row_a = tk.Frame(file_body, bg=COLORS["panel"])
-    row_a.pack(fill="x", pady=(6, 10))
-
-    ent_audio = tk.Entry(row_a, textvariable=audio_var, fg=COLORS["text"], bg=COLORS["panel2"], insertbackground=COLORS["text"],
-                         relief="flat", font=("Segoe UI", 10))
-    ent_audio.pack(side="left", fill="x", expand=True, ipady=6)
-
-    def pick_audio():
-        p = filedialog.askopenfilename(
-            title="Choose audio file",
-            filetypes=[("Audio files", "*.wav *.mp3 *.flac *.ogg *.m4a *.aac *.aiff *.aif"), ("All files", "*.*")],
-        )
-        if p:
-            apply_audio(p)
-            new_rec = push_recent(p)
-            recent_box.configure(values=new_rec)
-            recent_var.set(new_rec[0])
-
-    btn_browse = tk.Button(row_a, text="Browse", command=pick_audio,
-                           bg=COLORS["pink"], fg=COLORS["dark"], relief="flat",
-                           font=("Segoe UI", 10, "bold"), padx=12, pady=6)
-    btn_browse.pack(side="left", padx=(10, 0))
-
-    tk.Label(file_body, text="Output JSON", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(anchor="w")
-    row_o = tk.Frame(file_body, bg=COLORS["panel"])
-    row_o.pack(fill="x", pady=(6, 0))
-
-    ent_out = tk.Entry(row_o, textvariable=out_var, fg=COLORS["text"], bg=COLORS["panel2"], insertbackground=COLORS["text"],
-                       relief="flat", font=("Segoe UI", 10))
-    ent_out.pack(side="left", fill="x", expand=True, ipady=6)
-
-    def pick_out():
-        _safe_mkdir(DEFAULT_OUT_DIR)
-        p = filedialog.asksaveasfilename(
-            title="Save analysis JSON as…",
-            defaultextension=".json",
-            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
-            initialdir=DEFAULT_OUT_DIR,
-        )
-        if p:
-            out_var.set(p)
-
-    btn_out = tk.Button(row_o, text="Path", command=pick_out,
-                        bg=COLORS["lav"], fg=COLORS["dark"], relief="flat",
-                        font=("Segoe UI", 10, "bold"), padx=12, pady=6)
-    btn_out.pack(side="left", padx=(10, 0))
-
-    settings_card, settings_body = card(main, "Settings")
-    settings_card.pack(fill="x", pady=(0, 10))
-
-    accurate_var = tk.BooleanVar(value=True)
-    normalize_var = tk.BooleanVar(value=True)
-    autotune_var = tk.BooleanVar(value=True)
-    percussive_var = tk.BooleanVar(value=False)
-    safe_mode_var = tk.BooleanVar(value=False)
-    max_conf_var = tk.BooleanVar(value=True)
-    force_full_var = tk.BooleanVar(value=False)  # NEW toggle
-
-    max_passes_var = tk.IntVar(value=20)
-    min_bpm_var = tk.DoubleVar(value=90.0)
-    max_bpm_var = tk.DoubleVar(value=220.0)
-    ts_var = tk.IntVar(value=4)
-    refine_ms_var = tk.IntVar(value=220)
-    quick_var = tk.IntVar(value=0)
-
-    top_row = tk.Frame(settings_body, bg=COLORS["panel"])
-    top_row.pack(fill="x", pady=(0, 6))
-    tk.Label(top_row, text="Backend", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    backend_box = ttk.Combobox(top_row, textvariable=backend_var, values=["auto", "madmom", "librosa"], state="readonly", width=10)
-    backend_box.pack(side="right")
-
-    row_bpm = tk.Frame(settings_body, bg=COLORS["panel"])
-    row_bpm.pack(fill="x", pady=6)
-    tk.Label(row_bpm, text="BPM", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    tk.Entry(row_bpm, textvariable=min_bpm_var, width=7, fg=COLORS["text"], bg=COLORS["panel2"],
-             insertbackground=COLORS["text"], relief="flat", font=("Segoe UI", 10)).pack(side="right", ipady=4)
-    tk.Label(row_bpm, text="min", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 8)).pack(side="right", padx=(6, 0))
-    tk.Entry(row_bpm, textvariable=max_bpm_var, width=7, fg=COLORS["text"], bg=COLORS["panel2"],
-             insertbackground=COLORS["text"], relief="flat", font=("Segoe UI", 10)).pack(side="right", ipady=4)
-    tk.Label(row_bpm, text="max", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 8)).pack(side="right", padx=(6, 10))
-
-    row_misc = tk.Frame(settings_body, bg=COLORS["panel"])
-    row_misc.pack(fill="x", pady=6)
-    tk.Label(row_misc, text="TS", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    ttk.Combobox(row_misc, textvariable=ts_var, values=[3, 4], state="readonly", width=5).pack(side="left", padx=(8, 14))
-    tk.Label(row_misc, text="Refine ms", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    tk.Entry(row_misc, textvariable=refine_ms_var, width=7, fg=COLORS["text"], bg=COLORS["panel2"],
-             insertbackground=COLORS["text"], relief="flat", font=("Segoe UI", 10)).pack(side="left", padx=(8, 14), ipady=4)
-    tk.Label(row_misc, text="Quick s", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    tk.Entry(row_misc, textvariable=quick_var, width=7, fg=COLORS["text"], bg=COLORS["panel2"],
-             insertbackground=COLORS["text"], relief="flat", font=("Segoe UI", 10)).pack(side="left", padx=(8, 0), ipady=4)
-
-    def tgl(text: str, var: tk.Variable):
-        tk.Checkbutton(
-            settings_body, text=text, variable=var,
-            fg=COLORS["text"], bg=COLORS["panel"],
-            activebackground=COLORS["panel"], activeforeground=COLORS["text"],
-            selectcolor=COLORS["panel2"], font=("Segoe UI", 10, "bold"),
-        ).pack(anchor="w", pady=2)
-
-    tgl("Accurate mode", accurate_var)
-    tgl("Normalize (ffmpeg)", normalize_var)
-    tgl("Auto-tune settings", autotune_var)
-    tgl("Percussive assist", percussive_var)
-    tgl("Safe mode (librosa)", safe_mode_var)
-    tgl("Maximize confidence (keeps trying)", max_conf_var)
-    tgl("Force full passes (ignore plateau)", force_full_var)  # NEW
-
-    row_pass = tk.Frame(settings_body, bg=COLORS["panel"])
-    row_pass.pack(fill="x", pady=(6, 0))
-    tk.Label(row_pass, text="Max passes", fg=COLORS["muted"], bg=COLORS["panel"], font=("Segoe UI", 9)).pack(side="left")
-    tk.Entry(row_pass, textvariable=max_passes_var, width=6, fg=COLORS["text"], bg=COLORS["panel2"],
-             insertbackground=COLORS["text"], relief="flat", font=("Segoe UI", 10)).pack(side="right", ipady=4)
-
-    status_card, status_body = card(main, "Progress")
-    status_card.pack(fill="x", pady=(0, 10))
-
-    status_var = tk.StringVar(value="Ready.")
-    tk.Label(status_body, textvariable=status_var, fg=COLORS["text"], bg=COLORS["panel"],
-             font=("Segoe UI", 10), wraplength=520, justify="left").pack(anchor="w", pady=(0, 8))
-
-    pb_canvas = tk.Canvas(status_body, height=pb_h, bg=COLORS["panel"], highlightthickness=0)
-    pb_canvas.pack(fill="x")
-
-    action_row = tk.Frame(main, bg=COLORS["bg"])
-    action_row.pack(fill="x", pady=(0, 10))
-
-    def open_output_folder():
-        p = out_var.get().strip()
-        if not p:
-            return
-        folder = os.path.dirname(os.path.abspath(p))
-        if os.path.isdir(folder):
-            try:
-                if os.name == "nt":
-                    os.startfile(folder)  # type: ignore
-                else:
-                    subprocess.run(["xdg-open", folder])
-            except Exception:
-                messagebox.showerror("Open failed", "Could not open folder:\n" + folder)
-
-    def cancel_now():
-        if not state["busy"]:
-            return
-        state["cancel"] = True
-        state["last_msg"] = "Cancel requested… stopping between steps."
-        status_var.set(state["last_msg"])
-
-    def build_cfg_opt() -> Tuple[AnalysisConfig, AnalysisOptions]:
-        cfg = AnalysisConfig(
-            backend=backend_var.get().strip(),
-            min_bpm=float(min_bpm_var.get()),
-            max_bpm=float(max_bpm_var.get()),
-            prefer_time_signature=int(ts_var.get()),
-            onset_refine_ms=int(refine_ms_var.get()),
-            accurate_mode=bool(accurate_var.get()),
-        )
-        opt = AnalysisOptions(
-            safe_mode=bool(safe_mode_var.get()),
-            quick_seconds=int(quick_var.get()),
-            use_cache=True,
-            normalize_audio=bool(normalize_var.get()),
-            auto_tune=bool(autotune_var.get()),
-            percussive_assist=bool(percussive_var.get()),
-            maximize_confidence=bool(max_conf_var.get()),
-            max_passes=max(1, min(200, int(max_passes_var.get()))),
-            force_full_passes=bool(force_full_var.get()),
-        )
-        if opt.maximize_confidence:
-            cfg.accurate_mode = True
-            opt.quick_seconds = 0
-        return cfg, opt
-
-    def install_deps():
-        if state["busy"]:
-            messagebox.showinfo("Busy", "Already working.")
-            return
-        set_busy(True)
-        state["cancel"] = False
-        prog["target"] = 0
-        state["last_msg"] = "Installing/repairing dependencies…"
-        status_var.set(state["last_msg"])
-        log_append("\n== Install/Repair deps ==")
-
-        def worker():
-            rep = ensure_dependencies(force=False, progress_cb=lambda p, m: q.put(("progress", (p, m))))
-            q.put(("deps", rep))
-
-        import threading
-        threading.Thread(target=worker, daemon=True).start()
-
-    def analyze_now():
-        if state["busy"]:
-            messagebox.showinfo("Busy", "Already analyzing.")
-            return
-
-        ap = audio_var.get().strip()
-        if not ap or not os.path.isfile(ap):
-            messagebox.showerror("No file", "Choose a valid audio file first.")
-            return
-
-        op = out_var.get().strip()
-        if not op:
-            out_var.set(default_out_path_for_audio(ap))
-            op = out_var.get().strip()
-
-        cfg, opt = build_cfg_opt()
-
-        set_busy(True)
-        state["cancel"] = False
-        prog["target"] = 0
-        state["last_msg"] = "Analyzing…"
-        status_var.set(state["last_msg"])
-
-        def worker():
-            rep = ensure_dependencies(force=False, progress_cb=lambda p, m: q.put(("progress", (int(p * 0.25), m))))
-            q.put(("deps_short", rep))
-
-            res, rep2 = analyze_audio_and_export(
-                ap, op, cfg, opt,
-                progress_cb=lambda p, m: q.put(("progress", (p, m))),
-                cancel_flag=lambda: bool(state["cancel"]),
-            )
-            q.put(("res", (res, op, rep2)))
-
-        import threading
-        threading.Thread(target=worker, daemon=True).start()
-
-    btn_install = tk.Button(action_row, text="Install/Repair", command=install_deps,
-                            bg=COLORS["lav"], fg=COLORS["dark"], relief="flat",
-                            font=("Segoe UI", 10, "bold"), padx=12, pady=8)
-    btn_install.pack(side="left")
-
-    btn_analyze = tk.Button(action_row, text="Analyze", command=analyze_now,
-                            bg=COLORS["pink2"], fg=COLORS["dark"], relief="flat",
-                            font=("Segoe UI", 12, "bold"), padx=16, pady=10)
-    btn_analyze.pack(side="left", padx=(10, 0))
-
-    btn_cancel = tk.Button(action_row, text="Cancel", command=cancel_now,
-                           bg=COLORS["bad"], fg=COLORS["dark"], relief="flat",
-                           font=("Segoe UI", 10, "bold"), padx=12, pady=8)
-    btn_cancel.pack(side="left", padx=(10, 0))
-    btn_cancel.configure(state="disabled")
-
-    btn_open = tk.Button(action_row, text="Open Folder", command=open_output_folder,
-                         bg=COLORS["pink"], fg=COLORS["dark"], relief="flat",
-                         font=("Segoe UI", 10, "bold"), padx=12, pady=8)
-    btn_open.pack(side="right")
-
-    tabs = ttk.Notebook(main)
-    tabs.pack(fill="both", expand=True)
-
-    tab_res = tk.Frame(tabs, bg=COLORS["bg"])
-    tab_log = tk.Frame(tabs, bg=COLORS["bg"])
-    tabs.add(tab_res, text="Result")
-    tabs.add(tab_log, text="Log")
-
-    results_box = tk.Text(tab_res, height=10, bg=COLORS["panel2"], fg=COLORS["text"],
-                          insertbackground=COLORS["text"], relief="flat")
-    results_box.pack(fill="both", expand=True)
-    results_box.insert("1.0", "No analysis yet.\n")
-    results_box.configure(state="disabled")
-
-    log_box = tk.Text(tab_log, height=10, bg=COLORS["panel2"], fg=COLORS["text"],
-                      insertbackground=COLORS["text"], relief="flat")
-    log_box.pack(fill="both", expand=True)
-    log_box.insert("1.0", f"{APP_ID} log\n")
-    log_box.configure(state="disabled")
-
-    # Apply prefill (if launched with args)
-    if prefill_audio:
-        apply_audio(prefill_audio)
-        if prefill_out:
-            out_var.set(prefill_out)
-
-    def poll():
+    t0 = time.time()
+    prog = args.progress_file or ""
+    audio = os.path.abspath(args.audio)
+    out = os.path.abspath(args.out) if args.out else default_out_for(audio)
+
+    def ping(p: int, m: str) -> None:
+        write_progress_file(prog, p, m)
         try:
-            while True:
-                kind, payload = q.get_nowait()
-
-                if kind == "progress":
-                    pct, msg = payload
-                    set_target(int(pct), str(msg))
-
-                elif kind == "deps":
-                    rep = payload
-                    log_append("\n== Dependency report ==")
-                    log_append(f"Python: {rep.get('python','')}")
-                    log_append(f"Exe:    {rep.get('executable','')}")
-                    if rep.get("warning"):
-                        log_append("⚠️ " + str(rep["warning"]))
-                    for s in rep.get("steps", []):
-                        icon = "✅" if s.get("ok") else "❌"
-                        log_append(f"{icon} {s.get('title')}")
-                        if not s.get("ok"):
-                            log_append("   ↳ " + str(s.get("log", "")).replace("\n", "\n   ↳ ")[:2500])
-                    set_target(100, "Dependencies check complete ✅")
-                    set_busy(False)
-
-                elif kind == "deps_short":
-                    rep = payload
-                    if not rep.get("ok", False):
-                        log_append("\n⚠️ Dependencies not fully OK. Some features may fail.")
-
-                elif kind == "res":
-                    res, outp, _rep2 = payload
-
-                    if not res.ok:
-                        set_target(100, "Analysis failed ❌")
-                        set_results(f"Backend attempted: {res.backend_used}\n\n{res.notes}\n\nERROR:\n{res.error}\n")
-                        set_busy(False)
-                        continue
-
-                    conf = ((res.extra or {}).get("confidence", {}) or {})
-                    conf_score = conf.get("score", None)
-                    conf_txt = f"{conf_score:.3f}" if isinstance(conf_score, (int, float)) else "n/a"
-
-                    beat_n = len(res.beats or [])
-                    db_n = len(res.downbeats or [])
-                    on_n = len(res.onsets or [])
-                    bpm_txt = f"{res.bpm:.2f}" if res.bpm else "unknown"
-
-                    maxi = (res.extra or {}).get("maximize_confidence", {}) or {}
-                    best_s = maxi.get("best_score", None)
-                    best_s_txt = f"{best_s:.3f}" if isinstance(best_s, (int, float)) else conf_txt
-
-                    summary = (
-                        f"✅ Success\n"
-                        f"Backend:        {res.backend_used}\n"
-                        f"BPM:            {bpm_txt}\n"
-                        f"Confidence:     {conf_txt}\n"
-                        f"Best score:     {best_s_txt}\n"
-                        f"Beats:          {beat_n}\n"
-                        f"Downbeats:      {db_n}\n"
-                        f"Onsets:         {on_n}\n"
-                        f"Offset corr:    {res.offset_correction_s:+.4f}s\n\n"
-                        f"Saved JSON:\n{outp}\n"
-                    )
-                    set_results(summary)
-                    set_target(100, "Done ✅")
-
-                    new_rec = push_recent(audio_var.get().strip())
-                    recent_box.configure(values=new_rec)
-                    recent_var.set(new_rec[0])
-
-                    set_busy(False)
-
-        except queue.Empty:
+            print("[%3d%%] %s" % (int(p), m), flush=True)
+        except Exception:
             pass
 
-        root.after(120, poll)
+    def cancelled() -> bool:
+        return bool(args.cancel_file and os.path.isfile(args.cancel_file))
 
-    root.after(16, animate_progress)
-    root.after(16, draw_rainbow_bar)
-    root.after(120, poll)
+    cfg = AnalysisConfig(
+        min_bpm=float(args.min_bpm),
+        max_bpm=float(args.max_bpm),
+        time_signature=int(args.ts),
+        snap_window_ms=float(args.snap_ms),
+        onset_delta=float(args.onset_delta),
+        use_beatnet=(not args.no_beatnet),
+        quick_seconds=int(args.quick_seconds),
+        auto=bool(args.auto),
+    )
+    map_cfg = MapGenConfig(
+        enabled=bool(args.mapgen),
+        difficulty=int(args.map_diff),
+        lane_count=int(args.map_lanes),
+        seed=int(args.map_seed),
+        min_gap_ms=int(args.map_min_gap_ms),
+        allow_chords=bool(args.map_allow_chords),
+        allow_triplets=bool(args.map_triplets),
+    )
 
-    root.mainloop()
-    return 0
+    ping(1, "Starting %s…" % APP_ID)
+    try:
+        res = analyze(audio, cfg, ping, cancelled)
+    except Exception:
+        tb = traceback.format_exc()
+        _crash_log(tb)
+        res = FusionResult(ok=False, error=tb[-4000:])
 
+    map_notes: List[Dict[str, Any]] = []
+    if res.ok and map_cfg.enabled:
+        ping(94, "Generating map notes…")
+        try:
+            map_notes = generate_map_notes(
+                onsets=res.onsets, beats=res.beats, downbeats=res.downbeats,
+                period=(60.0 / res.bpm) if res.bpm else 0.0,
+                audio_hash=_audio_hash(audio), cfg=map_cfg,
+                bands=res.bands, bars=res.bars)
+        except Exception:
+            tb = traceback.format_exc()
+            _crash_log(tb)
+            res.extra["mapgen_error"] = tb[-2000:]
 
-# ============================================================
-# Entrypoint
-# ============================================================
+    ping(97, "Writing JSON…")
+    payload = build_payload(audio, res, cfg, map_cfg, map_notes, time.time() - t0)
+    try:
+        write_json(out, payload)
+    except Exception:
+        tb = traceback.format_exc()
+        _crash_log(tb)
+        write_progress_file(prog, 100, "Failed: could not write JSON")
+        sys.stderr.write(tb)
+        return 1
+
+    if res.ok:
+        ping(100, "Done — %.2f BPM, %d beats, %d notes"
+             % (res.bpm or 0.0, len(res.beats), len(map_notes)))
+        return 0
+
+    write_progress_file(prog, 100, "Failed: %s" % (res.error or "unknown")[:200])
+    try:
+        print("FAILED: %s" % (res.error or "unknown"), file=sys.stderr)
+    except Exception:
+        pass
+    return 2
+
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--cli", action="store_true", help="Run in CLI mode (Godot-friendly).")
+    ap = argparse.ArgumentParser(
+        prog="BeatmapAnalyzer",
+        description="BeatNet + Librosa fusion beat/structure analyzer for Rawstyle.")
+    ap.add_argument("--cli", action="store_true", help="CLI mode (Godot uses this).")
     ap.add_argument("--audio", type=str, default="", help="Audio file path.")
     ap.add_argument("--out", type=str, default="", help="Output JSON path.")
-    ap.add_argument("--progress-file", type=str, default="", help="Write progress JSON here (for Godot progress UI).")
+    ap.add_argument("--progress-file", type=str, default="",
+                    help="Progress JSON written here for the Godot UI.")
+    ap.add_argument("--cancel-file", type=str, default="",
+                    help="If this file appears, the run aborts.")
 
-    ap.add_argument("--cancel-file", type=str, default="", help="CLI: if this file exists, analysis cancels.")
-    ap.add_argument("--mapgen", action="store_true", help="Generate mixed-lane beatmap into map_notes.")
-    ap.add_argument("--no-mapgen", action="store_true", help="Disable map generation.")
-    ap.add_argument("--map-diff", type=int, default=5, help="Map difficulty 1..10.")
-    ap.add_argument("--map-seed", type=int, default=0, help="0 = deterministic from audio hash.")
-    ap.add_argument("--map-min-gap-ms", type=int, default=85, help="Global min gap between notes.")
-    ap.add_argument("--map-allow-chords", action="store_true", help="Allow rare chords on high difficulty.")
-
-
-    ap.add_argument("--backend", type=str, default="auto", choices=["auto", "madmom", "librosa"])
-    ap.add_argument("--min-bpm", type=float, default=90.0)
-    ap.add_argument("--max-bpm", type=float, default=220.0)
+    ap.add_argument("--min-bpm", type=float, default=120.0)
+    ap.add_argument("--max-bpm", type=float, default=200.0)
     ap.add_argument("--ts", type=int, default=4, choices=[3, 4])
-    ap.add_argument("--refine-ms", type=int, default=220)
+    ap.add_argument("--snap-ms", type=float, default=18.0,
+                    help="Transient snap window (ms).")
+    ap.add_argument("--onset-delta", type=float, default=0.055,
+                    help="Onset peak-pick threshold; lower finds more.")
+    ap.add_argument("--auto", dest="auto", action="store_true", default=True,
+                    help="Derive tempo window, onset thresholds and snap window "
+                         "from the audio (default).")
+    ap.add_argument("--no-auto", dest="auto", action="store_false",
+                    help="Use the values passed on the command line verbatim.")
+    ap.add_argument("--no-beatnet", action="store_true",
+                    help="Skip BeatNet; librosa-only grid.")
+    ap.add_argument("--quick-seconds", type=int, default=0,
+                    help="Analyze only the first N seconds (0 = whole track).")
 
-    ap.add_argument("--accurate", action="store_true", help="Accurate mode.")
-    ap.add_argument("--fast", action="store_true", help="Fast-ish mode (turns off accurate).")
+    ap.add_argument("--mapgen", dest="mapgen", action="store_true", default=True)
+    ap.add_argument("--no-mapgen", dest="mapgen", action="store_false")
+    ap.add_argument("--map-diff", type=int, default=5)
+    ap.add_argument("--map-lanes", type=int, default=2,
+                    help="2 = beats lane + melody lane (roles decide the lane). "
+                         "4 or more spreads roles across lanes instead.")
+    ap.add_argument("--map-seed", type=int, default=0)
+    ap.add_argument("--map-min-gap-ms", type=int, default=85)
+    ap.add_argument("--map-allow-chords", action="store_true")
+    ap.add_argument("--map-triplets", dest="map_triplets", action="store_true",
+                    default=True, help="Allow 1/12 and 1/24 triplet placement.")
+    ap.add_argument("--no-map-triplets", dest="map_triplets", action="store_false",
+                    help="Binary subdivisions only (1/4, 1/8, 1/16, 1/32).")
 
-    ap.add_argument("--normalize", action="store_true")
-    ap.add_argument("--no-normalize", action="store_true")
-    ap.add_argument("--auto-tune", action="store_true")
-    ap.add_argument("--no-auto-tune", action="store_true")
-    ap.add_argument("--percussive", action="store_true")
-    ap.add_argument("--safe-mode", action="store_true")
-    ap.add_argument("--max-confidence", action="store_true")
-    ap.add_argument("--no-max-confidence", action="store_true")
-
-    ap.add_argument("--max-passes", type=int, default=50)
-    ap.add_argument("--no-improve-limit", type=int, default=6)
-    ap.add_argument("--improve-epsilon", type=float, default=0.002)
-    ap.add_argument("--force-full-passes", action="store_true")
-
-    ap.add_argument("--quick-seconds", type=int, default=0)
-    ap.add_argument("--ensure-deps", action="store_true", help="CLI: install/repair deps if needed.")
-    ap.add_argument("--scan-venv", action="store_true", help="Allow time-limited deeper venv scan if not found.")
-    ap.add_argument("--no-relaunch", action="store_true", help="Disable venv relaunch.")
-    ap.add_argument("--no-autostart", action="store_true", help="GUI: do not autostart (reserved; GUI currently manual).")
+    ap.add_argument("--no-relaunch", action="store_true",
+                    help="Do not re-exec into the fusion venv.")
+    ap.add_argument("--selftest", action="store_true",
+                    help="Verify the BeatNet/Librosa stack and exit.")
 
     ns = ap.parse_args(argv)
-
-    # normalize flags
-    if ns.fast:
-        ns.accurate = False
-    elif not ns.accurate:
-        ns.accurate = True
-
-    if ns.no_normalize:
-        ns.normalize = False
-    elif not ns.normalize:
-        ns.normalize = True
-
-    if ns.no_auto_tune:
-        ns.auto_tune = False
-    elif not ns.auto_tune:
-        ns.auto_tune = True
-
-    if ns.no_max_confidence:
-        ns.max_confidence = False
-    elif not ns.max_confidence:
-        ns.max_confidence = True
-    
-    if ns.no_mapgen:
-        ns.mapgen = False
-    elif not ns.mapgen:
-        ns.mapgen = True
-
     ns.map_diff = max(1, min(10, int(ns.map_diff)))
-    ns.map_min_gap_ms = max(25, min(250, int(ns.map_min_gap_ms)))
-
-    ns.max_passes = max(1, min(200, int(ns.max_passes)))
+    ns.map_min_gap_ms = max(20, min(400, int(ns.map_min_gap_ms)))
+    ns.map_lanes = max(1, min(8, int(ns.map_lanes)))
     return ns
+
+
+def selftest() -> int:
+    print("%s selftest" % APP_ID)
+    print("  python  : %s" % sys.version.split()[0])
+    print("  exe     : %s" % sys.executable)
+    ok = True
+    for mod in ("numpy", "scipy", "librosa", "torch", "madmom", "soundfile"):
+        try:
+            m = __import__(mod)
+            print("  %-9s: %s" % (mod, getattr(m, "__version__", "ok")))
+        except Exception as e:
+            ok = False
+            print("  %-9s: MISSING (%s)" % (mod, e))
+    try:
+        from BeatNet.BeatNet import BeatNet  # noqa: F401
+        print("  BeatNet  : ok")
+    except Exception as e:
+        ok = False
+        print("  BeatNet  : MISSING (%s)" % e)
+    print("  RESULT   : %s" % ("OK" if ok else "INCOMPLETE"))
+    return 0 if ok else 1
+
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
+    if not args.no_relaunch:
+        relaunch_into_venv_if_needed()
+    if args.selftest:
+        return selftest()
+    if not args.audio:
+        print("No --audio given. Use --help for usage, or --selftest to check the stack.",
+              file=sys.stderr)
+        return 2
+    return run_cli(args)
 
-    # venv relaunch (unless disabled)
-    if "--no-relaunch" not in sys.argv and not args.no_relaunch:
-        relaunch_into_found_venv_if_needed(allow_scan=bool(args.scan_venv))
 
-    # Choose mode:
-    # - Explicit --cli
-    # - Or if Godot passes audio+out+progress-file etc (we treat that as CLI)
-    wants_cli = bool(args.cli) or (bool(args.audio) and (bool(args.out) or bool(args.progress_file)))
-
-    if wants_cli:
-        return run_cli(args)
-
-    # GUI
-    return run_gui(prefill_audio=str(args.audio or ""), prefill_out=str(args.out or ""))
-
-def safe_entry() -> int:
+if __name__ == "__main__":
     try:
-        return main()
+        raise SystemExit(main())
     except SystemExit:
         raise
     except Exception:
         tb = traceback.format_exc()
-        logp = _crash_log_file()
-        _write_text(logp, tb)
-        _show_fatal_popup(APP_ID, f"{APP_ID} crashed.\n\nCrash log saved to:\n{logp}\n\nLast traceback:\n{tb[-1600:]}")
-        return 1
-
-if __name__ == "__main__":
-    raise SystemExit(safe_entry())
+        p = _crash_log(tb)
+        sys.stderr.write(tb)
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.MessageBoxW(
+                    0, "%s crashed.\n\nLog: %s\n\n%s" % (APP_ID, p, tb[-1200:]),
+                    APP_ID, 0x10)
+            except Exception:
+                pass
+        raise SystemExit(1)

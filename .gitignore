@@ -1,3 +1,7 @@
 tools/.venv/
+tools/.venv-fusion/
+tools/.venv-bn/
+tools/.venv-v3/
+tools/.cache/
 .godot/
 __pycache__/
