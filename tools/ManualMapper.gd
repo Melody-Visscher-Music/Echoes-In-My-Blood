@@ -239,6 +239,10 @@ var autofinish_use_mapgen: bool = true # NEW: default on
 # left to configure -- no per-lane beats/downbeats/onsets decisions.
 var autofinish_two_lane: bool = true
 
+## Set while loading a chart whose song_path no longer resolves; appended to the
+## load message so the warning is not buried by it.
+var _chart_song_warning: String = ""
+
 # --- Refine mode (AutoFinish with "clear" unchecked on an existing chart) ---
 # The existing chart is treated as the style oracle: it decides which windows
 # are meant to be quiet, how dense they are, and where rolls belong. The
@@ -2030,6 +2034,29 @@ func _analyzer_finalize_tick() -> void:
 
 	_on_analyzer_fail()
 
+## Reads an analyzer output file and returns why it is unusable, or "" if it is
+## fine. The analyzer signals failure inside a perfectly well-formed JSON
+## (ok:false plus an error string), so "the file exists" is not success --
+## a run that could not even find its audio still writes one.
+func _analysis_failure_reason(vpath: String) -> String:
+	if vpath == "" or not FileAccess.file_exists(vpath):
+		return "no output file was written"
+	var f: FileAccess = FileAccess.open(vpath, FileAccess.READ)
+	if f == null:
+		return "output file could not be read"
+	var txt: String = f.get_as_text()
+	f.close()
+	var parsed: Variant = JSON.parse_string(txt)
+	if parsed is not Dictionary:
+		return "output was not valid JSON"
+	var d: Dictionary = parsed as Dictionary
+	if d.has("ok") and not bool(d.get("ok", true)):
+		var err: String = String(d.get("error", "")).strip_edges()
+		return err if err != "" else "the analyzer reported a failure"
+	if not _is_supported_schema(String(d.get("schema", ""))):
+		return "output is not an analysis file"
+	return ""
+
 func _on_analyzer_success(found_path: String) -> void:
 	_analyzer_dbg("DONE success → " + found_path)
 	_analyzer_dbg(" beats=%d downbeats=%d onsets=%d map_notes=%d" % [
@@ -2038,17 +2065,29 @@ func _on_analyzer_success(found_path: String) -> void:
 		analysis_onsets.size(),
 		analysis_map_notes.size()
 	])
+	# The analyzer writes an output file whether it succeeded or not, so check
+	# what is IN it before calling this a success -- otherwise a run that failed
+	# for an obvious reason (missing audio) is reported as "done" and the real
+	# cause never reaches the user.
+	var why: String = _analysis_failure_reason(found_path)
+	if why != "":
+		_set_analyzer_progress(0.0, "Failed ✖")
+		_hide_analyzer_progress_after(0.6)
+		info.text = "Analyze failed: %s" % why
+		_analyzer_dbg("FAILED: " + why)
+		_unload_analysis()
+		_dump_analyzer_debug()
+		return
+
 	analysis_path = found_path
 	_load_analysis_json(analysis_path)
 	_analyzer_dbg("schema=" + String(analysis_data.get("schema","")))
-	_analyzer_dbg("map_notes key exists? " + str(analysis_data.has("map_notes")))
 	_analyzer_dbg("map_notes loaded=" + str(analysis_map_notes.size()))
 
-	# extra safety: must actually be analysis schema
-	if analysis_data.is_empty() or not _looks_like_analysis_json(analysis_path):
+	if analysis_data.is_empty():
 		_set_analyzer_progress(0.0, "Failed ✖")
 		_hide_analyzer_progress_after(0.6)
-		info.text = "Analyzer output found, but it isn't a valid analysis JSON: %s" % analysis_path
+		info.text = "Analyze failed: output could not be loaded."
 		_dump_analyzer_debug()
 		return
 
@@ -5191,6 +5230,40 @@ func _normalize_song_path(p: String) -> String:
 	return s
 
 
+## Finds the song a chart belongs to when its stored song_path no longer
+## resolves. Renaming a song leaves every chart pointing at a name that is gone,
+## and the file is usually still sitting right there under a new one.
+##
+## Matching is on the beatmap KEY, not on filename similarity: a key is derived
+## from a song filename by the same rule that named the chart, so
+## "This Is Me.wav" -> "this_is_me" matches chart "this_is_me.json" exactly.
+## That is deterministic, so it can be applied silently rather than guessed at.
+func _find_song_for_key(key: String) -> String:
+	if key == "":
+		return ""
+	var exts: Array[String] = ["wav", "ogg", "mp3", "flac"]
+	for dir_path in ["res://audio/", "user://audio/"]:
+		var d: DirAccess = DirAccess.open(dir_path)
+		if d == null:
+			continue
+		d.list_dir_begin()
+		while true:
+			var fn: String = d.get_next()
+			if fn == "":
+				break
+			if d.current_is_dir():
+				continue
+			# Godot exports audio as .import companions; ignore those.
+			if fn.ends_with(".import"):
+				continue
+			if not exts.has(fn.get_extension().to_lower()):
+				continue
+			if _beatmap_key_from_song_path(fn) == key:
+				d.list_dir_end()
+				return dir_path + fn
+		d.list_dir_end()
+	return ""
+
 func _beatmap_key_from_song_path(p: String) -> String:
 	var base := p.get_file().get_basename()
 	base = base.strip_edges().to_lower()
@@ -5249,6 +5322,8 @@ func _on_load_chart() -> void:
 		info.text = "No beatmap key set."
 		return
 
+	_chart_song_warning = ""
+
 	var rel: String = "res://data/beatmaps/%s.json" % beatmap_key
 	if not FileAccess.file_exists(rel):
 		info.text = "No existing chart at %s" % rel
@@ -5275,9 +5350,31 @@ func _on_load_chart() -> void:
 	bpm_edit.text = str(bpm_v)
 	var off_v: Variant = d.get("offset_ms", 0)
 	offset_edit.text = str(off_v)
+	# Adopt the chart's song path only if that file still exists. A renamed or
+	# removed song leaves a dead path in the chart, and blindly taking it
+	# replaced a song the user had just loaded by hand with one that is gone --
+	# which then failed much later, inside the analyzer.
 	var path_v: Variant = d.get("song_path", "")
-	if str(path_v) != "":
-		path_edit.text = str(path_v)
+	var chart_song: String = str(path_v)
+	if chart_song != "":
+		var song_abs: String = chart_song
+		if chart_song.begins_with("res://") or chart_song.begins_with("user://"):
+			song_abs = ProjectSettings.globalize_path(chart_song)
+		if FileAccess.file_exists(song_abs):
+			path_edit.text = chart_song
+		else:
+			# Not necessarily gone -- most often just renamed. Look for it by key.
+			var found: String = _find_song_for_key(beatmap_key)
+			if found != "":
+				path_edit.text = found
+				if found.get_file() != chart_song.get_file():
+					_chart_song_warning = "song renamed %s → %s, using the new one" % [
+						chart_song.get_file(), found.get_file()]
+			elif path_edit.text.strip_edges() == "":
+				path_edit.text = chart_song   # nothing else to offer; keep it visible
+				_chart_song_warning = "song file %s not found — load it with P" % chart_song.get_file()
+			else:
+				_chart_song_warning = "song %s not found; kept the one you loaded" % chart_song.get_file()
 
 	analysis_path = String(d.get("analysis_path", analysis_path))
 
@@ -5357,6 +5454,9 @@ func _on_load_chart() -> void:
 	_try_autoload_analysis()
 
 	info.text = "Loaded %d events from %s" % [events.size(), rel]
+	if _chart_song_warning != "":
+		info.text += "  ⚠ " + _chart_song_warning
+		_chart_song_warning = ""
 	queue_redraw()
 
 # ============================================================
@@ -5494,6 +5594,24 @@ func _analyze_current_song_with_settings() -> void:
 		audio_abs = ProjectSettings.globalize_path(song_path)
 	audio_abs = audio_abs.replace("\\", "/")
 
+	# Check the audio is actually there before spawning anything. A chart can
+	# outlive the file it points at (renamed or removed song), and without this
+	# the run is launched only to fail deep inside python, surfacing as a
+	# confusing "output isn't valid" instead of "that file is gone".
+	if not FileAccess.file_exists(audio_abs):
+		# Usually a rename rather than a deletion; recover the same way chart
+		# loading does instead of failing deep inside python.
+		var alt: String = _find_song_for_key(beatmap_key)
+		if alt != "":
+			_analyzer_dbg("audio missing at %s, using %s" % [audio_abs, alt])
+			path_edit.text = alt
+			song_path = alt
+			audio_abs = ProjectSettings.globalize_path(alt).replace("\\", "/")
+		else:
+			info.text = "Analyze: song file %s not found. Load the song with P." % song_path.get_file()
+			_analyzer_dbg("ABORT: audio missing at " + audio_abs)
+			return
+
 	# Track run metadata for finalize scan
 	_analyzer_start_unix = int(Time.get_unix_time_from_system())
 	_analyzer_audio_stem = audio_abs.get_file().get_basename()
@@ -5590,15 +5708,33 @@ func _analyze_current_song_with_settings() -> void:
 	_analyzer_dbg("PID=" + str(_analyzer_pid))
 
 func _try_autoload_analysis() -> void:
-	# Priority: analysis_path saved in beatmap json, else default path
-	if analysis_path != "" and FileAccess.file_exists(analysis_path):
+	# Try the path saved in the beatmap, then the default location, and take
+	# the first that is actually USABLE. A chart can point at an analysis left
+	# over from an older song or a run that failed; loading one of those gave a
+	# silently empty analysis that made Analyze and AutoFinish look broken.
+	# Nothing here is required -- no usable analysis simply means none loaded.
+	var tries: Array[String] = []
+	if analysis_path != "":
+		tries.append(analysis_path)
+	var guess: String = _analysis_default_out_path()
+	if guess != "" and guess != analysis_path:
+		tries.append(guess)
+
+	for cand in tries:
+		if not FileAccess.file_exists(cand):
+			continue
+		var why: String = _analysis_failure_reason(cand)
+		if why != "":
+			_analyzer_dbg("autoload skipped %s (%s)" % [cand, why])
+			continue
+		analysis_path = cand
 		_load_analysis_json(analysis_path)
 		return
 
-	var guess: String = _analysis_default_out_path()
-	if FileAccess.file_exists(guess):
-		analysis_path = guess
-		_load_analysis_json(analysis_path)
+	# Nothing usable: make sure no leftovers from a previous song stay loaded.
+	if not analysis_data.is_empty() or not analysis_map_notes.is_empty():
+		_unload_analysis()
+	analysis_path = ""
 
 func _reload_analysis() -> void:
 	if analysis_path == "" or not FileAccess.file_exists(analysis_path):

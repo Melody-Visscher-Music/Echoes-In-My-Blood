@@ -2,13 +2,13 @@
 
 importer="wav"
 type="AudioStreamWAV"
-uid="uid://6pc2ahbqp87o"
-path="res://.godot/imported/This Is Me v1.wav-342160afd99d2c3cf63cbce6632c4454.sample"
+uid="uid://djyglm3ylirl1"
+path="res://.godot/imported/This Is Me.wav-d78e22b7530701ef5a906b50a3e21e0e.sample"
 
 [deps]
 
-source_file="res://audio/This Is Me v1.wav"
-dest_files=["res://.godot/imported/This Is Me v1.wav-342160afd99d2c3cf63cbce6632c4454.sample"]
+source_file="res://audio/This Is Me.wav"
+dest_files=["res://.godot/imported/This Is Me.wav-d78e22b7530701ef5a906b50a3e21e0e.sample"]
 
 [params]
 

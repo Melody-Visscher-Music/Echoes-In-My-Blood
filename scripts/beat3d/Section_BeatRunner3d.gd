@@ -4325,7 +4325,8 @@ func _z_is_electric(world_z: float) -> bool:
 # Spawned once after all gate visuals are built. These are large structural
 # pieces that span an entire phrase rather than a single beat.
 
-func _song_end_z() -> float:
+## Time of the last event of any kind. This is the chart's end, NOT the song's.
+func _last_event_t() -> float:
 	var last_t: float = 0.0
 	for e in gameplay_events:
 		var t: float = float(e.get("t", 0.0))
@@ -4333,7 +4334,13 @@ func _song_end_z() -> float:
 	for e in world_events:
 		var t: float = float(e.get("t", 0.0))
 		if t > last_t: last_t = t
-	return max(last_t, 1.0) * player.forward_speed + 500.0
+	return last_t
+
+
+## How long the TRACK has to be. The 500 m tail is deliberate runout so the
+## player cannot reach the end of the geometry; it is not part of the song.
+func _song_end_z() -> float:
+	return max(_last_event_t(), 1.0) * player.forward_speed + 500.0
 
 
 func _spawn_section_geometry() -> void:
@@ -8120,9 +8127,17 @@ func _update_city_pulse(delta: float) -> void:
 func _update_hud_progress(t_s: float) -> void:
 	if _hud == null:
 		return
-	# Derive total length from the last gameplay event + a small buffer.
+	# The bar shows SONG progress, so the total is the audio's own length.
+	#
+	# It used to be _song_end_z() / forward_speed -- but _song_end_z() is TRACK
+	# length, which adds 500 m of runout past the last note so the player cannot
+	# run off the end of the geometry. At ~18 m/s that padded the bar with an
+	# extra ~28 s, so the song always finished with the bar still short of full.
 	if _song_total_duration <= 0.0:
-		_song_total_duration = _song_end_z() / player.forward_speed
+		if music != null and music.stream != null:
+			_song_total_duration = music.stream.get_length()
+		if _song_total_duration <= 0.0:
+			_song_total_duration = maxf(1.0, _last_event_t())   # no stream: chart end
 	_hud.set_progress(clampf(t_s / _song_total_duration, 0.0, 1.0))
 
 
