@@ -5672,7 +5672,7 @@ func _check_near_miss(idx: int, entry: Dictionary, action: String) -> void:
 
 func _award_near_miss(_idx: int) -> void:
 	# Award a flat 25-point bonus (intentionally small, not multiplier-scaled)
-	_score += 25
+	_score += 50
 	_update_hud_score()
 
 	# Reuse the same HUD root that streak milestones use

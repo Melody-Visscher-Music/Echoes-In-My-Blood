@@ -5660,6 +5660,96 @@ func _request_cancel_analyzer() -> void:
 			f.close()
 	_analyzer_dbg("CANCEL requested")
 
+# ============================================================
+# Analyzer tooling discovery (editor AND exported build)
+# ============================================================
+# res:// is a real folder in the editor but lives inside the .pck once
+# exported, and a process cannot be launched from inside a .pck. So the
+# analyzer script is extracted to user:// when it is not on disk, and the
+# interpreter is searched for in the places it can actually exist.
+
+const _ANALYZER_SCRIPT_NAME: String = "BeatmapAnalyzer.py"
+const _VENV_REL: String = "tools/.venv-fusion/Scripts/"
+
+func _exe_dir() -> String:
+	return OS.get_executable_path().get_base_dir().replace("\\", "/")
+
+func _is_exported() -> bool:
+	return not OS.has_feature("editor")
+
+## Real on-disk path of the analyzer script, extracting it from the pack if
+## that is the only copy. Returns "" when it cannot be produced.
+func _resolve_analyzer_script() -> String:
+	var tries: Array[String] = []
+	if analyzer_script_path != "":
+		tries.append(ProjectSettings.globalize_path(analyzer_script_path))
+	if _is_exported():
+		tries.append(_exe_dir().path_join("tools").path_join(_ANALYZER_SCRIPT_NAME))
+	tries.append(ProjectSettings.globalize_path("user://tools/").path_join(_ANALYZER_SCRIPT_NAME))
+
+	for t in tries:
+		var tp: String = t.replace("\\", "/")
+		if tp != "" and FileAccess.file_exists(tp):
+			return tp
+
+	# Only copy left is the packed one: unpack it beside the user data so it
+	# can be executed. Rewritten whenever the packed copy differs, so a game
+	# update cannot leave a stale analyzer behind.
+	var packed: String = "res://tools/" + _ANALYZER_SCRIPT_NAME
+	if not FileAccess.file_exists(packed):
+		return ""
+	var src: FileAccess = FileAccess.open(packed, FileAccess.READ)
+	if src == null:
+		return ""
+	var body: String = src.get_as_text()
+	src.close()
+
+	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://tools"))
+	var out_v: String = "user://tools/" + _ANALYZER_SCRIPT_NAME
+	var need_write: bool = true
+	if FileAccess.file_exists(out_v):
+		var cur: FileAccess = FileAccess.open(out_v, FileAccess.READ)
+		if cur != null:
+			need_write = cur.get_as_text() != body
+			cur.close()
+	if need_write:
+		var dst: FileAccess = FileAccess.open(out_v, FileAccess.WRITE)
+		if dst == null:
+			return ""
+		dst.store_string(body)
+		dst.close()
+		_analyzer_dbg("extracted analyzer to " + out_v)
+	return ProjectSettings.globalize_path(out_v).replace("\\", "/")
+
+## Real on-disk python that can run the analyzer, or "" if there is none.
+func _resolve_python() -> String:
+	var names: Array[String] = ["pythonw.exe", "python.exe"]
+	if OS.get_name() != "Windows":
+		names = ["python3", "python"]
+
+	var tries: Array[String] = []
+	if python_executable != "":
+		tries.append(python_executable)
+	for n in names:
+		if _is_exported():
+			tries.append(_exe_dir().path_join(_VENV_REL + n))
+		tries.append(ProjectSettings.globalize_path("res://" + _VENV_REL + n))
+		tries.append(ProjectSettings.globalize_path("user://" + _VENV_REL + n))
+
+	for t in tries:
+		var tp: String = t.replace("\\", "/")
+		if tp != "" and FileAccess.file_exists(tp):
+			return tp
+	return ""
+
+## One line explaining what is missing, for the UI. "" when everything is ready.
+func _analyzer_unavailable_reason() -> String:
+	if _resolve_python() == "":
+		return "the Python environment (tools/.venv-fusion) isn't next to the game"
+	if _resolve_analyzer_script() == "":
+		return "BeatmapAnalyzer.py could not be found or unpacked"
+	return ""
+
 func _analyze_current_song_with_settings() -> void:
 	var song_path: String = path_edit.text.strip_edges()
 	if song_path == "":
@@ -5670,7 +5760,16 @@ func _analyze_current_song_with_settings() -> void:
 		info.text = "Analyze: already running…"
 		return
 
-	var script_abs: String = ProjectSettings.globalize_path(analyzer_script_path).replace("\\", "/")
+	# Resolve the tooling to real on-disk paths. In an exported build res:// is
+	# inside the .pck, so the configured paths do not exist as files and the
+	# process launch would fail with nothing useful to show the user.
+	var py_exe: String = _resolve_python()
+	var script_abs: String = _resolve_analyzer_script()
+	if py_exe == "" or script_abs == "":
+		var reason: String = _analyzer_unavailable_reason()
+		info.text = "Analyze unavailable: %s. Everything else in the mapper still works." % reason
+		_analyzer_dbg("UNAVAILABLE: " + reason)
+		return
 
 	# Output path (auto user:// fallback handled inside helper)
 	var outp: String = _analysis_default_out_path()
@@ -5774,7 +5873,7 @@ func _analyze_current_song_with_settings() -> void:
 
 	# ✅ DEBUG START PRINT
 	_analyzer_dbg("START")
-	_analyzer_dbg(" python=" + python_executable)
+	_analyzer_dbg(" python=" + py_exe)
 	_analyzer_dbg(" script=" + script_abs)
 	_analyzer_dbg(" audio=" + audio_abs)
 	_analyzer_dbg(" out(vpath)=" + outp)
@@ -5797,12 +5896,12 @@ func _analyze_current_song_with_settings() -> void:
 	info.text = "Analyzing…"
 	call_deferred("_show_analyzer_progress", 0.0, "Starting Beatmap Analyzer…")
 
-	var pid: int = OS.create_process(python_executable, PackedStringArray(args), true)
+	var pid: int = OS.create_process(py_exe, PackedStringArray(args), true)
 	if pid <= 0:
 		_analyzer_dbg("FAILED to start process (pid<=0)")
 		_set_analyzer_progress(0.0, "Failed ✖")
 		_hide_analyzer_progress_after(0.6)
-		info.text = "Analyze failed: couldn't start python process. Check python_executable + script path."
+		info.text = "Analyze failed: could not start %s" % py_exe.get_file()
 		_analyzer_out_path = ""
 		_analyzer_progress_path = ""
 		_analyzer_reported_out_abs = ""
