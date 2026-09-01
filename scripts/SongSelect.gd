@@ -263,6 +263,8 @@ func _load_beatmaps() -> void:
 		_info.text = "FOLDER NOT FOUND: res://data/beatmaps"
 		return
 
+	var pending: Array[Dictionary] = []
+
 	dir.list_dir_begin()
 	var entry_name: String = dir.get_next()
 	while entry_name != "":
@@ -278,6 +280,7 @@ func _load_beatmaps() -> void:
 			var title: String = key.replace("_", " ")
 			var song_path: String = ""
 
+			var order: int = 0
 			var f: FileAccess = FileAccess.open(json_path, FileAccess.READ)
 			if f != null:
 				var txt: String = f.get_as_text()
@@ -285,30 +288,50 @@ func _load_beatmaps() -> void:
 				var parsed: Variant = JSON.parse_string(txt)
 				if parsed is Dictionary:
 					song_path = String((parsed as Dictionary).get("song_path", ""))
+					order = int((parsed as Dictionary).get("song_order", 0))
 
-			beatmaps.append({"key": key, "title": title, "song_path": song_path})
-
-			var card := _make_card(title, key)
-			_list_box.add_child(card)
-			# Cards are clickable as well as keyboard-navigable; PlatePanel
-			# ignores the mouse by default so this has to be re-enabled.
-			card.mouse_filter = Control.MOUSE_FILTER_STOP
-			var idx: int = _cards.size()
-			# Hovering moves the selection so the mouse and the keyboard agree on
-			# what "selected" means — otherwise the lit card and the card you are
-			# about to click could be two different songs.
-			card.mouse_entered.connect(func() -> void: _select(idx))
-			card.gui_input.connect(func(ev: InputEvent) -> void:
-				var mb := ev as InputEventMouseButton
-				if mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
-					if idx == _sel_idx:
-						_start_selected()
-					else:
-						_select(idx))
-			_cards.append(card)
+			pending.append({"key": key, "title": title, "song_path": song_path,
+				"song_order": order})
 
 		entry_name = dir.get_next()
 	dir.list_dir_end()
+
+	# Sort before building anything: numbered songs first in their given order,
+	# then anything unnumbered, alphabetically. Cards used to be built inside
+	# the scan loop, so the running order was whatever the directory happened to
+	# return -- effectively alphabetical, with no way to author a play order.
+	pending.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		var oa: int = int(a.get("song_order", 0))
+		var ob: int = int(b.get("song_order", 0))
+		var ka: int = oa if oa > 0 else 0x7FFFFFFF
+		var kb: int = ob if ob > 0 else 0x7FFFFFFF
+		if ka != kb:
+			return ka < kb
+		return String(a.get("title", "")).naturalnocasecmp_to(String(b.get("title", ""))) < 0)
+
+	for entry in pending:
+		var key: String = String(entry.get("key", ""))
+		var title: String = String(entry.get("title", ""))
+		beatmaps.append(entry)
+
+		var card := _make_card(title, key)
+		_list_box.add_child(card)
+		# Cards are clickable as well as keyboard-navigable; PlatePanel
+		# ignores the mouse by default so this has to be re-enabled.
+		card.mouse_filter = Control.MOUSE_FILTER_STOP
+		var idx: int = _cards.size()
+		# Hovering moves the selection so the mouse and the keyboard agree on
+		# what "selected" means — otherwise the lit card and the card you are
+		# about to click could be two different songs.
+		card.mouse_entered.connect(func() -> void: _select(idx))
+		card.gui_input.connect(func(ev: InputEvent) -> void:
+			var mb := ev as InputEventMouseButton
+			if mb != null and mb.pressed and mb.button_index == MOUSE_BUTTON_LEFT:
+				if idx == _sel_idx:
+					_start_selected()
+				else:
+					_select(idx))
+		_cards.append(card)
 
 	if _cards.is_empty():
 		_info.text = "NO BEATMAPS FOUND IN res://data/beatmaps"

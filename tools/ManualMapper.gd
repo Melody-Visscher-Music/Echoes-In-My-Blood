@@ -243,6 +243,10 @@ var autofinish_two_lane: bool = true
 ## load message so the warning is not buried by it.
 var _chart_song_warning: String = ""
 
+## Play order in Song Select. 0 = unset, which sorts after every numbered song.
+var song_order: int = 0
+var order_edit: LineEdit = null
+
 # --- Refine mode (AutoFinish with "clear" unchecked on an existing chart) ---
 # The existing chart is treated as the style oracle: it decides which windows
 # are meant to be quiet, how dense they are, and where rolls belong. The
@@ -632,6 +636,29 @@ func _ready() -> void:
 		if not load_btn.pressed.is_connected(cb):
 			load_btn.pressed.connect(cb)
 
+## Adds the play-order box to the top bar. Built in code rather than in the
+## scene so the .tscn stays untouched.
+func _ensure_order_edit() -> void:
+	if order_edit != null or top_bar == null or key_edit == null:
+		return
+	order_edit = LineEdit.new()
+	order_edit.placeholder_text = "Order (01)"
+	order_edit.tooltip_text = "Play order in Song Select. 01, 02, 03... Blank means unordered, which sorts to the end."
+	order_edit.alignment = HORIZONTAL_ALIGNMENT_CENTER
+	order_edit.custom_minimum_size = Vector2(96, 0)
+	order_edit.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	order_edit.text = _format_song_order(song_order)
+	top_bar.add_child(order_edit)
+	top_bar.move_child(order_edit, key_edit.get_index() + 1)
+
+	# Warn as soon as the box is left, not only when the chart is saved.
+	order_edit.focus_exited.connect(func() -> void:
+		order_edit.text = _format_song_order(_parse_song_order(order_edit.text))
+		_check_song_order_conflict())
+	order_edit.text_submitted.connect(func(_t: String) -> void:
+		order_edit.text = _format_song_order(_parse_song_order(order_edit.text))
+		_check_song_order_conflict())
+
 func _ensure_topbar_bg_panel() -> void:
 	if top_bar == null:
 		return
@@ -745,6 +772,7 @@ func _style_top_tree(n: Node) -> void:
 		_style_top_tree(c)
 
 func _apply_happy_top_ui() -> void:
+	_ensure_order_edit()
 	_ensure_topbar_bg_panel()
 	_style_top_tree(top_bar)
 
@@ -5128,6 +5156,71 @@ func _variant_array_to_dict_array(v: Variant) -> Array[Dictionary]:
 				out.append((item as Dictionary).duplicate(true))
 	return out
 
+# ============================================================
+# Song order (play order in Song Select)
+# ============================================================
+
+## Parses whatever the user typed into the order box. Accepts "01", "1", " 3 ";
+## anything else means "no order set", which sorts to the end.
+func _parse_song_order(s: String) -> int:
+	var t: String = s.strip_edges()
+	if t == "":
+		return 0
+	if not t.is_valid_int():
+		return 0
+	return maxi(0, t.to_int())
+
+func _format_song_order(n: int) -> String:
+	return "" if n <= 0 else "%02d" % n
+
+## Other charts already using this number. Duplicates are allowed (order is a
+## hint, not a key) but they make the Song Select order ambiguous, so the user
+## is told rather than silently getting an arbitrary tie-break.
+func _song_order_conflicts(order: int, exclude_key: String) -> Array[String]:
+	var out: Array[String] = []
+	if order <= 0:
+		return out
+	var dir: DirAccess = DirAccess.open("res://data/beatmaps")
+	if dir == null:
+		return out
+	dir.list_dir_begin()
+	while true:
+		var fn: String = dir.get_next()
+		if fn == "":
+			break
+		if dir.current_is_dir() or not fn.to_lower().ends_with(".json"):
+			continue
+		var k: String = fn.substr(0, fn.length() - 5)
+		if k == exclude_key:
+			continue
+		var f: FileAccess = FileAccess.open("res://data/beatmaps/%s" % fn, FileAccess.READ)
+		if f == null:
+			continue
+		var parsed: Variant = JSON.parse_string(f.get_as_text())
+		f.close()
+		if parsed is not Dictionary:
+			continue
+		if int((parsed as Dictionary).get("song_order", 0)) == order:
+			out.append(k)
+	dir.list_dir_end()
+	out.sort()
+	return out
+
+## Warns in the info line if this chart's number is already spoken for.
+## Returns true when there is a clash.
+func _check_song_order_conflict(quiet_when_clear: bool = true) -> bool:
+	var order: int = _parse_song_order(order_edit.text) if order_edit != null else 0
+	if order <= 0:
+		return false
+	var clash: Array[String] = _song_order_conflicts(order, beatmap_key)
+	if clash.is_empty():
+		if not quiet_when_clear:
+			info.text = "Song order %s is free." % _format_song_order(order)
+		return false
+	info.text = "⚠ Song order %s is already used by: %s" % [
+		_format_song_order(order), ", ".join(clash)]
+	return true
+
 func _save_chart() -> void:
 	if beatmap_key == "":
 		if path_edit.text.strip_edges() != "":
@@ -5139,6 +5232,9 @@ func _save_chart() -> void:
 
 	bpm = float(bpm_edit.text)
 	offset_ms = int(offset_edit.text)
+	if order_edit != null:
+		song_order = _parse_song_order(order_edit.text)
+		order_edit.text = _format_song_order(song_order)
 	var song_path: String = _normalize_song_path(path_edit.text)
 	if song_path == "":
 		info.text = "No song path set."
@@ -5147,6 +5243,7 @@ func _save_chart() -> void:
 	_ensure_event_ids_and_fields()
 
 	var bm: Dictionary = {
+		"song_order": song_order,
 		"song_path": song_path,
 		"bpm": roundi(bpm),
 		"offset_ms": offset_ms,
@@ -5350,6 +5447,9 @@ func _on_load_chart() -> void:
 	bpm_edit.text = str(bpm_v)
 	var off_v: Variant = d.get("offset_ms", 0)
 	offset_edit.text = str(off_v)
+	song_order = int(_json_num(d.get("song_order", null), 0.0))
+	if order_edit != null:
+		order_edit.text = _format_song_order(song_order)
 	# Adopt the chart's song path only if that file still exists. A renamed or
 	# removed song leaves a dead path in the chart, and blindly taking it
 	# replaced a song the user had just loaded by hand with one that is gone --
@@ -5454,6 +5554,10 @@ func _on_load_chart() -> void:
 	_try_autoload_analysis()
 
 	info.text = "Loaded %d events from %s" % [events.size(), rel]
+	if song_order > 0 and not _song_order_conflicts(song_order, beatmap_key).is_empty():
+		_chart_song_warning = "song order %s is shared with %s" % [
+			_format_song_order(song_order),
+			", ".join(_song_order_conflicts(song_order, beatmap_key))]
 	if _chart_song_warning != "":
 		info.text += "  ⚠ " + _chart_song_warning
 		_chart_song_warning = ""
