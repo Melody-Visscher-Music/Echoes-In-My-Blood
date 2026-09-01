@@ -17176,9 +17176,9 @@
 			"capture_pass": "beats",
 			"category": "generic",
 			"dur": 0.1,
-			"id": 1478,
+			"id": 1478.0,
 			"judgement": "tap",
-			"lane": 0,
+			"lane": 0.0,
 			"role": "generic",
 			"src": "capture",
 			"t": 46.6567851838173,
@@ -17597,5 +17597,6 @@
 	"offset_ms": 0,
 	"rap_segments": [],
 	"rap_taps": [],
+	"song_order": 1,
 	"song_path": "res://audio/This Is Me.wav"
 }

@@ -159,7 +159,7 @@ func _build_ui() -> void:
 
 
 ## One song card: title, plus best score and combo when the song has been played.
-func _make_card(title: String, key: String) -> PlatePanel:
+func _make_card(title: String, key: String, bpm: float = 0.0) -> PlatePanel:
 	var s: float = _s
 	var card := PlatePanel.create(int(18 * s), UiStyle.VIOLET, 18.0 * s)
 	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -184,9 +184,23 @@ func _make_card(title: String, key: String) -> PlatePanel:
 	else:
 		stat_text = "NOT YET PLAYED"
 		stat_col  = Color(0.52, 0.47, 0.65)
+	# Stat line and BPM share a row: the tempo is reference information, not a
+	# score, so it sits to the right in a muted colour and the card keeps its
+	# height whether or not a chart has a BPM recorded.
+	var stat_row := HBoxContainer.new()
+	stat_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_child(stat_row)
+
 	var stat_lbl: Label = UiStyle.label(stat_text, UiStyle.display(700), int(14 * s), Color.WHITE)
 	stat_lbl.self_modulate = stat_col
-	box.add_child(stat_lbl)
+	stat_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	stat_row.add_child(stat_lbl)
+
+	if bpm > 0.0:
+		var bpm_lbl: Label = UiStyle.label("%d BPM" % roundi(bpm), UiStyle.display(700), int(14 * s), Color.WHITE)
+		bpm_lbl.self_modulate = Color(0.62, 0.55, 0.78)
+		bpm_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		stat_row.add_child(bpm_lbl)
 
 	return card
 
@@ -281,6 +295,7 @@ func _load_beatmaps() -> void:
 			var song_path: String = ""
 
 			var order: int = 0
+			var bpm: float = 0.0
 			var f: FileAccess = FileAccess.open(json_path, FileAccess.READ)
 			if f != null:
 				var txt: String = f.get_as_text()
@@ -289,9 +304,12 @@ func _load_beatmaps() -> void:
 				if parsed is Dictionary:
 					song_path = String((parsed as Dictionary).get("song_path", ""))
 					order = int((parsed as Dictionary).get("song_order", 0))
+					var bv: Variant = (parsed as Dictionary).get("bpm", 0)
+					if bv is float or bv is int:
+						bpm = float(bv)
 
 			pending.append({"key": key, "title": title, "song_path": song_path,
-				"song_order": order})
+				"song_order": order, "bpm": bpm})
 
 		entry_name = dir.get_next()
 	dir.list_dir_end()
@@ -314,7 +332,7 @@ func _load_beatmaps() -> void:
 		var title: String = String(entry.get("title", ""))
 		beatmaps.append(entry)
 
-		var card := _make_card(title, key)
+		var card := _make_card(title, key, float(entry.get("bpm", 0.0)))
 		_list_box.add_child(card)
 		# Cards are clickable as well as keyboard-navigable; PlatePanel
 		# ignores the mouse by default so this has to be re-enabled.
