@@ -5,3 +5,4 @@ tools/.venv-v3/
 tools/.cache/
 .godot/
 __pycache__/
+data/Analysis/

@@ -1233,8 +1233,15 @@ func _load_chart_and_build_plan() -> void:
 
 	_setup_runner_rng()
 
-	runner_plan = _build_runner_plan_from_beats(gameplay_events)
+	# Rap data FIRST: the grind rails live on those segments, and wall-jump
+	# placement inside _build_runner_plan_from_beats has to be able to see them
+	# to stay clear. Parsed after the plan, _rap_segs was still empty when the
+	# wall jump was chosen, so one could be dropped straight onto a rail.
+	# Safe to move up -- _parse_rap_data only needs _runner_avg_beat_s, which is
+	# set further above.
 	_parse_rap_data(d)
+
+	runner_plan = _build_runner_plan_from_beats(gameplay_events)
 	_parse_drop_buildups(d)
 	_parse_electric_zones(d)
 	_parse_lyrics(d)
@@ -1570,9 +1577,45 @@ func _choose_section_sequence(analyses: Array[Dictionary]) -> Array[String]:
 # best one. If the first/natural choice was unjumpable we simply keep searching, so a
 # feasible spot is almost always found. If none exists, no WJ is placed (sections stay
 # filled — never an empty corridor).
+## True when a wall-jump section hosted by this phrase would overlap a grind
+## rail. The rail spawns across a whole rap segment and the player rides it with
+## no way to deal with wall geometry, so the two must never coexist on track.
+##
+## The span checked is the WJ CORRIDOR, not just the phrase: _prescan_wj_zone
+## reserves 8 m before the first gate and ~100 m after the last for the elevated
+## floor and the descent ramp, so the exclusion is measured over the same
+## distance, converted to time at the runner's forward speed.
+func _wj_phrase_hits_grind(phrase: Array) -> bool:
+	if _rap_segs.is_empty() or phrase.is_empty():
+		return false
+
+	var t_first: float = float(phrase[0].get("t", 0.0))
+	var t_last:  float = float(phrase[phrase.size() - 1].get("t", 0.0))
+
+	var spd: float = 18.0
+	if player != null and player.forward_speed > 0.1:
+		spd = player.forward_speed
+	var lead_s:  float = 8.0 / spd
+	var trail_s: float = 100.0 / spd
+
+	var wj_start: float = t_first - lead_s
+	var wj_end:   float = t_last + trail_s
+
+	for seg in _rap_segs:
+		var st: float = float(seg.get("start_t", 0.0))
+		var et: float = float(seg.get("end_t", 0.0))
+		if wj_start < et and st < wj_end:
+			return true
+	return false
+
+
 func _place_feasible_wall_jump(section_types: Array[String], phrases: Array, analyses: Array[Dictionary]) -> void:
 	const MAX_WJ_BEAT_S: float = 0.74
-	const WJ_PLACE_PROB: float = 0.90   # chance a song gets a WJ at all (set 1.0 = every song)
+	const WJ_PLACE_PROB: float = 0.50   # chance a song gets a WJ at all (set 1.0 = every song)
+	# Phrases scoring at least this fraction of the best are all fair game, and
+	# the winner is drawn from them weighted by score. Lower = more variety in
+	# where the wall jump lands, at the cost of using weaker spots.
+	const WJ_PICK_QUALITY_FLOOR: float = 0.72
 
 	# Clear any WJ the natural pool tentatively placed — we pick the spot ourselves.
 	for i in range(section_types.size()):
@@ -1584,19 +1627,52 @@ func _place_feasible_wall_jump(section_types: Array[String], phrases: Array, ana
 	if _runner_rng.randf() >= WJ_PLACE_PROB:
 		return   # intentionally WJ-free this song (variety)
 
-	# Search EVERY non-edge phrase for the most evenly-spaced feasible spot.
-	var best_i:     int   = -1
+	# Collect EVERY feasible non-edge phrase with its score, then choose among
+	# the good ones at random rather than always taking the single best.
+	# Scoring is fully deterministic (evenness, mid-song position, length), so
+	# picking the maximum put the wall jump at the same spot in a song every
+	# single run -- the only variety was whether it appeared at all.
+	var cand_i: Array[int] = []
+	var cand_w: Array[float] = []
 	var best_score: float = 0.0
 	for i in range(1, phrases.size() - 1):
 		if int(analyses[i].get("beat_count", 0)) < 4:
 			continue
+		if _wj_phrase_hits_grind(phrases[i]):
+			continue   # a rail runs here; the player has no answer to walls on it
 		var score: float = _wj_phrase_score(phrases[i], analyses[i])
-		if score > best_score:
-			best_score = score
-			best_i     = i
+		if score <= 0.0:
+			continue   # infeasible spacing
+		cand_i.append(i)
+		cand_w.append(score)
+		best_score = maxf(best_score, score)
 
-	if best_i != -1:
-		section_types[best_i] = "wall_jump"
+	if cand_i.is_empty():
+		return
+
+	# Keep only the genuinely good spots, then weight by score. A phrase well
+	# below the best is a worse wall jump, not merely a different one, so it is
+	# dropped rather than given a small chance of ruining a run.
+	var floor_score: float = best_score * WJ_PICK_QUALITY_FLOOR
+	var pick_i: Array[int] = []
+	var pick_w: Array[float] = []
+	for k in range(cand_i.size()):
+		if cand_w[k] >= floor_score:
+			pick_i.append(cand_i[k])
+			pick_w.append(cand_w[k])
+
+	var total: float = 0.0
+	for w in pick_w:
+		total += w
+	var roll: float = _runner_rng.randf() * total
+	var chosen: int = pick_i[pick_i.size() - 1]
+	for k in range(pick_i.size()):
+		roll -= pick_w[k]
+		if roll <= 0.0:
+			chosen = pick_i[k]
+			break
+
+	section_types[chosen] = "wall_jump"
 
 
 # Scores a phrase as a wall-jump host. Returns -1.0 if the beat spacing isn't

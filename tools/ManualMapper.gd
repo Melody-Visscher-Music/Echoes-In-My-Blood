@@ -218,6 +218,10 @@ var af_cb_downbeats: CheckBox
 var af_cb_onsets: CheckBox
 var af_cb_mapgen: CheckBox # use analyzer map_notes
 var af_cb_two_lane: CheckBox # lane 0 = beats (pink), lane 1 = melody (blue)
+var af_cb_refine_align: CheckBox
+var af_cb_refine_fill: CheckBox
+var af_cb_refine_rolls: CheckBox
+var af_sb_refine_max: SpinBox
 
 var af_sb_beats_every: SpinBox
 var af_sb_lane_sep_ms: SpinBox
@@ -234,6 +238,15 @@ var autofinish_use_mapgen: bool = true # NEW: default on
 # analyzer already classifies every note, so with this on there is nothing
 # left to configure -- no per-lane beats/downbeats/onsets decisions.
 var autofinish_two_lane: bool = true
+
+# --- Refine mode (AutoFinish with "clear" unchecked on an existing chart) ---
+# The existing chart is treated as the style oracle: it decides which windows
+# are meant to be quiet, how dense they are, and where rolls belong. The
+# analyzer only supplies the timing truth and the candidates.
+var autofinish_refine_max_ms: int = 55          # per-note snap window
+var autofinish_refine_align_true: bool = true   # strip the chart's own latency
+var autofinish_refine_fill_gaps: bool = true
+var autofinish_refine_complete_rolls: bool = true
 
 # ============================================================
 # Beatmap data
@@ -2451,6 +2464,52 @@ func _build_autofinish_popup() -> void:
 	af_sb_onset_avoid_beat_ms.custom_minimum_size = Vector2(90, 0)
 	hb_avoid.add_child(af_sb_onset_avoid_beat_ms)
 
+	var sep_rf: HSeparator = HSeparator.new()
+	vb.add_child(sep_rf)
+
+	var lbl_rf: Label = Label.new()
+	lbl_rf.text = "Refine existing chart (used when \"Clear\" above is OFF)"
+	vb.add_child(lbl_rf)
+
+	var lbl_rf2: Label = Label.new()
+	lbl_rf2.text = "Corrects the notes already there instead of adding a second chart on top. Your chart decides which windows stay quiet and where rolls belong."
+	lbl_rf2.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl_rf2.modulate = Color(1, 1, 1, 0.6)
+	vb.add_child(lbl_rf2)
+
+	var hb_rf: HBoxContainer = HBoxContainer.new()
+	vb.add_child(hb_rf)
+
+	af_cb_refine_align = CheckBox.new()
+	af_cb_refine_align.text = "Remove tap latency"
+	af_cb_refine_align.tooltip_text = "Measure how far the whole chart sits from the real transients and shift it onto them, then fix the leftover jitter per note."
+	af_cb_refine_align.button_pressed = autofinish_refine_align_true
+	hb_rf.add_child(af_cb_refine_align)
+
+	af_cb_refine_fill = CheckBox.new()
+	af_cb_refine_fill.text = "Fill gaps"
+	af_cb_refine_fill.tooltip_text = "Add notes only in windows you already charted, and only where the gap is wider than your own spacing there."
+	af_cb_refine_fill.button_pressed = autofinish_refine_fill_gaps
+	hb_rf.add_child(af_cb_refine_fill)
+
+	af_cb_refine_rolls = CheckBox.new()
+	af_cb_refine_rolls.text = "Complete rolls"
+	af_cb_refine_rolls.tooltip_text = "Finish double/triple kicks, but only in windows where you already use them."
+	af_cb_refine_rolls.button_pressed = autofinish_refine_complete_rolls
+	hb_rf.add_child(af_cb_refine_rolls)
+
+	var lbl_rfc: Label = Label.new()
+	lbl_rfc.text = "Max correction (ms):"
+	hb_rf.add_child(lbl_rfc)
+
+	af_sb_refine_max = SpinBox.new()
+	af_sb_refine_max.min_value = 10
+	af_sb_refine_max.max_value = 200
+	af_sb_refine_max.step = 1
+	af_sb_refine_max.value = autofinish_refine_max_ms
+	af_sb_refine_max.tooltip_text = "A note further than this from any detected event is treated as deliberate and left alone."
+	af_sb_refine_max.custom_minimum_size = Vector2(90, 0)
+	hb_rf.add_child(af_sb_refine_max)
 	var hb_btn: HBoxContainer = HBoxContainer.new()
 	hb_btn.alignment = BoxContainer.ALIGNMENT_END as BoxContainer.AlignmentMode
 	vb.add_child(hb_btn)
@@ -3159,6 +3218,12 @@ func _on_autofinish_apply() -> void:
 	autofinish_apply_quantize = (af_cb_quantize != null and af_cb_quantize.button_pressed)
 	autofinish_use_mapgen = (af_cb_mapgen != null and af_cb_mapgen.button_pressed)
 	autofinish_two_lane = (af_cb_two_lane != null and af_cb_two_lane.button_pressed)
+
+	autofinish_refine_align_true = (af_cb_refine_align != null and af_cb_refine_align.button_pressed)
+	autofinish_refine_fill_gaps = (af_cb_refine_fill != null and af_cb_refine_fill.button_pressed)
+	autofinish_refine_complete_rolls = (af_cb_refine_rolls != null and af_cb_refine_rolls.button_pressed)
+	if af_sb_refine_max != null:
+		autofinish_refine_max_ms = int(round(af_sb_refine_max.value))
 
 	var include_beats: bool = (af_cb_beats != null and af_cb_beats.button_pressed)
 	var include_down: bool = (af_cb_downbeats != null and af_cb_downbeats.button_pressed)
@@ -5620,6 +5685,19 @@ func _load_analysis_json(p: String) -> void:
 	#   "beatmap_analyzer_v2" -- legacy, same array layout
 	# beats/downbeats are arrays of seconds; onsets are dicts in v3.
 	# ------------------------------------------------------------
+	# A cancelled or failed run still writes a well-formed file, complete with
+	# schema and empty arrays, so it loads as a perfectly valid "analysis" that
+	# simply has nothing in it -- and Analyze/AutoFinish then appear to do
+	# nothing for no visible reason. Treat it as no analysis and say why.
+	if analysis_data.has("ok") and not bool(analysis_data.get("ok", true)):
+		var why: String = String(analysis_data.get("error", "")).strip_edges()
+		if why == "":
+			why = "analysis did not complete"
+		analysis_data.clear()
+		info.text = "Analysis not usable: %s — re-run Analyze (F12)." % why.replace("\n", " ").substr(0, 120)
+		_update_analysis_popup_text()
+		return
+
 	var schema: String = String(analysis_data.get("schema", ""))
 	if _is_supported_schema(schema):
 		var beats_s: Variant = analysis_data.get("beats", [])
@@ -5676,7 +5754,7 @@ func _load_analysis_json(p: String) -> void:
 		# Adopt the detected tempo. Leaving the editor on its 150 default meant
 		# every analyzed chart saved a BPM that was simply wrong, and the value
 		# is written into the beatmap the game loads.
-		var det_bpm: float = float(analysis_data.get("bpm", 0.0))
+		var det_bpm: float = _json_num(analysis_data.get("bpm", null))
 		if det_bpm > 20.0 and det_bpm < 400.0:
 			bpm = det_bpm
 			if bpm_edit != null:
@@ -5783,6 +5861,17 @@ func _load_analysis_json(p: String) -> void:
 
 	_update_analysis_popup_text()
 
+## Safe number read for anything coming out of analysis JSON.
+## Dictionary.get(key, default) returns the STORED value when the key exists,
+## so a JSON null comes back as null and float(null) is a hard error in
+## GDScript -- the default never gets a chance to apply. The analyzer writes
+## null for bpm on a failed run and for beatnet.bpm when BeatNet is
+## unavailable, so every number read from it goes through here.
+func _json_num(v: Variant, def: float = 0.0) -> float:
+	if v is float or v is int:
+		return float(v)
+	return def
+
 func _is_supported_schema(s: String) -> bool:
 	return s == "beatmap_analyzer_v3" or s == "beatmap_analyzer_v2"
 
@@ -5864,12 +5953,397 @@ func _autofinish_add_event_from_candidate(
 	last_lane_t[lane] = t
 	return true
 
+# ============================================================
+# Refine mode helpers
+# ============================================================
+
+func _refine_class_of(e: Dictionary) -> String:
+	# capture_pass is authoritative because it is what the game routes on.
+	var cp: String = String(e.get("capture_pass", ""))
+	if cp == "beats":
+		return "beat"
+	if cp == "melody" or cp == "fx":
+		return "melody"
+	var rc: String = String(e.get("role_class", ""))
+	if rc == "beat" or rc == "melody":
+		return rc
+	return "melody" if int(e.get("lane", 0)) == 1 else "beat"
+
+func _refine_period() -> float:
+	var b: float = _json_num(analysis_data.get("bpm", null))
+	return 60.0 / b if b > 20.0 else 0.4
+
+func _refine_sorted_onsets(band: String) -> Array[float]:
+	var out: Array[float] = []
+	for o in analysis_onsets:
+		if String(o.get("band", "")) == band:
+			out.append(float(o.get("t_ms", 0)) / 1000.0)
+	out.sort()
+	return out
+
+func _refine_beat_grid() -> Array[float]:
+	var out: Array[float] = []
+	for ms in analysis_beats_ms:
+		out.append(float(ms) / 1000.0)
+	out.sort()
+	return out
+
+func _refine_eighth_grid() -> Array[float]:
+	# Melody sits on eighths in this game's charts, so a note with no mid onset
+	# nearby still has a sensible place to land.
+	var b: Array[float] = _refine_beat_grid()
+	var out: Array[float] = []
+	for i in range(b.size()):
+		out.append(b[i])
+		if i + 1 < b.size():
+			out.append((b[i] + b[i + 1]) * 0.5)
+	out.sort()
+	return out
+
+## Signed distance from t to the closest entry in a sorted list.
+## Returns INF when the list is empty so callers can test with is_inf().
+func _refine_signed_dev(sorted_t: Array[float], t: float) -> float:
+	var n: int = sorted_t.size()
+	if n == 0:
+		return INF
+	var lo: int = 0
+	var hi: int = n - 1
+	while lo < hi:
+		var mid: int = (lo + hi) / 2
+		if sorted_t[mid] < t:
+			lo = mid + 1
+		else:
+			hi = mid
+	var best: float = sorted_t[lo] - t
+	if lo > 0:
+		var alt: float = sorted_t[lo - 1] - t
+		if abs(alt) < abs(best):
+			best = alt
+	return best
+
+func _refine_median(vals: Array[float]) -> float:
+	if vals.is_empty():
+		return 0.0
+	var v: Array[float] = vals.duplicate()
+	v.sort()
+	var n: int = v.size()
+	if n % 2 == 1:
+		return v[n / 2]
+	return (v[n / 2 - 1] + v[n / 2]) * 0.5
+
+## Reads the existing chart, two bars at a time, and records what the author
+## did there. Everything the refine pass is allowed to change is gated on this:
+## a window the author left empty stays empty, and rolls are only completed
+## where the author already rolls.
+func _refine_windows() -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	var period: float = _refine_period()
+
+	# Window edges come from bars when the analysis has them, so a window is
+	# musically meaningful rather than an arbitrary slice of seconds.
+	var edges: Array[float] = []
+	if analysis_bars.size() >= 2:
+		for i in range(0, analysis_bars.size(), 2):
+			edges.append(float(analysis_bars[i].get("t", 0.0)))
+		var last_bar: Dictionary = analysis_bars[analysis_bars.size() - 1]
+		edges.append(float(last_bar.get("t_end", 0.0)))
+	else:
+		var span: float = period * 8.0
+		var end_t: float = 0.0
+		for e in events:
+			end_t = maxf(end_t, float(e.get("t", 0.0)))
+		var t: float = 0.0
+		while t <= end_t + span:
+			edges.append(t)
+			t += span
+
+	for i in range(edges.size() - 1):
+		out.append({
+			"t0": edges[i],
+			"t1": edges[i + 1],
+			"beat_t": [] as Array[float],
+			"melody_t": [] as Array[float],
+			"has_rolls": false,
+			"beat_gap": period,
+			"melody_gap": period * 0.5,
+			"added": 0,
+			"cap": 0,
+		})
+	if out.is_empty():
+		return out
+
+	# Bucket the existing notes.
+	for e in events:
+		var t: float = float(e.get("t", 0.0))
+		var wi: int = _refine_window_index(out, t)
+		if wi < 0:
+			continue
+		if _refine_class_of(e) == "beat":
+			(out[wi]["beat_t"] as Array[float]).append(t)
+		else:
+			(out[wi]["melody_t"] as Array[float]).append(t)
+
+	for w in out:
+		var bt: Array[float] = w["beat_t"]
+		var mt: Array[float] = w["melody_t"]
+		bt.sort()
+		mt.sort()
+
+		# A window already using sub-beat spacing on the beat lane is one where
+		# the author plays rolls; that is the only place we may complete them.
+		var gaps_b: Array[float] = []
+		for i in range(1, bt.size()):
+			var g: float = bt[i] - bt[i - 1]
+			gaps_b.append(g)
+			if g < period * 0.72:
+				w["has_rolls"] = true
+		var gaps_m: Array[float] = []
+		for i in range(1, mt.size()):
+			gaps_m.append(mt[i] - mt[i - 1])
+
+		w["beat_gap"] = _refine_median(gaps_b) if not gaps_b.is_empty() else period
+		w["melody_gap"] = _refine_median(gaps_m) if not gaps_m.is_empty() else period * 0.5
+
+		# A refine pass is meant to correct, not to re-chart. No window may grow
+		# by more than a fifth of what the author already put there.
+		w["cap"] = int(ceil(float(bt.size() + mt.size()) * 0.20))
+
+	return out
+
+func _refine_window_index(wins: Array[Dictionary], t: float) -> int:
+	var lo: int = 0
+	var hi: int = wins.size() - 1
+	if hi < 0 or t < float(wins[0]["t0"]):
+		return -1
+	while lo < hi:
+		var mid: int = (lo + hi + 1) / 2
+		if float(wins[mid]["t0"]) <= t:
+			lo = mid
+		else:
+			hi = mid - 1
+	return lo
+
+## Refine an existing chart instead of appending a second one on top of it.
+## Runs when AutoFinish is applied with "Clear existing events first" unchecked
+## and the chart already has notes.
+func _autofinish_refine() -> void:
+	var period: float = _refine_period()
+	if period <= 0.0:
+		info.text = "Refine: analysis has no usable tempo."
+		return
+
+	var kick_on: Array[float] = _refine_sorted_onsets("kick")
+	var mid_on: Array[float] = _refine_sorted_onsets("mid")
+	var beat_grid: Array[float] = _refine_beat_grid()
+	var eighth_grid: Array[float] = _refine_eighth_grid()
+	if kick_on.is_empty() and beat_grid.is_empty():
+		info.text = "Refine: analysis has no beats or onsets to align to."
+		return
+
+	_begin_action("AutoFinish (refine)")
+
+	# ------------------------------------------------------------------
+	# Stage 1 - strip the chart's systematic latency.
+	#
+	# Hand-tapped charts carry a constant offset (this one sat ~100 ms ahead of
+	# the kick). That is wider than a safe per-note snap window, so correcting
+	# it note by note would let each note reach past its own transient and grab
+	# a neighbouring roll hit. Measuring it once and shifting everything
+	# together cannot mis-assign anything, and it leaves only jitter behind.
+	# ------------------------------------------------------------------
+	# Measured against the BEAT GRID, not the onset pool. Onsets run about
+	# 4-5 per second, so whatever the offset is there is always one nearby and
+	# the systematic error averages away to nothing. The grid is sparse and
+	# perfectly regular, so a constant lead or lag shows up in it cleanly.
+	# Only beat-lane notes vote: the latency is a property of the capture, so
+	# one clean estimate beats mixing in the denser melody lane.
+	var devs: Array[float] = []
+	var wide: float = period * 0.35
+	for e in events:
+		if _refine_class_of(e) != "beat":
+			continue
+		var d: float = _refine_signed_dev(beat_grid, float(e.get("t", 0.0)))
+		if not is_inf(d) and absf(d) <= wide:
+			devs.append(d)
+
+	var global_shift: float = 0.0
+	if autofinish_refine_align_true and devs.size() >= 8:
+		global_shift = _refine_median(devs)
+		if absf(global_shift) > 0.004:
+			for e in events:
+				e["t"] = maxf(0.0, float(e.get("t", 0.0)) + global_shift)
+		else:
+			global_shift = 0.0
+
+	# ------------------------------------------------------------------
+	# Stage 2 - snap out the residual jitter, one note at a time.
+	# A real transient is preferred; the grid is the fallback. Anything further
+	# away than the correction window is a deliberate placement, not an error,
+	# so it is left exactly where the author put it.
+	# ------------------------------------------------------------------
+	var max_corr: float = float(autofinish_refine_max_ms) / 1000.0
+	var moved: int = 0
+	var move_sizes: Array[float] = []
+	for e in events:
+		var rc2: String = _refine_class_of(e)
+		var t2: float = float(e.get("t", 0.0))
+		var d2: float = _refine_signed_dev(kick_on if rc2 == "beat" else mid_on, t2)
+		if is_inf(d2) or absf(d2) > max_corr:
+			var dg: float = _refine_signed_dev(beat_grid if rc2 == "beat" else eighth_grid, t2)
+			if not is_inf(dg) and absf(dg) <= max_corr:
+				d2 = dg
+			else:
+				continue
+		if absf(d2) < 0.0005:
+			continue
+		e["t"] = maxf(0.0, t2 + d2)
+		move_sizes.append(absf(d2))
+		moved += 1
+
+	events.sort_custom(Callable(self, "_sort_autofinish_candidate"))
+
+	# ------------------------------------------------------------------
+	# Stage 3 - fill genuine holes, using the author's own density as the cap.
+	# A candidate only lands if the window is one the author actually charted,
+	# nothing of theirs is already there, and it sits in a gap noticeably wider
+	# than their own spacing in that window. Windows left deliberately empty
+	# stay empty.
+	# ------------------------------------------------------------------
+	var wins: Array[Dictionary] = _refine_windows()
+	var merge_w: float = maxf(0.045, float(autofinish_lane_min_sep_ms) / 1000.0 * 0.8)
+	var added: int = 0
+
+	if autofinish_refine_fill_gaps and not analysis_map_notes.is_empty() and not wins.is_empty():
+		for n in analysis_map_notes:
+			var t3: float = float(n.get("t", 0.0)) 
+			var rc3: String = String(n.get("role_class", ""))
+			if rc3 == "":
+				rc3 = _role_class_fallback(String(n.get("basis", "")), String(n.get("band", "")))
+			var wi: int = _refine_window_index(wins, t3)
+			if wi < 0:
+				continue
+			var w: Dictionary = wins[wi]
+			var existing: Array[float] = w["beat_t"] if rc3 == "beat" else w["melody_t"]
+			if existing.is_empty():
+				continue  # the author left this window silent on purpose
+			var typical: float = float(w["beat_gap"] if rc3 == "beat" else w["melody_gap"])
+			var dv: float = _refine_signed_dev(existing, t3)
+			if is_inf(dv) or absf(dv) < merge_w:
+				continue  # already covered
+			if absf(dv) < typical * 1.15:
+				continue  # not a hole -- just normal spacing for this window
+			if int(w["added"]) >= int(w["cap"]):
+				continue
+			if _refine_add_note(t3, rc3, n, existing):
+				w["added"] = int(w["added"]) + 1
+				added += 1
+
+	# ------------------------------------------------------------------
+	# Stage 4 - complete rolls, but only where the author already rolls.
+	# The analyzer knows which bars are gated; the chart decides whether a roll
+	# belongs there at all. That keeps double and triple kicks out of sections
+	# the author deliberately kept simple.
+	# ------------------------------------------------------------------
+	var rolls_added: int = 0
+	if autofinish_refine_complete_rolls and not wins.is_empty():
+		for bar in analysis_bars:
+			var tags: Array = bar.get("tags", []) as Array
+			if not (tags.has("gated_kick") or tags.has("kick_roll")):
+				continue
+			var b0: float = float(bar.get("t", 0.0))
+			var b1: float = float(bar.get("t_end", b0 + period * 4.0))
+			var wi2: int = _refine_window_index(wins, b0)
+			if wi2 < 0 or not bool(wins[wi2]["has_rolls"]):
+				continue
+			var bt2: Array[float] = wins[wi2]["beat_t"]
+			if bt2.is_empty():
+				continue
+			for i in range(beat_grid.size()):
+				var g0: float = beat_grid[i]
+				if g0 < b0 or g0 >= b1 or i + 1 >= beat_grid.size():
+					continue
+				var g1: float = beat_grid[i + 1]
+
+				# Only COMPLETE a roll the author already started in this very
+				# beat. Unlocking rolls for a whole two-bar window let one hit
+				# spawn a run of invented doubles everywhere else in it.
+				var off_beat_here: int = 0
+				for bt_t in bt2:
+					if bt_t > g0 + period * 0.08 and bt_t < g1 - period * 0.08:
+						off_beat_here += 1
+				if off_beat_here < 1:
+					continue
+				if int(wins[wi2]["added"]) >= int(wins[wi2]["cap"]):
+					continue
+
+				# Match the subdivision the author is already using here.
+				var d: int = 4 if off_beat_here >= 2 else 2
+				var step: float = (g1 - g0) / float(d)
+				for k in range(1, d):
+					var st: float = g0 + step * float(k)
+					# only where a real kick transient backs it up
+					var dk: float = _refine_signed_dev(kick_on, st)
+					if is_inf(dk) or absf(dk) > period * 0.10:
+						continue
+					var dex: float = _refine_signed_dev(bt2, st)
+					if is_inf(dex) or absf(dex) < merge_w:
+						continue
+					if int(wins[wi2]["added"]) >= int(wins[wi2]["cap"]):
+						break
+					if _refine_add_note(st + dk, "beat", {"basis": "gated_kick", "band": "kick", "div": d}, bt2):
+						wins[wi2]["added"] = int(wins[wi2]["added"]) + 1
+						rolls_added += 1
+
+	_events_dirty = true
+	_commit_action()
+
+	var med_move: float = _refine_median(move_sizes) * 1000.0
+	print("[RefineDBG] shift=%.1fms moved=%d (median %.0fms) filled=%d rolls=%d total=%d"
+		% [global_shift * 1000.0, moved, med_move, added, rolls_added, events.size()])
+	info.text = "Refine: latency %+.0fms removed | moved %d (med %.0fms) | filled %d | rolls +%d | %d notes" % [
+		-global_shift * 1000.0, moved, med_move, added, rolls_added, events.size()
+	]
+	queue_redraw()
+
+## Inserts one refined note and keeps the window's bookkeeping in step, so
+## later candidates see it and don't stack on top of it.
+func _refine_add_note(t: float, rc: String, meta: Dictionary, window_list: Array[float]) -> bool:
+	if t < 0.0:
+		return false
+	var lane: int = int(ROLE_CLASS_LANE.get(rc, 0))
+	lane = clampi(lane, 0, lane_count - 1)
+
+	var e: Dictionary = _make_event(lane, t, "lane", 0.10)
+	e["category"] = "generic"
+	e["role"] = "generic"
+	e["src"] = "refine"
+	e["role_class"] = rc
+	e["capture_pass"] = ROLE_CLASS_PASS.get(rc, "beats")
+	e["basis"] = String(meta.get("basis", "kick"))
+	e["band"] = String(meta.get("band", "kick"))
+	e["div"] = int(meta.get("div", 1))
+	if meta.has("section"):
+		e["section"] = String(meta.get("section", ""))
+	if meta.has("intensity"):
+		e["intensity"] = float(meta.get("intensity", 0.5))
+
+	events.append(e)
+	window_list.append(t)
+	window_list.sort()
+	return true
+
 func _autofinish(clear_first: bool) -> void:
 	if analysis_data.is_empty():
 		info.text = "AutoFinish: load analysis first (F12)."
 		return
 	if song_player.stream == null:
 		info.text = "AutoFinish: load a song first."
+		return
+
+	# With "clear" unchecked on a chart that already has notes, the useful job
+	# is correcting what is there -- not stacking a second chart on top of it.
+	if not clear_first and not events.is_empty():
+		_autofinish_refine()
 		return
 
 	var mode_label: String = "replace" if clear_first else "append"
@@ -5891,7 +6365,7 @@ func _autofinish(clear_first: bool) -> void:
 			return
 
 		var min_sep_s: float = float(autofinish_lane_min_sep_ms) / 1000.0
-		var corr_s: float = float(analysis_data.get("offset_correction_s", 0.0))
+		var corr_s: float = _json_num(analysis_data.get("offset_correction_s", null))
 		var snap_ms: int = 18
 
 		var used_lane_ms: Dictionary = {}
@@ -7156,14 +7630,14 @@ func _update_analysis_popup_text() -> void:
 			analysis_label.append_text("%s %s\n" % [String(app.get("name", "Beatmap Analyzer")), String(app.get("version", ""))])
 		analysis_label.append_text("schema: %s\n" % schema)
 
-		analysis_label.append_text("bpm: %.3f\n" % float(analysis_data.get("bpm", 0.0)))
-		analysis_label.append_text("offset_correction_s: %.4f\n" % float(analysis_data.get("offset_correction_s", 0.0)))
+		analysis_label.append_text("bpm: %.3f\n" % _json_num(analysis_data.get("bpm", null)))
+		analysis_label.append_text("offset_correction_s: %.4f\n" % _json_num(analysis_data.get("offset_correction_s", null)))
 
 		var backend: String = String(analysis_data.get("backend", ""))
 		if backend != "":
 			analysis_label.append_text("backend: %s\n" % backend)
 
-		var elapsed: float = float(analysis_data.get("elapsed_s", 0.0))
+		var elapsed: float = _json_num(analysis_data.get("elapsed_s", null))
 		if elapsed > 0.0:
 			analysis_label.append_text("elapsed_s: %.2f\n" % elapsed)
 
@@ -7183,7 +7657,7 @@ func _update_analysis_popup_text() -> void:
 				var win: Array = au.get("bpm_window", []) as Array
 				if win.size() == 2:
 					analysis_label.append_text("[color=lightgreen]auto settings:[/color] tempo window %.1f-%.1f BPM, snap %.1f ms\n" % [
-						float(win[0]), float(win[1]), float(au.get("snap_window_ms", 0.0))])
+						_json_num(win[0]), _json_num(win[1]), _json_num(au.get("snap_window_ms", null))])
 				var bd: Dictionary = au.get("band_deltas", {}) as Dictionary
 				if not bd.is_empty():
 					var bp: Array[String] = []
@@ -7196,13 +7670,13 @@ func _update_analysis_popup_text() -> void:
 			var tp: Dictionary = ex.get("tempo", {}) as Dictionary
 			if not tp.is_empty():
 				analysis_label.append_text("tempo lock: %.4f BPM via %s (strength %.4f)\n" % [
-					float(tp.get("bpm", 0.0)), String(tp.get("source", "?")), float(tp.get("strength", 0.0))])
+					_json_num(tp.get("bpm", null)), String(tp.get("source", "?")), _json_num(tp.get("strength", null))])
 
 			var bnn: Dictionary = ex.get("beatnet", {}) as Dictionary
 			if not bnn.is_empty():
 				if bool(bnn.get("ok", false)):
 					analysis_label.append_text("BeatNet: ok, %d beats, seed %.2f BPM\n" % [
-						int(bnn.get("beats", 0)), float(bnn.get("bpm", 0.0))])
+						int(bnn.get("beats", 0)), _json_num(bnn.get("bpm", null))])
 				else:
 					analysis_label.append_text("[color=khaki]BeatNet: unavailable (librosa-only grid)[/color]\n")
 
@@ -7210,7 +7684,7 @@ func _update_analysis_popup_text() -> void:
 			if not gr.is_empty():
 				analysis_label.append_text("grid: tightness %s, snapped %s, score %.3f\n" % [
 					str(gr.get("chosen_tightness", 0)), str(gr.get("chosen_snapped", false)),
-					float(gr.get("chosen_score", 0.0))])
+					_json_num(gr.get("chosen_score", null))])
 
 			var roles: Dictionary = ex.get("onset_roles", {}) as Dictionary
 			if not roles.is_empty():
@@ -7226,7 +7700,7 @@ func _update_analysis_popup_text() -> void:
 					sp.append("%s %d" % [String(k2), int(secs[k2])])
 				analysis_label.append_text("sections: %s\n" % ", ".join(sp))
 
-			analysis_label.append_text("frame resolution: %.2f ms\n" % float(ex.get("resolution_ms", 0.0)))
+			analysis_label.append_text("frame resolution: %.2f ms\n" % _json_num(ex.get("resolution_ms", null)))
 
 		if analysis_bars.size() > 0:
 			analysis_label.append_text("bars: %d | map_notes: %d\n" % [analysis_bars.size(), analysis_map_notes.size()])
