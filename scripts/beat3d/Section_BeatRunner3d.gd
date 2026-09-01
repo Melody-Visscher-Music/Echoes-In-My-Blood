@@ -107,7 +107,7 @@ var _gates_missed: int = 0   # total notes missed
 # Starts at 25 %. This used to have three different answers: the declaration
 # said 0.50, _create_hud() overwrote it with 0.25 at runtime, and the HP readout
 # was built with a hardcoded "50%" placeholder string.
-var _health_pct: float = 0.25   # 0.0 – 1.0
+var _health_pct: float = 0.50   # 0.0 – 1.0
 
 # ── HUD ─────────────────────────────────────────────────────────────────────────
 # The gameplay HUD lives in scripts/ui/GameHud.gd — it used to be ~300 lines of
@@ -1212,7 +1212,7 @@ func _load_chart_and_build_plan() -> void:
 	# tempos. 32nd-note ornaments (beat_s/8) still get thinned some — that's
 	# ~20 hits/sec, past what's meant to be individually tapped anyway.
 	var _raw_beat_s: float = _estimate_runner_avg_beat_s(gameplay_events)
-	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.55)
+	var _min_gap_s:  float = maxf(0.06, _raw_beat_s * 0.48)
 	gameplay_events = _thin_beats(gameplay_events, _min_gap_s)
 
 	_runner_avg_beat_s = _estimate_runner_avg_beat_s(gameplay_events)
@@ -7053,7 +7053,7 @@ func _on_gate_scored(success: bool) -> void:
 		_gates_hit += 1
 		var _base_gate_pts: int = 1000 if _is_electric_at(_song_time()) else 500
 		_score += _base_gate_pts * _score_multiplier()
-		_health_pct = clamp(_health_pct + 0.01, 0.0, 1.0)
+		_health_pct = clamp(_health_pct + 0.02, 0.0, 1.0)
 		_world_vitality = clamp(_world_vitality + 0.07, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
