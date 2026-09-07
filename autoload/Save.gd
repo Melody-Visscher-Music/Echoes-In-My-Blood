@@ -77,3 +77,63 @@ func save_high_score(song_key: String, score: int, combo: int) -> bool:
 	cfg.set_value(song_key, "combo", maxi(combo, prev_combo))
 	cfg.save(_HS_PATH)
 	return new_record
+
+# ── Story mode progress ──────────────────────────────────────────────────────
+## Which story-map nodes have been cleared. That single list is the whole
+## unlock state of the Story Mode map: StoryMapData turns it into which rifts
+## are visible and which routes are drawn, so nothing else has to be persisted.
+##
+## Kept in its own file rather than in the save slot because it is progress, not
+## a loadout — and because the slot only ever round-trips core_upgrades today.
+## Freeplay does not read this, and this does not read Freeplay's high scores;
+## the two modes stay independent.
+const _STORY_PATH: String = "user://story_progress.cfg"
+
+## Cleared story node ids. Order is the order they were cleared in.
+func get_story_cleared() -> PackedStringArray:
+	var cfg := ConfigFile.new()
+	if cfg.load(_STORY_PATH) != OK:
+		return PackedStringArray()
+	var raw: Array = cfg.get_value("story", "cleared", [])
+	var out := PackedStringArray()
+	for id in raw:
+		out.append(String(id))
+	return out
+
+func is_story_cleared(node_id: String) -> bool:
+	return node_id in get_story_cleared()
+
+## Records a story node as cleared. Returns true only if this was NEW — the map
+## uses that to decide whether a reveal should play, so a re-clear stays quiet.
+func mark_story_cleared(node_id: String) -> bool:
+	if node_id.strip_edges() == "":
+		return false
+	var cfg := ConfigFile.new()
+	cfg.load(_STORY_PATH)   # ignore error — file may not exist yet
+	var cleared: Array = cfg.get_value("story", "cleared", [])
+	if node_id in cleared:
+		return false
+	cleared.append(node_id)
+	cfg.set_value("story", "cleared", cleared)
+	cfg.save(_STORY_PATH)
+	return true
+
+## The map node Meeko is standing on, or "" for "start at the hub". Saved so
+## coming back from a level puts him where he played it rather than walking him
+## back to the middle of the city every time.
+func get_story_position() -> String:
+	var cfg := ConfigFile.new()
+	if cfg.load(_STORY_PATH) != OK:
+		return ""
+	return String(cfg.get_value("story", "position", ""))
+
+func set_story_position(node_id: String) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(_STORY_PATH)   # ignore error — file may not exist yet
+	cfg.set_value("story", "position", node_id)
+	cfg.save(_STORY_PATH)
+
+## Wipes story progress, putting the map back to its opening state (dev tool).
+func clear_story_progress() -> void:
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(_STORY_PATH))
+	print("[Save] Story progress cleared.")

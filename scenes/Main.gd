@@ -13,10 +13,12 @@ var _menu_box: VBoxContainer
 # {"action": String, "device": "key"|"joy", "btn": Button}
 var _awaiting_bind: Dictionary = {}
 
-# Hidden dev entry point into the chart-authoring tool — Ctrl+Alt+D reveals
-# a MAPPER button in the main menu (session-only; doesn't persist).
+# Hidden dev entry points — Ctrl+Alt+D reveals a MAPPER button (chart-authoring
+# tool) and a STORY MAP button (the story level-select prototype) in the main
+# menu (session-only; doesn't persist).
 var _dev_unlocked: bool = false
 var _mapper_btn: Button = null
+var _story_map_btn: Button = null
 
 # Where keyboard/gamepad focus should go when a panel closes. Pushed on the way
 # in, popped on the way out — hiding a Control silently drops the focus owner,
@@ -33,6 +35,11 @@ var _confirm_panel: Control = null
 func _ready() -> void:
 	Save.load_from_disk(0)
 	GameConfig.load_from_disk()
+	# Reaching the main menu ends any story run that was in progress. Without
+	# this, quitting a story level to the menu and then starting a Freeplay song
+	# would leave the story context set, and that song's exit would send the
+	# player to the story map instead of back to the song list.
+	Run.end_story_context()
 	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_build_ui()
 
@@ -1093,9 +1100,14 @@ func _on_options() -> void:
 func _on_quit() -> void:
 	get_tree().quit()
 
-## Ctrl+Alt+D — reveals (or re-hides) the MAPPER entry in the main menu.
-## Session-only; doesn't persist to disk. Only affects visibility of the
-## button itself, nothing else in the menu.
+## Ctrl+Alt+D — reveals (or re-hides) the dev entries in the main menu: the
+## chart-authoring MAPPER, and the Story Mode map prototype. Session-only;
+## doesn't persist to disk. Only affects visibility of the buttons themselves,
+## nothing else in the menu.
+##
+## The story map lives here rather than on PLAY > NEW GAME on purpose: NEW GAME
+## and CONTINUE stay disabled until story mode actually exists, and this is a
+## prototype of the level-select screen, not a way into a story run.
 func _toggle_dev_mapper_entry() -> void:
 	_dev_unlocked = not _dev_unlocked
 	if _dev_unlocked:
@@ -1104,14 +1116,24 @@ func _toggle_dev_mapper_entry() -> void:
 			_mapper_btn = _menu_btn("MAPPER", _on_open_mapper, s)
 			_menu_box.add_child(_mapper_btn)
 			_menu_box.move_child(_mapper_btn, _menu_box.get_child_count() - 2)   # just above QUIT
+			_story_map_btn = _menu_btn("STORY MAP (WIP)", _on_open_story_map, s)
+			_menu_box.add_child(_story_map_btn)
+			_menu_box.move_child(_story_map_btn, _menu_box.get_child_count() - 2)
 			_rewrap_menu()
-	elif _mapper_btn != null:
-		_mapper_btn.queue_free()
-		_mapper_btn = null
+	else:
+		if _mapper_btn != null:
+			_mapper_btn.queue_free()
+			_mapper_btn = null
+		if _story_map_btn != null:
+			_story_map_btn.queue_free()
+			_story_map_btn = null
 		_rewrap_menu.call_deferred()   # after queue_free actually removes it
 
 func _on_open_mapper() -> void:
 	get_tree().change_scene_to_file("res://tools/ManualMapper.tscn")
+
+func _on_open_story_map() -> void:
+	get_tree().change_scene_to_file("res://scenes/story/StoryMap.tscn")
 
 func _on_save_back() -> void:
 	Save.save_to_disk(0)

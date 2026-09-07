@@ -30,6 +30,53 @@ var shards = 0
 var current_song_key: String = "stuck_in_a_game"
 var song_lives: int = 3        # lives remaining for the current song attempt (per-song, not meta)
 
+# ── Story Mode context ───────────────────────────────────────────────────────
+## The story-map node whose level is currently loaded, or "" when the level was
+## started from Freeplay. StoryMap sets it on the way in and clears it on the
+## way back, so it is non-empty only while a story level is actually running.
+##
+## The level itself never learns what a story node IS — it only asks the three
+## helpers below. That is what keeps Section_BeatRunner3d identical for both
+## modes: Freeplay is simply "the story context is empty".
+var story_node_id: String = ""
+
+## Set when a story level is played to the end, and consumed by the map on the
+## way back so it plays the reveal instead of just showing the newly opened rift
+## already sitting there. Separate from the saved cleared-list on purpose: "is
+## cleared" and "was JUST cleared" are different questions and only the second
+## one should trigger a cutscene.
+var story_just_cleared: String = ""
+
+func in_story_mode() -> bool:
+	return story_node_id != ""
+
+## Where backing out of a level goes. Freeplay came from the song list, a story
+## run came from the map, and each should return where it came from.
+func level_exit_scene() -> String:
+	return "res://scenes/story/StoryMap.tscn" if in_story_mode() else "res://scenes/SongSelect.tscn"
+
+## The name for that destination. It lives next to the path deliberately — the
+## death, pause and results screens each label this exit themselves, and a label
+## that disagrees with where the button actually goes is worse than either.
+## Each screen keeps its own icon; only the words come from here.
+func level_exit_name() -> String:
+	return "STORY MAP" if in_story_mode() else "SONG SELECT"
+
+## Called by the runner when a song is played to the end. No-op in Freeplay, so
+## the call site does not need to branch.
+func on_story_level_cleared() -> void:
+	if story_node_id == "":
+		return
+	Save.mark_story_cleared(story_node_id)
+	Save.set_story_position(story_node_id)
+	story_just_cleared = story_node_id
+
+## Drops the story context, so a level started later from Freeplay is not
+## mistaken for a story run.
+func end_story_context() -> void:
+	story_node_id = ""
+	story_just_cleared = ""
+
 func start_new_run(seed_value, chosen_class):
 	run_seed = seed_value
 	level_index = 0

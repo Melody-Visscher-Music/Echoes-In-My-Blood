@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://c15ui8eut1xgp"]
+
+[ext_resource type="Script" uid="uid://c38jtkionulvd" path="res://scripts/story/StoryMap.gd" id="1_storymap"]
+
+[node name="StoryMap" type="Node3D" unique_id=655219682]
+script = ExtResource("1_storymap")

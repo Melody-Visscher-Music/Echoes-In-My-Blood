@@ -7235,7 +7235,7 @@ func _trigger_death() -> void:
 
 	var opt_texts: Array[String] = [
 		"▶  PLAY NEW SEED" if lives_exhausted else "▶  RETRY",
-		"↩  SONG SELECT",
+		"↩  %s" % Run.level_exit_name(),
 		"⌂  MAIN MENU",
 	]
 	_death_option_nodes.clear()
@@ -7292,10 +7292,10 @@ func _death_confirm() -> void:
 	match _death_menu_option:
 		0:  # RETRY / PLAY NEW SEED — Run.run_seed already holds the correct seed
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
-		1:  # SONG SELECT — reset so the next song picked starts completely fresh
+		1:  # SONG SELECT / STORY MAP — reset so the next song picked starts fresh
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
-			get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+			get_tree().change_scene_to_file(Run.level_exit_scene())
 		2:  # MAIN MENU — same reset; matches what the pause menu already does
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
@@ -7335,7 +7335,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			_end_confirm()
 		elif event.is_action("ui_cancel"):
 			get_viewport().set_input_as_handled()
-			_end_screen_sel = 1   # Esc backs out to song select
+			_end_screen_sel = 1   # Esc backs out the way the level was entered
 			_end_confirm()
 		return
 
@@ -8228,7 +8228,12 @@ func _pause_game() -> void:
 		# RESTART costs a life, so it wears the warning accent rather than the
 		# signature one - the cost should be visible before it is confirmed.
 		var accent: Color = Color(1.00, 0.52, 0.16) if i == 1 else UiStyle.PINK
-		var btn := PlateButton.create(_PAUSE_OPTIONS[i], Callable(), int(19 * s), accent)
+		# Entry 3 is the "back to where this level was started from" exit, so its
+		# wording follows the run: the song list in Freeplay, the map in a story run.
+		var opt_text: String = _PAUSE_OPTIONS[i]
+		if i == 3:
+			opt_text = "⏹  %s" % Run.level_exit_name()
+		var btn := PlateButton.create(opt_text, Callable(), int(19 * s), accent)
 		btn.name = "PauseOpt%d" % i
 		# Selection is driven by _pause_option, not by Godot focus - otherwise
 		# ui_up/ui_down would move both and the highlight would skip entries.
@@ -8311,11 +8316,11 @@ func _pause_confirm() -> void:
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file("res://scenes/Main.tscn")
-		3:  # Song Select
+		3:  # Song Select / Story Map
 			_resume_game()
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
-			get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+			get_tree().change_scene_to_file(Run.level_exit_scene())
 		4:  # Calibrate Audio — overlay calibrator on top of paused game
 			_launch_audio_calibrator()
 
@@ -9292,6 +9297,8 @@ func _on_music_finished() -> void:
 
 	# Reset song lives for next attempt (they earned a clean slate by clearing)
 	Run.song_lives = GameConfig.lives_per_song
+	# Story Mode: this is the clear the map's reveal hangs off. No-op in Freeplay.
+	Run.on_story_level_cleared()
 	_sync_hud_lives()
 
 	# Results panel slides in after the CLEAR! animation settles
@@ -9750,7 +9757,7 @@ func _spawn_results_panel() -> void:
 	vbox.add_child(nav_row)
 
 	_end_nav_labels.clear()
-	for txt in ["\u25b6  PLAY AGAIN", "\u21a9  SONG SELECT", "\u2302  MAIN MENU"]:
+	for txt in ["\u25b6  PLAY AGAIN", "\u21a9  %s" % Run.level_exit_name(), "\u2302  MAIN MENU"]:
 		var btn := PlateButton.create(txt, Callable(), int(16 * s), UiStyle.PINK)
 		btn.focus_mode = Control.FOCUS_NONE   # selection is driven by _end_screen_sel
 		btn.custom_minimum_size = Vector2(230 * s, 50 * s)
@@ -9808,10 +9815,10 @@ func _end_confirm() -> void:
 	match _end_screen_sel:
 		0:  # Play Again — relaunch with the same song key and mode
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
-		1:  # Song Select
+		1:  # Song Select / Story Map
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
-			get_tree().change_scene_to_file("res://scenes/SongSelect.tscn")
+			get_tree().change_scene_to_file(Run.level_exit_scene())
 		2:  # Main Menu
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
