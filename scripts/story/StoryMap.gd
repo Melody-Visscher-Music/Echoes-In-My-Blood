@@ -11,8 +11,13 @@ class_name StoryMap
 ##   * only UNLOCKED rifts exist on the map — locked ones are not drawn at all,
 ##     not greyed out;
 ##   * clicking (or selecting and confirming) a rift makes Meeko walk himself
-##     there along the graph — the player never drives him directly;
-##   * clearing a level reveals the next rift and lights its route up.
+##     there through the streets — the player never drives him directly;
+##   * clearing a level reveals the next rift.
+##
+## There are no drawn routes between rifts. There used to be, following the
+## unlock tree, back when travel followed that tree too. Travel takes the
+## shortest way through the streets now, so a drawn trail showed a road Meeko
+## did not use — worse than no line at all.
 ##
 ## Freeplay is untouched by all of this: scripts/SongSelect.gd is still the flat
 ## song list and still the only thing the FREEPLAY menu entry reaches. This is a
@@ -32,6 +37,9 @@ const MAIN_SCENE: String = "res://scenes/Main.tscn"
 ## level and a Freeplay run of the same chart are the same level — the only
 ## difference is the story context Run carries in with it.
 const LEVEL_SCENE: String = "res://scenes/GameScene.tscn"
+## The hand-editable city. Present = the map instances it; absent = the map
+## generates one and Ctrl+Alt+B can bake it here.
+const BAKED_CITY: String = "res://scenes/story/CalderCity.tscn"
 
 ## Camera stays at map distance at all times — it never approaches the ground,
 ## which is why the city is built for silhouette rather than detail.
@@ -48,10 +56,15 @@ var _data: StoryMapData = null
 var _cleared: PackedStringArray = PackedStringArray()
 
 var _rifts: Dictionary = {}            # node id -> StoryRift
-var _links: Dictionary = {}            # "from>to"  -> StoryPathLink
 var _walker: StoryWalker = null
 var _camera: Camera3D = null
 var _cam_focus: Vector3 = Vector3.ZERO
+## True when the city came from BAKED_CITY rather than from the generator.
+var _city_is_baked: bool = false
+## Dev override: show every rift whatever the save says. A VIEW toggle, not a
+## save edit — nothing is written, so turning it off puts the map straight back
+## to real progress, and rifts stay un-closed so their art can be looked at.
+var _reveal_all: bool = false
 
 ## Where Meeko is standing (a node id, or the hub id). Only ever changed by the
 ## walker arriving, so it cannot drift out of sync with what is on screen.
@@ -94,13 +107,15 @@ func _ready() -> void:
 	_selected = ""   # so the first _set_selected() below actually applies
 
 	_build_environment()
-	_build_city()
-	_build_hub_marker()
-	_build_links()
+	_build_world()
 	_build_rifts()
 	_build_walker()
 	_build_camera()
 	_build_hud()
+
+	# Shelters need the world in the tree (for global transforms) and the walker
+	# placed, so this is the first point both are true.
+	_collect_shelters(self)
 
 	# No animation on this pass: the map opens showing the city the player has
 	# already opened up, it does not replay every past reveal.
@@ -154,9 +169,18 @@ func _build_environment() -> void:
 	env.sky = sky
 
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	env.ambient_light_energy = 1.15
+	env.ambient_light_energy = 1.05
 	env.tonemap_mode = Environment.TONE_MAPPER_ACES
 	env.tonemap_exposure = 1.0
+
+	# Contact shading. From map height the city is read almost entirely through
+	# where one box meets another, and without occlusion in the gaps a block of
+	# buildings flattens into a single grey mass.
+	env.ssao_enabled = true
+	env.ssao_radius = 3.0
+	env.ssao_intensity = 1.6
+	env.ssao_power = 1.4
+	env.ssao_detail = 0.4
 
 	# Just enough glow that the rift emissives bleed; the city sits well under
 	# the threshold and stays flat.
@@ -175,94 +199,231 @@ func _build_environment() -> void:
 	add_child(world_env)
 
 	var sun := DirectionalLight3D.new()
-	sun.light_color  = Color(0.98, 0.94, 0.88)
-	sun.light_energy = 1.7
-	sun.rotation_degrees = Vector3(-46.0, 38.0, 0.0)
+	sun.name = "Sun"
+	sun.light_color  = Color(1.00, 0.96, 0.90)
+	sun.light_energy = 1.85
+	# Low and off-axis, so every building throws a long shadow across the street
+	# beside it. Those shadows are what give the grid depth from directly above.
+	sun.rotation_degrees = Vector3(-38.0, 34.0, 0.0)
 	sun.shadow_enabled = true
-	sun.directional_shadow_max_distance = 320.0
+	sun.shadow_bias = 0.03
+	sun.shadow_normal_bias = 1.2
+	sun.directional_shadow_mode = DirectionalLight3D.SHADOW_PARALLEL_4_SPLITS
+	sun.directional_shadow_max_distance = 420.0
+	sun.directional_shadow_split_1 = 0.06
+	sun.directional_shadow_split_2 = 0.16
+	sun.directional_shadow_split_3 = 0.42
 	add_child(sun)
 
+	# A cool fill from the opposite side, unshadowed. Pure sun-plus-ambient left
+	# every north face the same flat value; this separates the faces so massing
+	# reads without lifting the whole city.
+	var fill := DirectionalLight3D.new()
+	fill.name = "SkyFill"
+	fill.light_color  = Color(0.72, 0.78, 0.94)
+	fill.light_energy = 0.45
+	fill.rotation_degrees = Vector3(-24.0, -142.0, 0.0)
+	fill.shadow_enabled = false
+	add_child(fill)
 
-func _build_city() -> void:
+
+## Puts the city on screen.
+##
+## NOTHING here may add city geometry on top of a baked scene. The scene IS the
+## city — if a building is not in CalderCity.tscn it must not be in the game.
+## Wall rifts used to bring their own facade at runtime, which meant buildings
+## appeared in play that could not be found or deleted in the editor. Anything a
+## wall rift needs to be cut into gets baked, and is then just another building
+## to move or remove like the rest of them.
+##
+## Two routes in. If res://scenes/story/CalderCity.tscn exists it is instanced
+## as-is — that scene is a real, hand-editable tree, and whatever has been moved,
+## deleted or added in the editor is what the player sees. Otherwise the city is
+## generated procedurally, exactly as before, and Ctrl+Alt+B bakes that result
+## out to the scene so it can be taken over by hand.
+##
+## The baked scene also carries a Marker3D per rift under RiftAnchors. Dragging
+## one in the editor moves the rift AND re-routes the streets Meeko walks to
+## reach it, because the anchors are applied to the map data before anything
+## else is built from it.
+func _build_world() -> void:
+	if ResourceLoader.exists(BAKED_CITY):
+		_instance_baked_city()
+		return
+	_build_city_procedural(self)
+	_build_hub_marker(self)
+
+
+func _instance_baked_city() -> void:
+	var packed: PackedScene = load(BAKED_CITY) as PackedScene
+	if packed == null:
+		push_error("[StoryMap] %s exists but would not load — falling back to procedural." % BAKED_CITY)
+		_build_city_procedural(self)
+		_build_hub_marker(self)
+		return
+
+	var city: Node = packed.instantiate()
+	city.name = "CalderCity"
+	add_child(city)
+	_city_is_baked = true
+
+	# Anchors win over the branch maths, so a rift dragged in the editor stays
+	# where it was put and the routes follow it there.
+	var anchors: Node = city.get_node_or_null("RiftAnchors")
+	if anchors == null:
+		print("[StoryMap] baked city has no RiftAnchors — positions come from the map data.")
+		return
+	var overrides: Dictionary = {}
+	for child in anchors.get_children():
+		var marker := child as Node3D
+		if marker == null or not String(marker.name).begins_with("Rift_"):
+			continue
+		overrides[String(marker.name).substr(5)] = marker.transform
+	_data.apply_anchor_overrides(overrides)
+	print("[StoryMap] baked city loaded; %d rift anchors applied." % overrides.size())
+
+
+func _build_city_procedural(parent: Node3D) -> void:
 	# Everything the city has to leave room for: the hub, every rift (whether or
 	# not it is unlocked yet — a building may not appear inside a rift that has
 	# not opened yet either), and every route trail.
-	var keep_clear: Array[Dictionary] = [{"pos": _data.hub_position, "radius": 16.0}]
+	var keep_clear: Array[Dictionary] = [{"pos": _data.hub_position, "radius": 20.0}]
 	for id: String in _data.order:
-		keep_clear.append({"pos": _data.position_of(id), "radius": 15.0})
+		keep_clear.append({"pos": _data.position_of(id), "radius": 11.0})
 
+	# The only stretch of any journey that is NOT already a road is the spur from
+	# a rift out to its doorstep, so that is all the buildings have to stand
+	# clear of. This used to keep them off the whole drawn route between nodes,
+	# back when there was one; those routes ran down streets, which are gaps
+	# between blocks by construction, so it was clearing space that was already
+	# empty and thinning the city for nothing.
 	var paths: Array[PackedVector3Array] = []
-	for edge: Dictionary in _data.edges():
-		paths.append(_edge_points(String(edge["from"]), String(edge["to"])))
+	var walked: PackedStringArray = PackedStringArray([_data.hub_id])
+	walked.append_array(_data.order)
+	for id: String in walked:
+		var spur := PackedVector3Array([_data.position_of(id), _data.doorstep_of(id)])
+		if spur[0].distance_to(spur[1]) > 0.5:
+			paths.append(spur)
 
 	var city := StoryCity.new()
 	city.name = "City"
-	add_child(city)
+	parent.add_child(city)
 	city.build(_data.hub_position, _data.extent() + 78.0, keep_clear, paths)
 
 
-## The hub is a plain civic square, not a rift — it is the one node that is
-## always open and it is where Meeko starts.
-## TODO(art): real hub landmark (Anne's building / the plaza) goes here.
-func _build_hub_marker() -> void:
-	var plaza := MeshInstance3D.new()
-	var disc := CylinderMesh.new()
-	disc.top_radius      = 12.0
-	disc.bottom_radius   = 12.0
-	disc.height          = 0.3
-	disc.radial_segments = 24
-	plaza.mesh = disc
-	var m := StandardMaterial3D.new()
-	m.albedo_color = Color(0.48, 0.47, 0.48)
-	m.roughness    = 0.95
-	plaza.material_override = m
-	plaza.position = _data.hub_position + Vector3(0.0, 0.15, 0.0)
-	add_child(plaza)
-
-	var pillar := MeshInstance3D.new()
-	var pm := BoxMesh.new()
-	pm.size = Vector3(2.2, 9.0, 2.2)
-	pillar.mesh = pm
-	var pmat := StandardMaterial3D.new()
-	pmat.albedo_color = Color(0.58, 0.56, 0.55)
-	pmat.roughness    = 0.9
-	pillar.material_override = pmat
-	# Off to one side of the plaza, NOT on the middle of it — Meeko starts on the
-	# hub, and a monument on the exact same spot hides him behind it.
-	pillar.position = _data.hub_position + Vector3(-6.5, 4.5, -6.0)
-	add_child(pillar)
+## The hub is a civic square, not a rift — the one node that is always open, and
+## where Meeko starts. The geometry lives in StoryCity with the rest of the
+## city furniture, so the map and the bake build the same plaza.
+func _build_hub_marker(parent: Node3D) -> void:
+	StoryCity.build_hub(parent, _data.hub_position, _data.hub_facing)
 
 
-func _build_links() -> void:
-	for edge: Dictionary in _data.edges():
-		var from_id: String = String(edge["from"])
-		var to_id: String = String(edge["to"])
-		var link := StoryPathLink.new()
-		link.name = "Link_%s_%s" % [from_id, to_id]
-		add_child(link)
-		link.build(from_id, to_id, _edge_points(from_id, to_id), _accent_for(to_id))
-		_links[_link_key(from_id, to_id)] = link
+# ── Baking the city to an editable scene ─────────────────────────────────────
+
+## Ctrl+Alt+B. Generates the city once more and writes it to BAKED_CITY as a
+## normal scene of plain Node3D/MeshInstance3D nodes, then reloads the map onto
+## it. From then on the map instances that scene instead of generating, so
+## anything moved or deleted in the editor sticks.
+##
+## Baking again OVERWRITES those edits — it is a fresh generation, not a merge.
+## That is why it is a deliberate keystroke and not something the map does on its
+## own when the file is missing.
+func _bake_city() -> void:
+	var root := Node3D.new()
+	root.name = "CalderCity"
+	add_child(root)
+
+	_build_city_procedural(root)
+	_build_hub_marker(root)
+
+	# Rift anchors: one Marker3D per node, carrying the position AND the way it
+	# faces. StoryRift.face_toward() aims local +Z, so the marker is built the
+	# same way and apply_anchor_overrides() reads it back the same way.
+	var facades := Node3D.new()
+	facades.name = "RiftFacades"
+	root.add_child(facades)
+	for id: String in _data.order:
+		if _variant_for(id) == StoryRift.VARIANT_WALL:
+			StoryCity.build_rift_facade(facades, _data.position_of(id),
+				_data.facing_of(id), "Facade_%s" % id)
+
+	var anchors := Node3D.new()
+	anchors.name = "RiftAnchors"
+	root.add_child(anchors)
+	for id: String in _data.order:
+		var marker := Marker3D.new()
+		marker.name = "Rift_%s" % id
+		marker.position = _data.position_of(id)
+		var facing: Vector3 = _data.facing_of(id)
+		marker.rotation.y = atan2(facing.x, facing.z)
+		anchors.add_child(marker)
+
+	# The generator's own node keeps a script that would only confuse anyone
+	# opening the scene — the baked city is data, not a generator.
+	var city: Node = root.get_node_or_null("City")
+	if city != null:
+		city.set_script(null)
+
+	_claim(root, root)
+
+	var packed := PackedScene.new()
+	if packed.pack(root) != OK:
+		push_error("[StoryMap] could not pack the city.")
+		root.queue_free()
+		return
+	var dir := DirAccess.open("res://scenes")
+	if dir != null and not dir.dir_exists("story"):
+		dir.make_dir("story")
+	var err: int = ResourceSaver.save(packed, BAKED_CITY)
+	root.queue_free()
+
+	if err != OK:
+		push_error("[StoryMap] saving %s failed (code %d)." % [BAKED_CITY, err])
+		_detail_label.text = "BAKE FAILED — SEE OUTPUT"
+		return
+
+	print("[StoryMap] baked the city to %s — open it in the editor to change it." % BAKED_CITY)
+	_detail_label.text = "CITY BAKED"
+	_hint_label.text = "SAVED TO %s  ·  RELOADING" % BAKED_CITY
+	await get_tree().create_timer(0.9).timeout
+	if is_inside_tree():
+		get_tree().reload_current_scene()
+
+
+## PackedScene only keeps nodes that belong to the scene being packed, so every
+## descendant has to be claimed by the root before it is worth saving.
+func _claim(node: Node, root: Node) -> void:
+	for child in node.get_children():
+		child.owner = root
+		_claim(child, root)
+
+
+## Which look a node wears. Purely visual variety — no gameplay reads this.
+##
+## Derived from the node's index rather than a running counter, because the
+## rifts and their buildings are built in separate passes and both have to
+## arrive at the same answer.
+func _variant_for(id: String) -> String:
+	var entry: Dictionary = _data.nodes.get(id, {}) as Dictionary
+	var variant: String = String(entry.get("variant", "auto"))
+	if variant != "auto":
+		return variant
+	# Alternating keeps a cluster from being three of the same thing in a row.
+	return StoryRift.VARIANT_GROUND if _data.order.find(id) % 2 == 0 else StoryRift.VARIANT_WALL
 
 
 func _build_rifts() -> void:
-	var alternate: int = 0
 	for id: String in _data.order:
-		var entry: Dictionary = _data.nodes[id]
-		var variant: String = String(entry.get("variant", "auto"))
-		if variant == "auto":
-			# Purely visual variety — no gameplay reads this. Alternating keeps
-			# a cluster from being three of the same thing side by side.
-			variant = StoryRift.VARIANT_GROUND if alternate % 2 == 0 else StoryRift.VARIANT_WALL
-		alternate += 1
+		var variant: String = _variant_for(id)
 
 		var rift := StoryRift.new()
 		rift.name = "Rift_%s" % id
 		add_child(rift)
 		rift.position = _data.position_of(id)
 		rift.setup(id, _data.title_of(id), variant, _accent_for(id))
-		# Wall rifts have a front; turn them toward whatever they connect back
-		# to, so the gash always faces the route Meeko arrives on.
-		rift.face_toward(_data.position_of(_data.parent_of(id)))
+		# A rift faces the road it fronts onto, so the wall variant's facade ends
+		# up behind it inside the block instead of standing in the carriageway.
+		rift.face_toward(_data.position_of(id) + _data.facing_of(id))
 		rift.picked.connect(_on_rift_picked)
 		_rifts[id] = rift
 
@@ -387,8 +548,12 @@ func _update_hud() -> void:
 		# so the player should read it as scenery rather than as a wall.
 		song_line = "  ·  LV %02d  NO CHART — SKIPPED" % level
 
+	# Reveal-all is loud on purpose: a map showing rifts the save has not earned
+	# looks like broken progress unless it says why.
+	var dev: String = "  [DEV: ALL REVEALED]" if _reveal_all else ""
+
 	if target == _data.hub_id:
-		_detail_label.text = _data.hub_title
+		_detail_label.text = _data.hub_title + dev
 		_hint_label.text = "← →  SELECT A RIFT     ENTER / A  TRAVEL     ESC / B  BACK"
 		return
 
@@ -397,7 +562,7 @@ func _update_hud() -> void:
 	# every rift the player had already closed dropped its marker the moment they
 	# selected a different one — the last one beaten looked like the only one.
 	var closed_mark: String = "  ·  CLOSED" if target in _cleared else ""
-	_detail_label.text = "%s%s" % [target_title, closed_mark]
+	_detail_label.text = "%s%s%s" % [target_title, closed_mark, dev]
 
 	if target != _at_node:
 		_hint_label.text = "ENTER / A  TRAVEL%s     ← →  SELECT     ESC / B  BACK" % song_line
@@ -415,15 +580,11 @@ func _update_hud() -> void:
 ## plays the reveal flourish on anything that has just become visible — passed
 ## false on load, true after a clear.
 func _refresh_visibility(animate: bool) -> void:
-	var newly_open: PackedStringArray = PackedStringArray()
-
 	for id: String in _data.order:
 		var rift: StoryRift = _rifts.get(id, null)
 		if rift == null:
 			continue
-		var unlocked: bool = _data.is_unlocked(id, _cleared)
-		if unlocked and not rift.is_revealed():
-			newly_open.append(id)
+		var unlocked: bool = _is_on_map(id)
 		if unlocked != rift.is_revealed():
 			rift.set_revealed(unlocked, animate and unlocked)
 		# Closed rifts dim right down. Driven from the cleared list every refresh
@@ -431,25 +592,25 @@ func _refresh_visibility(animate: bool) -> void:
 		# already beaten when the map loads.
 		rift.set_closed(id in _cleared)
 
-	# A trail is drawn only when BOTH of its ends are on the map — otherwise it
-	# would point at a rift the player is not supposed to know about yet.
-	for key: String in _links.keys():
-		var link: StoryPathLink = _links[key]
-		var open: bool = _is_on_map(link.from_id) and _is_on_map(link.to_id)
-		var reveal: bool = animate and open and not link.is_open() \
-			and (link.to_id in newly_open or link.from_id in newly_open)
-		if open != link.is_open():
-			link.set_open(open, reveal)
-
 
 func _is_on_map(id: String) -> bool:
-	if id == _data.hub_id:
+	if id == _data.hub_id or _reveal_all:
 		return true
 	return _data.is_unlocked(id, _cleared)
 
 
+## Every node the map is currently showing, in authored order.
+func _visible_ids() -> PackedStringArray:
+	if not _reveal_all:
+		return _data.unlocked_ids(_cleared)
+	var all := PackedStringArray()
+	for id: String in _data.order:
+		all.append(id)
+	return all
+
+
 func _select_first_available() -> void:
-	var ids: PackedStringArray = _data.unlocked_ids(_cleared)
+	var ids: PackedStringArray = _visible_ids()
 	_set_selected(ids[0] if ids.size() > 0 else _data.hub_id)
 
 
@@ -470,7 +631,7 @@ func _set_selected(id: String) -> void:
 ## at the front so there is always a way back to it without the mouse.
 func _cycle_selection(delta: int) -> void:
 	var ids: PackedStringArray = PackedStringArray([_data.hub_id])
-	ids.append_array(_data.unlocked_ids(_cleared))
+	ids.append_array(_visible_ids())
 	if ids.size() <= 1:
 		return
 	var idx: int = ids.find(_selected)
@@ -486,7 +647,7 @@ func _travel_to(id: String) -> void:
 		return
 	if id == _at_node:
 		return
-	var plan: Dictionary = _data.travel_plan(_data.route(_at_node, id))
+	var plan: Dictionary = _data.direct_plan(_at_node, id)
 	_set_selected(id)
 	_walker.walk(plan["points"], plan["ids"], id)
 	_update_hud()
@@ -596,6 +757,22 @@ func _unhandled_input(event: InputEvent) -> void:
 			Save.clear_story_progress()
 			get_tree().reload_current_scene()
 			return
+		# Dev: reveal every rift, ignoring progress. Toggles, and writes nothing.
+		if key.physical_keycode == KEY_U and key.ctrl_pressed and key.alt_pressed:
+			get_viewport().set_input_as_handled()
+			_reveal_all = not _reveal_all
+			_refresh_visibility(false)
+			if not _is_on_map(_selected):
+				_select_first_available()
+			_update_hud()
+			print("[StoryMap] reveal-all %s" % ("ON" if _reveal_all else "off"))
+			return
+		# Dev: bake the generated city out to an editable scene. Overwrites any
+		# hand edits already in it, so it is a deliberate keystroke.
+		if key.physical_keycode == KEY_B and key.ctrl_pressed and key.alt_pressed:
+			get_viewport().set_input_as_handled()
+			_bake_city()
+			return
 
 	if event is InputEventMouseMotion:
 		_hover_at((event as InputEventMouseMotion).position)
@@ -665,6 +842,96 @@ func _pick_at(screen_pos: Vector2) -> String:
 	return best
 
 
+# ── Shelters ─────────────────────────────────────────────────────────────────
+## Roofs fade out while Meeko is underneath them.
+##
+## The map camera looks down from 124 m, so anything overhead hides whatever is
+## beneath it — the covered plaza swallows Meeko at the exact spot he starts on
+## and returns to. Rather than banning roofs, they dissolve when he is under one
+## and come back when he leaves, which is what a map camera is expected to do.
+##
+## A mesh counts as a shelter when it is in the `shelter` group OR its name
+## contains "roof", and it sits at least SHELTER_MIN_HEIGHT above the ground.
+## The name rule means anything built in the editor and called Roof-something
+## just works; the group is there for a roof you would rather call something
+## else. Nothing else about the scene has to be set up.
+
+## Alpha a roof drops to with Meeko beneath it — faint rather than gone, so the
+## shelter still reads as a structure and its columns do not look freestanding.
+const SHELTER_FADE: float = 0.16
+const SHELTER_FADE_RATE: float = 6.0
+## Ignore anything low enough to be street furniture; a shelter is overhead.
+const SHELTER_MIN_HEIGHT: float = 3.0
+## Extra metres beyond a roof's own footprint that still count as underneath, so
+## it starts fading just before he actually crosses the edge.
+const SHELTER_MARGIN: float = 2.5
+
+## Each entry: {"node", "mat", "center": Vector2, "radius", "base_alpha", "alpha"}
+var _shelters: Array[Dictionary] = []
+
+
+func _collect_shelters(root: Node) -> void:
+	for child in root.get_children():
+		_collect_shelters(child)
+
+		var mi := child as MeshInstance3D
+		if mi == null or mi.mesh == null:
+			continue
+		if not (mi.is_in_group("shelter") or String(mi.name).to_lower().contains("roof")):
+			continue
+
+		var world: AABB = mi.global_transform * mi.get_aabb()
+		if world.position.y + world.size.y < SHELTER_MIN_HEIGHT:
+			continue
+
+		# The material is duplicated per shelter: the baked scene shares material
+		# resources between nodes, and fading a shared one would take unrelated
+		# parts of the city with it.
+		var src := mi.material_override as StandardMaterial3D
+		if src == null and mi.mesh.get_surface_count() > 0:
+			src = mi.get_active_material(0) as StandardMaterial3D
+		if src == null:
+			push_warning("[StoryMap] shelter '%s' has no StandardMaterial3D to fade." % mi.name)
+			continue
+		var mat := src.duplicate() as StandardMaterial3D
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		mi.material_override = mat
+
+		var centre := world.get_center()
+		_shelters.append({
+			"node": mi,
+			"mat": mat,
+			"center": Vector2(centre.x, centre.z),
+			"radius": maxf(world.size.x, world.size.z) * 0.5 + SHELTER_MARGIN,
+			"base_alpha": mat.albedo_color.a,
+			"alpha": 1.0,
+		})
+
+
+func _update_shelters(delta: float) -> void:
+	if _shelters.is_empty() or _walker == null:
+		return
+	var here := Vector2(_walker.global_position.x, _walker.global_position.z)
+	var k: float = clampf(SHELTER_FADE_RATE * delta, 0.0, 1.0)
+
+	for sh: Dictionary in _shelters:
+		var under: bool = here.distance_to(sh["center"] as Vector2) < float(sh["radius"])
+		var a: float = lerpf(float(sh["alpha"]), SHELTER_FADE if under else 1.0, k)
+		sh["alpha"] = a
+
+		var mat: StandardMaterial3D = sh["mat"]
+		var col: Color = mat.albedo_color
+		mat.albedo_color = Color(col.r, col.g, col.b, float(sh["base_alpha"]) * a)
+
+		# A roof that has faded out but still casts its shadow would leave Meeko
+		# standing in a dark disc with nothing overhead to explain it.
+		var mi: MeshInstance3D = sh["node"]
+		var want: int = GeometryInstance3D.SHADOW_CASTING_SETTING_ON if a > 0.95 \
+			else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		if mi.cast_shadow != want:
+			mi.cast_shadow = want
+
+
 # ── Camera ───────────────────────────────────────────────────────────────────
 
 ## What the camera keeps in frame: Meeko while he is walking, and otherwise the
@@ -692,20 +959,10 @@ func _process(delta: float) -> void:
 	# not change, only what is under it.
 	_cam_focus = _cam_focus.lerp(_focus_target(), clampf(CAM_FOLLOW_RATE * delta, 0.0, 1.0))
 	_place_camera(_cam_focus)
+	_update_shelters(delta)
 
 
 # ── Graph helpers ────────────────────────────────────────────────────────────
-
-## The full polyline for one edge, routed along the streets. Shared by the trail
-## visuals, the walker's route and the city's keep-clear test, so all three agree
-## on where a path actually runs.
-func _edge_points(from_id: String, to_id: String) -> PackedVector3Array:
-	return _data.edge_points(from_id, to_id)
-
-
-static func _link_key(from_id: String, to_id: String) -> String:
-	return "%s>%s" % [from_id, to_id]
-
 
 ## A rift's colour, walked along the game's own signature band (pink → violet →
 ## cyan) by authored order. Rifts are the only saturated thing on the map, so

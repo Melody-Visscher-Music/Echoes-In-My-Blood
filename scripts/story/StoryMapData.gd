@@ -51,6 +51,15 @@ var nodes: Dictionary = {}
 var hub_id: String = "hub"
 var hub_title: String = "HUB"
 var hub_position: Vector3 = Vector3.ZERO
+## The one side of the plaza Meeko uses. A rift takes whichever street is
+## nearest, because a rift is a hole in a pavement and any pavement will do; the
+## plaza is a built place with a way in, and using all four sides made it read
+## as a roundabout rather than as somewhere you arrive at.
+##
+## Authored as `"facing"` on the hub in the map JSON: +Z is the near side on
+## screen (the map camera looks down the -Z axis, so +Z is the bottom edge).
+## Flip the sign, or move it to the X axis, to enter from another side.
+var hub_facing: Vector3 = Vector3(0.0, 0.0, 1.0)
 var map_title: String = ""
 
 ## branch id -> {"id", "title", "heading_deg", "unlocked_by"}
@@ -86,6 +95,10 @@ func _parse(root: Dictionary) -> void:
 	hub_id       = String(hub.get("id", "hub"))
 	hub_title    = String(hub.get("title", "HUB"))
 	hub_position = _to_vec3(hub.get("position", [0.0, 0.0, 0.0]))
+	if hub.has("facing"):
+		var hf: Vector3 = _to_vec3(hub.get("facing"))
+		if hf.length_squared() > 0.001:
+			hub_facing = hf.normalized()
 
 	for b_raw: Variant in root.get("branches", []):
 		if not (b_raw is Dictionary):
@@ -116,11 +129,20 @@ func _parse(root: Dictionary) -> void:
 
 		var branch_id: String = String(n.get("branch", ""))
 
+		# Branch maths puts a node wherever the numbers land, which is as often in
+		# the middle of a junction as anywhere else. Every derived position is
+		# pulled onto the nearest block's street frontage: on the pavement, a
+		# building line behind it, the road in front. An explicit "position" is
+		# taken as authored and left exactly where it was put.
 		var pos: Vector3
+		var facing := Vector3(0.0, 0.0, 1.0)
 		if n.has("position"):
 			pos = _to_vec3(n.get("position"))
 		else:
 			pos = branch_point(branch_id, float(n.get("along", 0.0)), float(n.get("across", 0.0)))
+			var front: Dictionary = StoryCity.street_frontage(pos, hub_position)
+			pos = front["pos"]
+			facing = front["facing"]
 
 		var via := PackedVector3Array()
 		for v_raw: Variant in n.get("via", []):
@@ -140,6 +162,8 @@ func _parse(root: Dictionary) -> void:
 			"branch": branch_id,
 			"cluster": String(n.get("cluster", branch_id)),
 			"variant": String(n.get("variant", "auto")),
+			# Which way the rift looks: out at the road it fronts onto.
+			"facing": facing,
 			"parent": String(n.get("connects_from", hub_id)),
 			"position": pos,
 			"via": via,
@@ -238,6 +262,38 @@ func position_of(id: String) -> Vector3:
 	return n.get("position", hub_position) as Vector3
 
 
+## The direction a rift faces — out toward the street it fronts onto, so the
+## wall variant's facade ends up behind it inside the block rather than standing
+## in the road.
+func facing_of(id: String) -> Vector3:
+	if id == hub_id:
+		return hub_facing
+	var n: Dictionary = nodes.get(id, {}) as Dictionary
+	return n.get("facing", Vector3(0.0, 0.0, 1.0)) as Vector3
+
+
+## Replaces node positions with ones authored in the baked city scene. Anchors
+## dragged around in the editor win over the branch maths, and the POSITION is
+## taken exactly as placed — no frontage snapping, because a hand-placed spot is
+## a decision.
+##
+## The facing is NOT taken from the marker, though. It is re-derived from where
+## the anchor now sits, so a rift always exits onto the street nearest to it.
+## Marker rotation is a thing nobody remembers to update while dragging things
+## around, and a stale one sent routes across whole blocks to reach a road the
+## rift used to front. Move an anchor anywhere and the route re-solves.
+func apply_anchor_overrides(anchors: Dictionary) -> void:
+	for id: String in anchors.keys():
+		if not nodes.has(id):
+			push_warning("[StoryMapData] scene has an anchor for unknown node '%s'." % id)
+			continue
+		var t: Transform3D = anchors[id]
+		var n: Dictionary = nodes[id]
+		n["position"] = t.origin
+		n["facing"] = StoryCity.nearest_street_facing(t.origin, hub_position)
+		nodes[id] = n
+
+
 func parent_of(id: String) -> String:
 	if id == hub_id:
 		return ""
@@ -323,55 +379,6 @@ func unlocked_ids(cleared: PackedStringArray) -> PackedStringArray:
 	return out
 
 
-## Every edge in the graph as {"from", "to"} — one per node, toward its parent.
-func edges() -> Array[Dictionary]:
-	var out: Array[Dictionary] = []
-	for id: String in order:
-		out.append({"from": String((nodes[id] as Dictionary).get("parent", hub_id)), "to": id})
-	return out
-
-
-## Node ids from `from_id` up to the hub, hub last. Used to find where two
-## routes meet.
-func chain_to_hub(from_id: String) -> PackedStringArray:
-	var out := PackedStringArray()
-	var walk: String = from_id
-	var guard: int = 0
-	while walk != "" and guard < 256:
-		out.append(walk)
-		if walk == hub_id:
-			break
-		walk = parent_of(walk)
-		guard += 1
-	return out
-
-
-## The node ids to travel through to get from `from_id` to `to_id`, inclusive of
-## both ends. The graph is a tree, so this is "up to the common ancestor, then
-## back down" — no search needed, and it is stable regardless of unlock state.
-func route(from_id: String, to_id: String) -> PackedStringArray:
-	if from_id == to_id:
-		return PackedStringArray([to_id])
-	var up:   PackedStringArray = chain_to_hub(from_id)
-	var down: PackedStringArray = chain_to_hub(to_id)
-
-	var meet_up: int = up.size() - 1
-	var meet_down: int = down.size() - 1
-	for i in up.size():
-		var idx: int = down.find(up[i])
-		if idx != -1:
-			meet_up = i
-			meet_down = idx
-			break
-
-	var out := PackedStringArray()
-	for i in meet_up + 1:
-		out.append(up[i])
-	for i in range(meet_down - 1, -1, -1):
-		out.append(down[i])
-	return out
-
-
 ## The world-space polyline for one edge, routed along the city's streets rather
 ## than cut straight across the blocks. Authored `via` points still work — they
 ## become intermediate stops, and each leg between them is road-routed too.
@@ -379,47 +386,53 @@ func route(from_id: String, to_id: String) -> PackedStringArray:
 ## This is the single source of both the dotted trail and the walker's route, so
 ## Meeko physically walks the line that is drawn.
 func edge_points(a: String, b: String) -> PackedVector3Array:
-	var stops := PackedVector3Array([position_of(a)])
+	var stops := PackedVector3Array([doorstep_of(a)])
 	for bend: Vector3 in edge_via(a, b):
 		stops.append(bend)
-	stops.append(position_of(b))
+	stops.append(doorstep_of(b))
 
-	var out := PackedVector3Array()
+	var pts := PackedVector3Array([position_of(a)])
 	for i in range(1, stops.size()):
-		var leg: PackedVector3Array = StoryCity.road_route(stops[i - 1], stops[i], hub_position)
-		for j in leg.size():
-			if i > 1 and j == 0:
-				continue    # the previous leg already ended on this point
-			out.append(leg[j])
-	return out
+		for p: Vector3 in StoryCity.road_route(stops[i - 1], stops[i], hub_position):
+			pts.append(p)
+	pts.append(position_of(b))
+	return StoryCity.dedupe_points(pts)
 
 
-## World-space waypoints for a whole route, road-routed end to end.
-func waypoints(route_ids: PackedStringArray) -> PackedVector3Array:
-	return travel_plan(route_ids).get("points", PackedVector3Array())
-
-
-## Points plus the node id reached at each one ("" for a street corner), kept in
-## step by being built together. They used to be assembled separately — the map
-## rebuilt the id list by counting `via` points — which only held while a leg was
-## a straight line. Road routing inserts corners, so anything counting hops would
-## now silently mis-label which waypoint is a rift.
+## Where a node meets the road.
 ##
-## Returns {"points": PackedVector3Array, "ids": PackedStringArray}.
-func travel_plan(route_ids: PackedStringArray) -> Dictionary:
-	var points := PackedVector3Array()
-	var ids := PackedStringArray()
-	if route_ids.is_empty():
-		return {"points": points, "ids": ids}
+## For a rift that is its doorstep, on whichever street it sits nearest. For the
+## hub it is the ONE side the plaza opens onto — every journey to or from the
+## plaza leaves and arrives there, rather than cutting across it to whichever
+## road happens to be closest to where it is going.
+func doorstep_of(id: String) -> Vector3:
+	if id == hub_id:
+		return StoryCity.frontage_doorstep(hub_position, hub_facing, hub_position)
+	if not nodes.has(id):
+		return position_of(id)
+	return StoryCity.frontage_doorstep(position_of(id), facing_of(id), hub_position)
 
-	points.append(position_of(route_ids[0]))
-	ids.append(route_ids[0])
-	for i in range(1, route_ids.size()):
-		var leg: PackedVector3Array = edge_points(route_ids[i - 1], route_ids[i])
-		# Skip the leg's first point: the previous leg already ended there.
-		for j in range(1, leg.size()):
-			points.append(leg[j])
-			ids.append(route_ids[i] if j == leg.size() - 1 else "")
+
+## The route Meeko actually walks: the shortest way through the STREETS from one
+## node to another, with no regard for how the map unlocks.
+##
+## Travel used to follow the unlock tree — up to the common ancestor and back
+## down again — so crossing from rift 5 to rift 8 marched him through 3, 2, 1
+## and the hub on the way. The tree says what OPENS what; it says nothing about
+## how far apart two places are in a city. Any two points on a street grid are
+## directly reachable, so this just routes between them and lets the trails go
+## on showing the unlock structure, which is what they are for.
+##
+## Returns {"points": PackedVector3Array, "ids": PackedStringArray}, the ids
+## naming only the two ends — every point between is a street corner.
+func direct_plan(from_id: String, to_id: String) -> Dictionary:
+	var points: PackedVector3Array = edge_points(from_id, to_id)
+	var ids := PackedStringArray()
+	for _i in points.size():
+		ids.append("")
+	if points.size() > 0:
+		ids[0] = from_id
+		ids[points.size() - 1] = to_id
 	return {"points": points, "ids": ids}
 
 

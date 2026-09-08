@@ -5,7 +5,8 @@
 	"hub": {
 		"id": "hub",
 		"title": "CENTRAL PLAZA",
-		"position": [0.0, 0.0, 0.0]
+		"position": [0.0, 0.0, 0.0],
+		"facing": [0.0, 0.0, 1.0]
 	},
 
 	"branches": [
