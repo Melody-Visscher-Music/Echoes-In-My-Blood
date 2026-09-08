@@ -189,7 +189,7 @@ func _build_city() -> void:
 	# not opened yet either), and every route trail.
 	var keep_clear: Array[Dictionary] = [{"pos": _data.hub_position, "radius": 16.0}]
 	for id: String in _data.order:
-		keep_clear.append({"pos": _data.position_of(id), "radius": 13.0})
+		keep_clear.append({"pos": _data.position_of(id), "radius": 15.0})
 
 	var paths: Array[PackedVector3Array] = []
 	for edge: Dictionary in _data.edges():
@@ -486,19 +486,9 @@ func _travel_to(id: String) -> void:
 		return
 	if id == _at_node:
 		return
-	var route: PackedStringArray = _data.route(_at_node, id)
-	var points: PackedVector3Array = _data.waypoints(route)
-	# waypoints() interleaves the authored bends between node positions, so the
-	# id list has to be rebuilt in step with it — a bend is not a node.
-	var ids: PackedStringArray = PackedStringArray()
-	if route.size() > 0:
-		ids.append(route[0])
-		for i in range(1, route.size()):
-			for _bend: Vector3 in _data.edge_via(route[i - 1], route[i]):
-				ids.append("")
-			ids.append(route[i])
+	var plan: Dictionary = _data.travel_plan(_data.route(_at_node, id))
 	_set_selected(id)
-	_walker.walk(points, ids, id)
+	_walker.walk(plan["points"], plan["ids"], id)
 	_update_hud()
 
 
@@ -706,15 +696,11 @@ func _process(delta: float) -> void:
 
 # ── Graph helpers ────────────────────────────────────────────────────────────
 
-## The full polyline for one edge: parent position, the authored bends, child
-## position. Shared by the trail visuals, the walker's route and the city's
-## keep-clear test, so all three agree on where a path actually runs.
+## The full polyline for one edge, routed along the streets. Shared by the trail
+## visuals, the walker's route and the city's keep-clear test, so all three agree
+## on where a path actually runs.
 func _edge_points(from_id: String, to_id: String) -> PackedVector3Array:
-	var points := PackedVector3Array([_data.position_of(from_id)])
-	for bend: Vector3 in _data.edge_via(from_id, to_id):
-		points.append(bend)
-	points.append(_data.position_of(to_id))
-	return points
+	return _data.edge_points(from_id, to_id)
 
 
 static func _link_key(from_id: String, to_id: String) -> String:

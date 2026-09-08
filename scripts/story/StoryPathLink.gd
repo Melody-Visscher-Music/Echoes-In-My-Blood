@@ -81,7 +81,9 @@ func build(edge_from: String, edge_to: String, points: PackedVector3Array, accen
 		m.emission_energy_multiplier = CALM_ENERGY
 		m.shading_mode               = BaseMaterial3D.SHADING_MODE_UNSHADED
 		dot.material_override = m
-		dot.position = p + Vector3(0.0, 0.06, 0.0)
+		# Clear of the road slab's top face (roads top out at y = 0.07), so the
+		# dots never z-fight with the street they now run down.
+		dot.position = p + Vector3(0.0, 0.11, 0.0)
 		add_child(dot)
 		_dots.append(dot)
 		_mats.append(m)

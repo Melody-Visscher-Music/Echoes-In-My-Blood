@@ -30,7 +30,7 @@ const CHARACTER_GLB: String = "res://assets/SIAGCharacter.glb"
 
 ## Metres per second on the map for a SHORT hop. Map travel is meant to feel
 ## brisk but readable.
-@export var walk_speed: float = 16.0
+@export var walk_speed: float = 20.0
 ## A cross-map trek is walked faster than a hop between two rifts in the same
 ## cluster. Routes here are not equal: stepping between rifts 2 and 3 is 12 m,
 ## while going from rift 5 back round to rift 6 crosses the whole city through

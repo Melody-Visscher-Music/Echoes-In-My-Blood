@@ -31,7 +31,14 @@ const BLOCK_PITCH: float = BLOCK_SIZE + ROAD_WIDTH
 
 ## Metres of clearance kept around the route trails, so a building never sits on
 ## top of a path Meeko has to walk down.
-const PATH_CLEARANCE: float = 7.0
+##
+## Small on purpose now that routes run down the STREETS. A road is already an
+## 11 m gap between blocks, so a trail on a road centreline needs no clearance of
+## its own — and asking for the old 7 m would have culled every building on a
+## lot facing a used road, stripping the city back along each route. What this
+## still covers is the short spur from a rift out to its nearest road, which
+## does cross a block.
+const PATH_CLEARANCE: float = 2.5
 
 ## How far from a map node the city is actually built. The map camera shows
 ## roughly 120 m of ground and never leaves the nodes, so this is a generous
@@ -63,6 +70,109 @@ var _rng := RandomNumberGenerator.new()
 var _unit_box: BoxMesh = null
 var _facade_mats: Array[StandardMaterial3D] = []
 var _building_count: int = 0
+
+
+# ── Road grid routing ────────────────────────────────────────────────────────
+## Where map routes come from. The grid lives here because this file is what
+## draws it — anything that wants to travel the city asks, rather than keeping a
+## second copy of the block pitch that can drift out of step with the roads.
+##
+## Routes used to be straight lines from rift to rift, which cut diagonally
+## across blocks and through buildings. They now step out to the nearest street,
+## drive the grid, and turn in at the far end, so both the dotted trail and Meeko
+## follow roads like anything else in a city would.
+
+## Centreline of the nearest north-south road to `x`. Roads sit at
+## `origin + i * BLOCK_PITCH - BLOCK_PITCH/2`, which is what _build_roads draws.
+static func nearest_road_x(x: float, origin_x: float) -> float:
+	var half: float = BLOCK_PITCH * 0.5
+	return origin_x + round((x - origin_x + half) / BLOCK_PITCH) * BLOCK_PITCH - half
+
+
+static func nearest_road_z(z: float, origin_z: float) -> float:
+	return nearest_road_x(z, origin_z)
+
+
+## Every street a position could reasonably step out onto: the road either side
+## of it on each axis, so four in all. Each entry is {"pos", "h"}, where h means
+## an east-west road (z fixed, free to travel in x).
+##
+## Both neighbours are offered, not just the nearer one. A block is bounded by
+## two roads on each axis and the useful one is whichever heads toward the
+## destination — the hub sits dead centre between four of them, so "nearest"
+## there is a coin toss that was sending routes off the wrong way entirely.
+static func _access_candidates(pos: Vector3, origin: Vector3) -> Array[Dictionary]:
+	var half: float = BLOCK_PITCH * 0.5
+	var out: Array[Dictionary] = []
+	var zi: float = floor((pos.z - origin.z + half) / BLOCK_PITCH)
+	var xi: float = floor((pos.x - origin.x + half) / BLOCK_PITCH)
+	for k: float in [0.0, 1.0]:
+		out.append({"pos": Vector3(pos.x, pos.y, origin.z + (zi + k) * BLOCK_PITCH - half), "h": true})
+		out.append({"pos": Vector3(origin.x + (xi + k) * BLOCK_PITCH - half, pos.y, pos.z), "h": false})
+	return out
+
+
+## An on-road polyline from `a` to `b`: a spur onto the street, at most two turns
+## along the grid, then a spur in at the far end. Corners always land on real
+## intersections, so no leg ever crosses a block.
+##
+## Picks the shortest of every access pairing rather than trying to reason about
+## which street is "right". Sixteen candidate routes per edge, built once when
+## the map loads — far cheaper than the special cases the alternative needs.
+static func road_route(a: Vector3, b: Vector3, origin: Vector3) -> PackedVector3Array:
+	var best := PackedVector3Array()
+	var best_len: float = INF
+	for ca: Dictionary in _access_candidates(a, origin):
+		for cb: Dictionary in _access_candidates(b, origin):
+			var cand: PackedVector3Array = _route_between(a, b, ca, cb, origin)
+			var total: float = 0.0
+			for i in range(1, cand.size()):
+				total += cand[i].distance_to(cand[i - 1])
+			if total < best_len:
+				best_len = total
+				best = cand
+	return best
+
+
+static func _route_between(a: Vector3, b: Vector3, ca: Dictionary, cb: Dictionary,
+		origin: Vector3) -> PackedVector3Array:
+	var ap: Vector3 = ca["pos"]
+	var bp: Vector3 = cb["pos"]
+	var a_h: bool = ca["h"]
+	var b_h: bool = cb["h"]
+
+	var pts := PackedVector3Array([a, ap])
+
+	if a_h and b_h:
+		if not is_equal_approx(ap.z, bp.z):
+			# Two east-west roads: drive across, turn up the destination's
+			# column, then turn onto its street.
+			var vx: float = nearest_road_x(bp.x, origin.x)
+			pts.append(Vector3(vx, a.y, ap.z))
+			pts.append(Vector3(vx, a.y, bp.z))
+	elif not a_h and not b_h:
+		if not is_equal_approx(ap.x, bp.x):
+			var vz: float = nearest_road_z(bp.z, origin.z)
+			pts.append(Vector3(ap.x, a.y, vz))
+			pts.append(Vector3(bp.x, a.y, vz))
+	elif a_h:
+		pts.append(Vector3(bp.x, a.y, ap.z))    # turn onto b's column
+	else:
+		pts.append(Vector3(ap.x, a.y, bp.z))    # turn onto b's row
+
+	pts.append(bp)
+	pts.append(b)
+	return _dedupe(pts)
+
+
+## Drops points that land on top of each other, which the corner cases above
+## produce whenever two legs happen to share a road.
+static func _dedupe(pts: PackedVector3Array) -> PackedVector3Array:
+	var out := PackedVector3Array()
+	for p: Vector3 in pts:
+		if out.is_empty() or out[out.size() - 1].distance_to(p) > 0.5:
+			out.append(p)
+	return out
 
 
 ## Shared facade look, so StoryRift's wall variant reads as the same city fabric

@@ -372,20 +372,55 @@ func route(from_id: String, to_id: String) -> PackedStringArray:
 	return out
 
 
-## World-space waypoints for a route, with each edge's authored `via` points
-## folded in (and reversed when the edge is walked toward the hub). This is what
-## the walker follows and what the path visuals are drawn from, so a curve
-## authored once bends both.
-func waypoints(route_ids: PackedStringArray) -> PackedVector3Array:
+## The world-space polyline for one edge, routed along the city's streets rather
+## than cut straight across the blocks. Authored `via` points still work — they
+## become intermediate stops, and each leg between them is road-routed too.
+##
+## This is the single source of both the dotted trail and the walker's route, so
+## Meeko physically walks the line that is drawn.
+func edge_points(a: String, b: String) -> PackedVector3Array:
+	var stops := PackedVector3Array([position_of(a)])
+	for bend: Vector3 in edge_via(a, b):
+		stops.append(bend)
+	stops.append(position_of(b))
+
 	var out := PackedVector3Array()
-	if route_ids.is_empty():
-		return out
-	out.append(position_of(route_ids[0]))
-	for i in range(1, route_ids.size()):
-		for p: Vector3 in edge_via(route_ids[i - 1], route_ids[i]):
-			out.append(p)
-		out.append(position_of(route_ids[i]))
+	for i in range(1, stops.size()):
+		var leg: PackedVector3Array = StoryCity.road_route(stops[i - 1], stops[i], hub_position)
+		for j in leg.size():
+			if i > 1 and j == 0:
+				continue    # the previous leg already ended on this point
+			out.append(leg[j])
 	return out
+
+
+## World-space waypoints for a whole route, road-routed end to end.
+func waypoints(route_ids: PackedStringArray) -> PackedVector3Array:
+	return travel_plan(route_ids).get("points", PackedVector3Array())
+
+
+## Points plus the node id reached at each one ("" for a street corner), kept in
+## step by being built together. They used to be assembled separately — the map
+## rebuilt the id list by counting `via` points — which only held while a leg was
+## a straight line. Road routing inserts corners, so anything counting hops would
+## now silently mis-label which waypoint is a rift.
+##
+## Returns {"points": PackedVector3Array, "ids": PackedStringArray}.
+func travel_plan(route_ids: PackedStringArray) -> Dictionary:
+	var points := PackedVector3Array()
+	var ids := PackedStringArray()
+	if route_ids.is_empty():
+		return {"points": points, "ids": ids}
+
+	points.append(position_of(route_ids[0]))
+	ids.append(route_ids[0])
+	for i in range(1, route_ids.size()):
+		var leg: PackedVector3Array = edge_points(route_ids[i - 1], route_ids[i])
+		# Skip the leg's first point: the previous leg already ended there.
+		for j in range(1, leg.size()):
+			points.append(leg[j])
+			ids.append(route_ids[i] if j == leg.size() - 1 else "")
+	return {"points": points, "ids": ids}
 
 
 ## The `via` points on the edge between two adjacent route entries, oriented for
