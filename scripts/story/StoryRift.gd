@@ -124,6 +124,12 @@ var _flicker_frame: int = 0
 var _flash: float = 0.0
 var _rng := RandomNumberGenerator.new()
 
+## The tear roots, turned to face the camera each frame. Aiming the NODE rather
+## than using a billboard material because the core layer is a ShaderMaterial —
+## billboard_mode is a StandardMaterial3D property, so a material-side billboard
+## would turn two of the three layers and leave the hot core behind.
+var _tears: Array[Node3D] = []
+
 ## Crack seams. One ShaderMaterial per rift; the surge position is a uniform, so
 ## animating a fracture costs one float per frame no matter how long it is.
 var _crack_mats: Array[ShaderMaterial] = []
@@ -218,13 +224,17 @@ func _build_wall() -> void:
 
 ## Builds one three-layer tear at `at`, `height` tall.
 ##
-## It is CROSSED — two ribbons at right angles — so it keeps its silhouette from
-## any bearing instead of thinning to a line when the map camera comes round to
-## its edge.
+## ONE ribbon per layer, turned to face the camera every frame. It used to be
+## crossed — two ribbons at right angles — so that it kept a silhouette from any
+## bearing. The map camera never orbits, so all that ever bought was a second
+## copy of the rift standing inside the first one at 90 degrees, which read as
+## two rifts in the same hole. Aiming a single ribbon costs nothing and is
+## always face-on.
 func _build_tear(parent: Node3D, at: Vector3, height: float, width: float,
 		jag: float, steps: int) -> void:
 	var tear := Node3D.new()
 	tear.name = "Tear"
+	_tears.append(tear)
 	tear.position = at
 	parent.add_child(tear)
 
@@ -718,6 +728,8 @@ func _process(delta: float) -> void:
 		core.set_shader_parameter("energy", CORE_ENERGY * lit)
 		core.set_shader_parameter("surge", _surge)
 
+	_aim_tears()
+
 	if _ring != null and _ring.visible:
 		var r: float = 1.0 + 0.04 * sin(_pulse_t * 4.0)
 		_ring.scale = Vector3(r, 1.0, r)
@@ -727,6 +739,25 @@ func _process(delta: float) -> void:
 			ring_mat.emission = col
 			ring_mat.albedo_color = col
 			ring_mat.emission_energy_multiplier = (1.6 if _selected else 0.9) * pulse
+
+
+## Turns every tear to face the map camera.
+##
+## Read from the live camera rather than hard-coded to its bearing: that bearing
+## happens to be fixed today, and a rift silently going edge-on is exactly the
+## kind of thing that would go unnoticed if the camera ever learned to turn.
+func _aim_tears() -> void:
+	if _tears.is_empty():
+		return
+	var cam: Camera3D = get_viewport().get_camera_3d() if is_inside_tree() else null
+	if cam == null:
+		return
+	for tear: Node3D in _tears:
+		var to: Vector3 = cam.global_position - tear.global_position
+		to.y = 0.0
+		if to.length_squared() < 0.01:
+			continue
+		tear.global_rotation.y = atan2(to.x, to.z)
 
 
 ## Runs a pulse of light out along the cracks, then waits before the next one.
