@@ -13,7 +13,7 @@ const DEADZONE_RT := 0.45
 
 func _ready() -> void:
 	# Ensure actions exist
-	for a in ["lane_0", "lane_1", "lane_2", "lane_3", "rhythm_pause"]:
+	for a in ["lane_0", "lane_1", "lane_2", "lane_3", "rhythm_pause", "ui_cancel"]:
 		if not InputMap.has_action(a):
 			InputMap.add_action(a)
 
@@ -26,12 +26,25 @@ func _ready() -> void:
 	_ensure_trigger("lane_1", JOY_AXIS_TRIGGER_LEFT,  DEADZONE_LT) # LT -> lane 1
 	_ensure_trigger("lane_2", JOY_AXIS_TRIGGER_RIGHT, DEADZONE_RT) # RT -> lane 2
 
+	# Back/cancel. Godot's built-in `ui_cancel` is Escape and nothing else — it
+	# ships no joypad event, unlike ui_left/ui_right which do carry the D-pad.
+	# So gamepad B did nothing on every menu in the game, including the pause
+	# menu that already had a comment claiming B backed out of it. One binding
+	# here fixes all of them at once, since every screen already asks for
+	# `ui_cancel` rather than reading the button itself.
+	#
+	# B is also `runner_slide` during play. That is not a conflict: an event can
+	# feed two actions, and no screen listens for `ui_cancel` while the player is
+	# actually running — the runner only checks it on the pause, death and end
+	# screens, where sliding is not happening.
+	_ensure_button("ui_cancel", JOY_BUTTON_B)
+
 	# Optional: Start -> pause
 	var start_btn := InputEventJoypadButton.new()
 	start_btn.button_index = JOY_BUTTON_START
 	InputMap.action_add_event("rhythm_pause", start_btn)
 
-	print("[GamepadSetup] Shoulders bound: LB/LT/RT/RB -> lanes 0/1/2/3")
+	print("[GamepadSetup] Shoulders bound: LB/LT/RT/RB -> lanes 0/1/2/3; B -> ui_cancel")
 
 func _ensure_button(action: String, btn: int) -> void:
 	for e in InputMap.action_get_events(action):

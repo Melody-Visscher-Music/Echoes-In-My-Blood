@@ -40,7 +40,7 @@ const DEFAULT_PATH: String = "res://data/story/story_map.json"
 var order: PackedStringArray = PackedStringArray()
 
 ## id -> {
-##   "id", "title", "song_key", "branch", "cluster", "variant",
+##   "id", "title", "song_key", "branch", "cluster",
 ##   "parent"     : String             — graph edge toward the hub
 ##   "position"   : Vector3            — resolved world position
 ##   "via"        : PackedVector3Array — extra waypoints on the edge from `parent`
@@ -161,7 +161,6 @@ func _parse(root: Dictionary) -> void:
 			"song_key": String(n.get("song_key", "")),
 			"branch": branch_id,
 			"cluster": String(n.get("cluster", branch_id)),
-			"variant": String(n.get("variant", "auto")),
 			# Which way the rift looks: out at the road it fronts onto.
 			"facing": facing,
 			"parent": String(n.get("connects_from", hub_id)),
@@ -262,9 +261,8 @@ func position_of(id: String) -> Vector3:
 	return n.get("position", hub_position) as Vector3
 
 
-## The direction a rift faces — out toward the street it fronts onto, so the
-## wall variant's facade ends up behind it inside the block rather than standing
-## in the road.
+## The direction a rift faces — out toward the street it fronts onto, so what
+## it opens into is the road rather than the block behind it.
 func facing_of(id: String) -> Vector3:
 	if id == hub_id:
 		return hub_facing
@@ -379,6 +377,32 @@ func unlocked_ids(cleared: PackedStringArray) -> PackedStringArray:
 	return out
 
 
+## How far in front of a rift Meeko waits.
+##
+## He used to stop on the node's own position, which is the middle of the tear:
+## standing in the hole rather than at it, and swallowed by the rift's own
+## geometry the moment the camera came anywhere near. The stand-off is measured
+## along the rift's spur to its doorstep, so it is a step back onto a line the
+## route already walked — no new geometry, and never through a wall.
+const STAND_OFF: float = 4.6
+
+
+## Where Meeko waits at a node: just outside a rift, and in the middle of the
+## plaza at the hub, which is a place to stand rather than a hole to avoid.
+func stand_point_of(id: String) -> Vector3:
+	if id == hub_id:
+		return hub_position
+	var pos: Vector3 = position_of(id)
+	var out: Vector3 = doorstep_of(id) - pos
+	out.y = 0.0
+	var reach: float = out.length()
+	if reach < 0.4:
+		return pos
+	# Never past the doorstep. A rift sitting close to its street would
+	# otherwise put him in the road.
+	return pos + out / reach * minf(STAND_OFF, reach * 0.65)
+
+
 ## The world-space polyline for one edge, routed along the city's streets rather
 ## than cut straight across the blocks. Authored `via` points still work — they
 ## become intermediate stops, and each leg between them is road-routed too.
@@ -391,11 +415,11 @@ func edge_points(a: String, b: String) -> PackedVector3Array:
 		stops.append(bend)
 	stops.append(doorstep_of(b))
 
-	var pts := PackedVector3Array([position_of(a)])
+	var pts := PackedVector3Array([stand_point_of(a)])
 	for i in range(1, stops.size()):
 		for p: Vector3 in StoryCity.road_route(stops[i - 1], stops[i], hub_position):
 			pts.append(p)
-	pts.append(position_of(b))
+	pts.append(stand_point_of(b))
 	return StoryCity.dedupe_points(pts)
 
 

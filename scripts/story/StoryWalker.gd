@@ -56,6 +56,7 @@ const CHARACTER_GLB: String = "res://assets/SIAGCharacter.glb"
 var walk_clips: PackedStringArray = PackedStringArray(["Walk", "Run"])
 var idle_clip: String = "Idle"
 
+var _pivot: Node3D = null
 var _model: Node3D = null
 var _anim: AnimationPlayer = null
 var _using_glb: bool = false
@@ -85,6 +86,7 @@ func _build_character(accent: Color) -> void:
 	var pivot := Node3D.new()
 	pivot.name  = "Pivot"
 	pivot.scale = Vector3.ONE * map_scale
+	_pivot = pivot
 	add_child(pivot)
 	_build_contact_shadow(pivot)
 
@@ -171,6 +173,7 @@ func is_walking() -> bool:
 
 ## Drops Meeko onto a node with no walk — used when the map first loads.
 func snap_to(pos: Vector3, facing: Vector3 = Vector3.ZERO) -> void:
+	_clear_entry_pose()
 	_walking = false
 	_route = PackedVector3Array()
 	global_position = pos
@@ -190,6 +193,7 @@ func walk(points: PackedVector3Array, ids: PackedStringArray, destination_id: St
 		_destination = destination_id
 		_finish()
 		return
+	_clear_entry_pose()
 	_route = points
 	_route_ids = ids
 	_destination = destination_id
@@ -245,6 +249,118 @@ func _finish() -> void:
 	_route = PackedVector3Array()
 	_play_idle()
 	arrived.emit(_destination)
+
+
+# ── Entering a rift ──────────────────────────────────────────────────────────
+
+## The last stride into a rift, then being drawn through it. Returns when he is
+## gone.
+##
+## This is NOT travel: no route, no `arrived`, no change to the map's idea of
+## which node Meeko is standing on. It is a scripted beat the map awaits, and
+## the character handling stays in here so the map never has to know how Meeko
+## is put together.
+##
+## `look` is the way to turn before stepping, or Vector3.ZERO to keep the
+## heading he arrived with - a ground rift takes him straight down, so there is
+## nothing for him to turn toward.
+func enter_rift(mouth: Vector3, look: Vector3, step_time: float,
+		draw_time: float) -> void:
+	_walking = false
+	_route = PackedVector3Array()
+
+	var from: Vector3 = global_position
+	var heading: float = rotation.y
+	if look.length_squared() > 0.001:
+		heading = atan2(look.x, look.z)
+
+	# Step. Short by design - he is already standing on the rift, so this is a
+	# stride onto the mouth of it rather than an approach, and its job is to put
+	# the walk cycle on screen one last time before he goes.
+	_play_move()
+	var t: float = 0.0
+	while t < step_time:
+		t += get_process_delta_time()
+		await get_tree().process_frame
+		if not is_inside_tree():
+			return
+		var k: float = clampf(t / maxf(0.001, step_time), 0.0, 1.0)
+		global_position = from.lerp(mouth, k)
+		rotation.y = lerp_angle(rotation.y, heading, clampf(k, 0.0, 1.0))
+
+	# Drawn through. Scale and sink rather than a fade: the model is an imported
+	# GLB whose materials are not ours to make transparent, and being pulled
+	# down and in reads better from map distance than dissolving anyway.
+	_play_idle()
+	t = 0.0
+	while t < draw_time:
+		t += get_process_delta_time()
+		await get_tree().process_frame
+		if not is_inside_tree():
+			return
+		set_entry_progress(clampf(t / maxf(0.001, draw_time), 0.0, 1.0))
+	set_entry_progress(1.0)
+
+
+## The mirror of enter_rift(): coming back out. He appears inside the mouth, is
+## pushed out of it, then walks to where he waits. Same rules — this is not
+## travel, nothing is announced, and the map's idea of where he stands does not
+## change.
+func exit_rift(mouth: Vector3, stand: Vector3, draw_time: float,
+		step_time: float) -> void:
+	_walking = false
+	_route = PackedVector3Array()
+	global_position = mouth
+	var out: Vector3 = stand - mouth
+	out.y = 0.0
+	if out.length_squared() > 0.001:
+		rotation.y = atan2(out.x, out.z)
+
+	# Pushed out: the draw-in run backwards.
+	set_entry_progress(1.0)
+	_play_idle()
+	var t: float = 0.0
+	while t < draw_time:
+		t += get_process_delta_time()
+		await get_tree().process_frame
+		if not is_inside_tree():
+			return
+		set_entry_progress(1.0 - clampf(t / maxf(0.001, draw_time), 0.0, 1.0))
+	_clear_entry_pose()
+
+	# And walks clear of it.
+	_play_move()
+	t = 0.0
+	while t < step_time:
+		t += get_process_delta_time()
+		await get_tree().process_frame
+		if not is_inside_tree():
+			return
+		global_position = mouth.lerp(stand, clampf(t / maxf(0.001, step_time), 0.0, 1.0))
+	global_position = stand
+	_play_idle()
+
+
+## How far through being drawn into a rift he is: 0 standing, 1 gone.
+func set_entry_progress(t: float) -> void:
+	if _pivot == null:
+		return
+	# Squared, so he holds his shape for the first half of the beat and then
+	# goes quickly - a linear shrink reads as the model being scaled, not as
+	# something being pulled in.
+	var k: float = clampf(t, 0.0, 1.0)
+	var eased: float = k * k
+	_pivot.scale = Vector3.ONE * map_scale * lerpf(1.0, 0.05, eased)
+	_pivot.position.y = lerpf(0.0, -1.6, eased)
+	_pivot.rotation.y = eased * TAU * 1.5
+
+
+func _clear_entry_pose() -> void:
+	if _pivot == null:
+		return
+	_pivot.scale = Vector3.ONE * map_scale
+	_pivot.position.y = 0.0
+	_pivot.rotation.y = 0.0
 
 
 # ── Animation seam ───────────────────────────────────────────────────────────

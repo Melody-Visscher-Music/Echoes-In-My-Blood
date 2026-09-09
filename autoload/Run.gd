@@ -47,6 +47,19 @@ var story_node_id: String = ""
 ## one should trigger a cutscene.
 var story_just_cleared: String = ""
 
+## The colour of the rift the player stepped into, so the level's own gateway
+## rifts can be built to match it. The level still never learns what a story
+## node IS — it is handed a colour, not an id to look up.
+var story_accent: Color = Color(0.72, 0.30, 1.00)
+
+## The finished run's numbers, handed back to the map.
+##
+## Story Mode has no results screen inside the level: the way out of a story
+## level is the map, so the score is reported there. Empty except on the one
+## trip from a finished level back to the map. Keys: score, best, is_perfect,
+## is_new_high, grade, grade_color, max_combo, hit, missed, accuracy.
+var story_result: Dictionary = {}
+
 func in_story_mode() -> bool:
 	return story_node_id != ""
 
@@ -76,6 +89,7 @@ func on_story_level_cleared() -> void:
 func end_story_context() -> void:
 	story_node_id = ""
 	story_just_cleared = ""
+	story_result = {}
 
 func start_new_run(seed_value, chosen_class):
 	run_seed = seed_value

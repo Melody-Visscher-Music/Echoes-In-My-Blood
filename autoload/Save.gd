@@ -133,6 +133,38 @@ func set_story_position(node_id: String) -> void:
 	cfg.set_value("story", "position", node_id)
 	cfg.save(_STORY_PATH)
 
+## The map's time of day, as a position in StoryMap.TIME_PRESETS, together with
+## the wall-clock second it was written at.
+##
+## Both halves matter. Without the time the map opens at noon every single visit,
+## which is what it did before; without the STAMP the clock freezes the moment
+## you look away, so a level could take five minutes and the city would not have
+## moved — the thing that was supposed to feel alive would only be alive while
+## being watched.
+##
+## Returns time = -1.0 when nothing has been saved yet, meaning "pick a default".
+func get_story_time() -> Dictionary:
+	var cfg := ConfigFile.new()
+	if cfg.load(_STORY_PATH) != OK:
+		return {"time": -1.0, "elapsed": 0.0}
+	var t: float = float(cfg.get_value("story", "time_of_day", -1.0))
+	var stamp: int = int(cfg.get_value("story", "time_stamp", 0))
+	var now: int = int(Time.get_unix_time_from_system())
+	# Guard a clock that has gone backwards (system time changed, or a save
+	# copied from another machine): treat it as no time having passed rather
+	# than winding the city backwards.
+	var elapsed: float = maxf(0.0, float(now - stamp)) if stamp > 0 else 0.0
+	return {"time": t, "elapsed": elapsed}
+
+
+func set_story_time(t: float) -> void:
+	var cfg := ConfigFile.new()
+	cfg.load(_STORY_PATH)   # ignore error — file may not exist yet
+	cfg.set_value("story", "time_of_day", t)
+	cfg.set_value("story", "time_stamp", int(Time.get_unix_time_from_system()))
+	cfg.save(_STORY_PATH)
+
+
 ## Wipes story progress, putting the map back to its opening state (dev tool).
 func clear_story_progress() -> void:
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(_STORY_PATH))

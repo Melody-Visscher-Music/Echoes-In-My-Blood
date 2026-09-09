@@ -3,18 +3,17 @@ extends Node3D
 
 ## One echo rift on the Story Mode map — the map's stand-in for a level.
 ##
-## PLACEHOLDER ART. Every mesh in here is a primitive (torus, box, cylinder)
-## standing in for real rift art. Two variants exist:
+## PLACEHOLDER ART, except the tear itself, which is real swept geometry — see
+## _build_tear(). Everything around it (halo, shaft, ring) is still a primitive.
 ##
-##   * GROUND — a tear standing open in the street.
-##   * WALL   — the same tear splitting a building facade, so a cluster does not
-##              read as three identical decals on the tarmac.
+## ONE kind of rift. There used to be two, GROUND and WALL, differing only in
+## how tall the tear was and where its cracks started; that existed to stop a
+## cluster reading as three identical decals on the tarmac, back when the tear
+## was a flat card and a card is all it could ever look like. A solid tear that
+## wanders differently every frame does that job on its own.
 ##
-## The variant is PURELY visual variety: nothing downstream branches on it.
-## StoryMap picks one per node ("auto" alternates) and that is the end of it.
-##
-## TODO(art): replace _build_ground()/_build_wall() with the authored rift
-## meshes + the rift shader once they exist. The public surface here — setup(),
+## TODO(art): replace _build_rift() with the authored rift meshes + the rift
+## shader once they exist. The public surface here — setup(),
 ## set_revealed(), set_selected(), set_hovered(), pick_radius() — is what the
 ## map talks to, so real art can land behind it without touching StoryMap.gd.
 ##
@@ -26,9 +25,6 @@ extends Node3D
 ## Emitted when the player clicks this rift. StoryMap does the picking (screen
 ## space, not physics) and calls `press()`, so this stays a pure visual.
 signal picked(node_id: String)
-
-const VARIANT_GROUND: String = "ground"
-const VARIANT_WALL:   String = "wall"
 
 ## Metres of slack around the rift's screen position that still counts as a
 ## click on it. Generous on purpose — the camera sits at map distance, so a
@@ -45,7 +41,6 @@ const VOID_COL: Color = Color(0.030, 0.020, 0.055)
 
 var node_id: String = ""
 var title: String = ""
-var variant: String = VARIANT_GROUND
 var accent: Color = Color(0.72, 0.30, 1.00)
 
 var _revealed: bool = false
@@ -84,15 +79,22 @@ var _shaft_alpha: float = 0.085
 ## How many alternative bolt shapes are built per rift. Cheap — each frame is a
 ## couple of dozen vertices — and five is enough that the cycle never reads as a
 ## loop at the rate they are swapped.
-const FLICKER_FRAMES: int = 1500
-## Seconds between snaps. Irregular on purpose: a fixed interval reads as a
-## strobe, and the whole point is that a rift is UNSTABLE, not ticking.
-const FLICKER_MIN: float = 0.0005
-const FLICKER_MAX: float = 0.25
-## A closed rift barely twitches. It is sealed, not dead.
+## Frames in the animation LOOP, played in order.
+##
+## These used to be 1500 unrelated shapes jumped between at random, which is
+## what made the tear read as snapping rather than moving. They are now one
+## continuous cycle: frame f is a smooth function of f, and the last frame joins
+## the first, so playing them in sequence is smooth motion and the loop never
+## shows a seam. Far fewer are needed for that — a hundred and twenty related
+## shapes animate better than fifteen hundred unrelated ones, and cost a
+## twelfth of the meshes to build.
+const FLICKER_FRAMES: int = 120
+## Frames per second of playback. With FLICKER_FRAMES above, the loop runs
+## three seconds; the wobble harmonics in _zigzag_line are set against that.
+const FLICKER_FPS: float = 40.0
+## A closed rift barely moves. It is sealed, not dead.
 const FLICKER_CLOSED_SCALE: float = 15.0
-## Extra emission on the frame a snap lands, decaying away. The brightness kick
-## is what sells the snap as electrical rather than as a mesh swap.
+## Extra emission laid on by a scripted beat, decaying away.
 const FLICKER_FLASH: float = 0.55
 const FLICKER_FLASH_DECAY: float = 7.0
 
@@ -122,13 +124,18 @@ var _flicker_layers: Array[Dictionary] = []
 var _flicker_t: float = 0.0
 var _flicker_frame: int = 0
 var _flash: float = 0.0
+## Extra output laid over the breathing pulse by a scripted beat - 1.0 is the
+## rift behaving normally. Beats drive THIS rather than writing the emission
+## straight onto the materials, because _process rewrites those every frame:
+## the reveal flourish used to tween the materials directly and was overwritten
+## before it could be seen.
+var _drive: float = 1.0
 var _rng := RandomNumberGenerator.new()
 
-## The tear roots, turned to face the camera each frame. Aiming the NODE rather
-## than using a billboard material because the core layer is a ShaderMaterial —
-## billboard_mode is a StandardMaterial3D property, so a material-side billboard
-## would turn two of the three layers and leave the hot core behind.
-var _tears: Array[Node3D] = []
+## Prebuilt shapes this rift flickers between. FLICKER_FRAMES on the map, which
+## can afford them; a level asks for far fewer — see setup().
+var _frames: int = FLICKER_FRAMES
+
 
 ## Crack seams. One ShaderMaterial per rift; the surge position is a uniform, so
 ## animating a fracture costs one float per frame no matter how long it is.
@@ -144,34 +151,39 @@ var _surge_wait: float = 0.0
 
 ## Builds the rift. `accent_col` is the saturated rift colour — the one thing on
 ## the map allowed to be bright.
-func setup(id: String, node_title: String, node_variant: String, accent_col: Color) -> void:
+##
+## `frames` is how many tear shapes to prebuild. Every one of them is three
+## meshes generated at load, so the map's full FLICKER_FRAMES is a few thousand
+## meshes per rift — worth it there, where the rifts ARE the screen and there
+## are ten of them to tell apart. A level uses the same rift as a doorway for a
+## few seconds at each end, so it asks for a fraction of that. The flicker steps
+## by a random amount rather than in sequence, so a short list still never
+## visibly repeats.
+func setup(id: String, node_title: String, accent_col: Color,
+		frames: int = FLICKER_FRAMES) -> void:
 	node_id = id
 	title   = node_title
-	variant = node_variant if node_variant in [VARIANT_GROUND, VARIANT_WALL] else VARIANT_GROUND
 	accent  = accent_col
+	_frames = maxi(2, frames)
 
 	_content = Node3D.new()
 	_content.name = "Content"
 	add_child(_content)
 
-	if variant == VARIANT_WALL:
-		_build_wall()
-	else:
-		_build_ground()
-
+	_build_rift()
 	_build_shared()
-	# Offset per rift, so a cluster of three does not snap in unison and read as
+	# Offset per rift, so a cluster of three does not run in unison and read as
 	# one animation playing on three objects.
 	_rng.seed = hash(id) ^ 0x5EED
-	_flicker_t = _rng.randf_range(FLICKER_MIN, FLICKER_MAX)
+	_flicker_t = _rng.randf() * float(_frames)
 	# Hidden until the map says otherwise: locked rifts are not on the map at
 	# all, so nothing here may be visible before set_revealed() allows it.
 	visible = false
 
 
-## Turns the rift to face `target` on the XZ plane. Only the wall variant really
-## cares (its facade has a front), but both are called the same way so the map
-## does not have to know which variant it built.
+## Turns the rift to face `target` on the XZ plane. The tear has no front any
+## more, but the cracks and the halo do, and a rift still wants to open toward
+## its street rather than across it.
 func face_toward(target: Vector3) -> void:
 	var to: Vector3 = target - global_position
 	to.y = 0.0
@@ -180,7 +192,6 @@ func face_toward(target: Vector3) -> void:
 	rotation.y = atan2(to.x, to.z)
 
 
-# ── Variants ─────────────────────────────────────────────────────────────────
 
 ## The tear is a generated zigzag ribbon, not a primitive. Nothing in the box
 ## library makes a lightning-bolt silhouette, and that hard angular break is the
@@ -194,12 +205,17 @@ func face_toward(target: Vector3) -> void:
 ##   CORE  — narrow and near-white hot. Colour lives in the edge; the core is
 ##           the part that is too bright to have a colour.
 ##
-## Each layer is built CROSSED — two ribbons at right angles — so the rift keeps
-## its silhouette from any bearing instead of thinning to a line when the map
-## camera comes round to its edge.
+## Each layer is a SWEPT PRISM around a path that wanders in all three axes —
+## real geometry, not cards. Everything before it was a flat ribbon dressed up:
+## first turned to face the camera, then crossed with a second ribbon, then
+## fanned into three. All of those are the same trick, and at the distance a
+## level puts the player from a rift the trick is what you see.
+##
+## The three layers are concentric tubes, so their CULL MODES are what let all
+## three be visible at once — see the materials below.
 
 
-func _build_ground() -> void:
+func _build_rift() -> void:
 	# One standing tear, no floor copy. It is tall and wide enough that what
 	# survives the map camera's foreshortening is still a bolt, and the cracks
 	# spreading from its foot are what locate it from directly above.
@@ -209,39 +225,28 @@ func _build_ground() -> void:
 	_build_cracks(_content, Vector3(0.0, 0.05, 0.0), 8)
 
 
-func _build_wall() -> void:
-	# The building this is cut into is NOT built here — StoryCity owns it, so it
-	# stands from the first frame instead of appearing along with the rift. See
-	# StoryCity.build_rift_facade().
-
-	# The tear splits the facade rather than standing in front of it, and runs
-	# down past the plinth so it reaches the ground it fractures.
-	_build_tear(_content, Vector3(0.0, 0.0, -1.15), 13.4, 1.9, 1.05, 13)
-
-	_ring_mesh("Halo", 2.4, 3.0, Vector3(0.0, 0.04, 0.7), accent, 0.9)
-	_build_cracks(_content, Vector3(0.0, 0.05, 0.55), 7)
-
-
 ## Builds one three-layer tear at `at`, `height` tall.
 ##
-## ONE ribbon per layer, turned to face the camera every frame. It used to be
-## crossed — two ribbons at right angles — so that it kept a silhouette from any
-## bearing. The map camera never orbits, so all that ever bought was a second
-## copy of the rift standing inside the first one at 90 degrees, which read as
-## two rifts in the same hole. Aiming a single ribbon costs nothing and is
-## always face-on.
+## Each layer is a SWEPT PRISM around a path that wanders in all three axes.
+##
+## This was a flat card for a long time, with three goes at making a card look
+## three-dimensional — turned to face the camera, then crossed with a second
+## card, then fanned into three. All the same trick, and from a camera that
+## comes anywhere close the trick is what you see.
+##
+## The three layers are concentric tubes, so their CULL MODES are what let all
+## three be visible at once — see the materials below.
 func _build_tear(parent: Node3D, at: Vector3, height: float, width: float,
 		jag: float, steps: int) -> void:
 	var tear := Node3D.new()
 	tear.name = "Tear"
-	_tears.append(tear)
 	tear.position = at
 	parent.add_child(tear)
 
-	# One centreline per flicker frame, shared by all three layers.
+	# One centreline per frame of the loop, shared by all three layers.
 	var lines: Array = []
-	for f in FLICKER_FRAMES:
-		lines.append(_zigzag_line(height, jag, steps, hash(node_id) + f * 7919))
+	for f in _frames:
+		lines.append(_zigzag_line(height, jag, steps, float(f) / float(_frames)))
 
 	var layers: Array = [
 		["Void", width * 1.95, jag, VOID_COL, 0.0, false],
@@ -250,7 +255,7 @@ func _build_tear(parent: Node3D, at: Vector3, height: float, width: float,
 	]
 	for layer: Array in layers:
 		var frames: Array = []
-		for line: PackedVector2Array in lines:
+		for line: PackedVector3Array in lines:
 			frames.append(_zigzag_mesh(line, float(layer[1])))
 		var mesh: ArrayMesh = frames[0]
 		# OPAQUE, not additive. The reference gets its punch from glow over a
@@ -274,81 +279,161 @@ func _build_tear(parent: Node3D, at: Vector3, height: float, width: float,
 			mat = sm
 		elif bool(layer[5]):
 			mat = _glow_mat(layer[3] as Color, float(layer[4]))
-			(mat as StandardMaterial3D).cull_mode = BaseMaterial3D.CULL_DISABLED
+			(mat as StandardMaterial3D).cull_mode = BaseMaterial3D.CULL_FRONT
 		else:
 			# The void is a real hole, so it is unlit as well as unshaded.
 			var vm := StandardMaterial3D.new()
 			vm.albedo_color = layer[3] as Color
 			vm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-			vm.cull_mode    = BaseMaterial3D.CULL_DISABLED
+			# Near wall culled, which is the trick that makes three concentric
+			# opaque tubes work at all: the void is the widest, so drawn
+			# normally it is a black shell hiding the edge and the core inside
+			# it. Showing only each layer's FAR wall stacks them back to front
+			# the way the old flat ribbons did, but in the round — and without
+			# transparency, which the bright map background would wash out.
+			vm.cull_mode    = BaseMaterial3D.CULL_FRONT
 			mat = vm
 
-		var depth: float = float(layers.find(layer)) * 0.014
-		var instances: Array[MeshInstance3D] = []
-		for pass_i in 2:
-			var mi := MeshInstance3D.new()
-			mi.name = "%s_%d" % [String(layer[0]), pass_i]
-			mi.mesh = mesh
-			mi.material_override = mat
-			mi.rotation.y = PI * 0.5 * float(pass_i)
-			# Nudge each layer in front of the one behind it so the three never
-			# fight over the same depth.
-			mi.position.z = depth
-			tear.add_child(mi)
-			instances.append(mi)
-		_flicker_layers.append({"instances": instances, "frames": frames})
+		# No depth nudge: the layers are nested tubes of different radii and
+		# never share a surface to fight over.
+		var mi := MeshInstance3D.new()
+		mi.name = String(layer[0])
+		mi.mesh = mesh
+		mi.material_override = mat
+		tear.add_child(mi)
+		_flicker_layers.append({"instances": [mi] as Array[MeshInstance3D], "frames": frames})
 
 
-## The zigzag centreline for one flicker frame: an (offset, height) pair per
-## turning point.
+## The tear's centreline at `phase` (0-1 through the loop): one turning point
+## per step, wandering in all three axes.
 ##
 ## The centreline is generated ONCE per frame and all three layers are built
 ## from it, so the core always sits inside the edge and the edge inside the
 ## void. Generating them separately let the layers drift apart and the tear came
 ## out looking like three unrelated bolts stacked up.
-func _zigzag_line(height: float, jag: float, steps: int, frame_seed: int) -> PackedVector2Array:
-	var rng := RandomNumberGenerator.new()
-	rng.seed = frame_seed
-	var line := PackedVector2Array()
+##
+## Every turning point moves on its OWN pair of sine waves, seeded from the rift
+## id and the point's index so they are stable across frames. Two things follow
+## from that, and both matter:
+##
+##   * the shape at phase f is a small step from the shape at phase f-1, so
+##     playing the frames in order is smooth motion rather than snapping;
+##   * the harmonics are WHOLE numbers of cycles per loop, so phase 1 lands
+##     exactly on phase 0 and the loop closes with no seam.
+func _zigzag_line(height: float, jag: float, steps: int, phase: float) -> PackedVector3Array:
+	var line := PackedVector3Array()
 	for i in steps + 1:
 		var t: float = float(i) / float(steps)
 		# Fat in the middle, pinched at both ends, so the tear closes rather
 		# than stopping dead.
 		var taper: float = pow(sin(t * PI), 0.45)
-		var side: float = 1.0 if i % 2 == 0 else -1.0
-		# Each frame kicks the turning points around a little. That variation is
-		# the entire flicker — the shape does not morph, it SNAPS, which is what
-		# lightning does and what a smooth tween never manages to look like.
-		var off: float = jag * taper * side * rng.randf_range(0.55, 1.35)
+
+		var rng := RandomNumberGenerator.new()
+		rng.seed = hash(node_id) ^ (i * 7919 + 13)
+		# Two harmonics per point, one slow and one quick, so the wander never
+		# settles into an obvious rhythm. Against a three-second loop these run
+		# at roughly 0.7-1.3 Hz and 1.3-2.7 Hz — a live shimmer rather than a
+		# sway, and slow enough that no vertex crosses much more than a tenth of
+		# a metre between frames.
+		var f1: float = float(rng.randi_range(2, 4))
+		var f2: float = float(rng.randi_range(4, 8))
+		var p1: float = rng.randf_range(0.0, TAU)
+		var p2: float = rng.randf_range(0.0, TAU)
+		var w: float = 0.76 * sin(TAU * phase * f1 + p1) \
+			+ 0.24 * sin(TAU * phase * f2 + p2)
+
+		# The kick alternates sides the way a bolt does, then swings OUT of that
+		# plane by a per-point amount. A planar zigzag is a flat object however
+		# it is meshed, so the swing is half of what makes this
+		# three-dimensional — the swept prism alone would not have got there.
+		#
+		# It is deliberately not a full coil. Spreading the turning points right
+		# around the axis (the golden angle) is more three-dimensional and reads
+		# WORSE: from map distance it projects as a compact tangle instead of a
+		# tall zigzag, and the zigzag is the shape doing the work. Alternating
+		# with depth keeps the silhouette and is still solid from every bearing.
+		var side: float = 0.0 if i % 2 == 0 else PI
+		var ang: float = side + rng.randf_range(-1.05, 1.05) + w * 0.45
+		var off: float = jag * taper * (0.95 + 0.40 * w)
+		# The height of each turning point is FIXED across the loop. Letting it
+		# breathe as well made the whole bolt bob up and down, which reads as the
+		# object moving rather than the lightning inside it.
 		var y: float = t * height + rng.randf_range(-0.18, 0.18) * height / float(steps)
-		line.append(Vector2(off, y))
+		line.append(Vector3(cos(ang) * off, y, sin(ang) * off))
 	return line
 
 
-## A ribbon of the given width around a centreline, standing in the XY plane.
-func _zigzag_mesh(line: PackedVector2Array, width: float) -> ArrayMesh:
+## Sides on the swept prism. Three, not more: a lightning bolt wants flat
+## facets meeting at hard angles, and every extra side rounds it toward a pipe.
+const TEAR_SIDES: int = 3
+
+## A solid prism of the given width swept along a 3D centreline.
+##
+## The cross-section is carried by a PARALLEL-TRANSPORT frame rather than being
+## rebuilt from a fixed up-vector at each ring. A fixed reference makes the
+## prism spin about its own axis wherever the path turns steeply — which this
+## path does at every single turning point, by design — and the twisting shows
+## up as the facets shearing along the bolt. Transport carries the previous
+## ring's orientation forward through the turn, so the facets stay aligned.
+func _zigzag_mesh(line: PackedVector3Array, width: float) -> ArrayMesh:
+	var count: int = line.size()
+	if count < 2:
+		return ArrayMesh.new()
+
+	# Tangents, from the neighbours on either side.
+	var tans := PackedVector3Array()
+	for i in count:
+		var a: Vector3 = line[maxi(i - 1, 0)]
+		var b: Vector3 = line[mini(i + 1, count - 1)]
+		var d: Vector3 = b - a
+		tans.append(d.normalized() if d.length_squared() > 0.000001 else Vector3.UP)
+
+	# Seed the frame with any vector perpendicular to the first tangent.
+	var n: Vector3 = tans[0].cross(Vector3.RIGHT)
+	if n.length_squared() < 0.001:
+		n = tans[0].cross(Vector3.FORWARD)
+	n = n.normalized()
+
 	var verts := PackedVector3Array()
 	var normals := PackedVector3Array()
 	var uvs := PackedVector2Array()
 	var indices := PackedInt32Array()
-	var last: int = line.size() - 1
+	var last: int = count - 1
 
-	for i in line.size():
+	for i in count:
+		var tan: Vector3 = tans[i]
+		if i > 0:
+			# Rotate the frame by the same turn the path just took.
+			var axis: Vector3 = tans[i - 1].cross(tan)
+			var s: float = axis.length()
+			if s > 0.0001:
+				n = n.rotated(axis / s, asin(clampf(s, -1.0, 1.0)))
+			# Re-orthogonalise: the rotation above is exact, floating point is not.
+			n = (n - tan * n.dot(tan)).normalized()
+		var bi: Vector3 = tan.cross(n).normalized()
+
 		var t: float = float(i) / float(last)
 		var taper: float = pow(sin(t * PI), 0.45)
-		var half: float = width * 0.5 * maxf(taper, 0.12)
-		verts.append(Vector3(line[i].x - half, line[i].y, 0.0))
-		verts.append(Vector3(line[i].x + half, line[i].y, 0.0))
-		normals.append(Vector3(0.0, 0.0, 1.0))
-		normals.append(Vector3(0.0, 0.0, 1.0))
-		# u runs 0 at the foot of the tear to 1 at its top, so the surge shader
-		# can send a pulse climbing it exactly as it sends one along a crack.
-		uvs.append(Vector2(t, 0.0))
-		uvs.append(Vector2(t, 1.0))
+		var r: float = width * 0.5 * maxf(taper, 0.12)
+		for k in TEAR_SIDES:
+			var a: float = TAU * float(k) / float(TEAR_SIDES)
+			var dir: Vector3 = n * cos(a) + bi * sin(a)
+			verts.append(line[i] + dir * r)
+			normals.append(dir)
+			# u runs 0 at the foot of the tear to 1 at its top, so the surge
+			# shader can send a pulse climbing it exactly as it sends one along
+			# a crack. v goes round the prism.
+			uvs.append(Vector2(t, float(k) / float(TEAR_SIDES)))
 
 	for i in last:
-		var b: int = i * 2
-		indices.append_array([b, b + 1, b + 3, b, b + 3, b + 2])
+		var b0: int = i * TEAR_SIDES
+		var b1: int = (i + 1) * TEAR_SIDES
+		for k in TEAR_SIDES:
+			var k2: int = (k + 1) % TEAR_SIDES
+			indices.append_array([
+				b0 + k, b1 + k, b1 + k2,
+				b0 + k, b1 + k2, b0 + k2,
+			])
 
 	var arrays: Array = []
 	arrays.resize(Mesh.ARRAY_MAX)
@@ -540,7 +625,7 @@ func _box(parent: Node3D, piece_name: String, pos: Vector3, size: Vector3,
 	return mi
 
 
-## Parts every variant shares: the light, the vertical shaft that makes the rift
+## Parts outside the tear itself: the light, the vertical shaft that makes the rift
 ## findable from map distance, and the flat selection ring.
 func _build_shared() -> void:
 	# A faint column of light so a rift is findable from map distance. It is NOT
@@ -634,7 +719,8 @@ func set_revealed(on: bool, animate: bool = false) -> void:
 	var tw := create_tween()
 	tw.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tw.tween_property(_content, "scale", Vector3.ONE, 0.85)
-	tw.parallel().tween_method(_set_flare, 4.0, 1.0, 1.1)
+	_drive = 4.0
+	tw.parallel().tween_property(self, "_drive", 1.0, 1.1)
 
 
 ## Marks the rift as closed (or re-opens it). Only the shaft needs touching
@@ -670,23 +756,39 @@ func press() -> void:
 	picked.emit(node_id)
 
 
-## Radius in metres that counts as a hit for picking. The wall variant is
-## physically bigger, so it gets a slightly wider one.
+## Radius in metres that counts as a hit for picking.
 func pick_radius() -> float:
-	return PICK_RADIUS_M * (1.25 if variant == VARIANT_WALL else 1.0)
+	return PICK_RADIUS_M
 
 
 ## Where a screen-space label or pick test should anchor — head height, not the
-## origin, so a rift on a facade still points at the rift and not at the kerb.
+## origin, so a rift set against a wall still points at the rift, not the kerb.
 func anchor_point() -> Vector3:
 	return global_position + Vector3(0.0, 3.0, 0.0)
 
 
-func _set_flare(mult: float) -> void:
-	for m: StandardMaterial3D in _glow_mats:
-		m.emission_energy_multiplier = _energy_base * mult
-	if _light != null:
-		_light.light_energy = 3.0 * mult
+## The entry beat: the rift opening up to take Meeko in. A swell and a surge,
+## where the reveal is a pop - the reveal says "this is new", this says "this is
+## taking you".
+##
+## TODO(cutscene): the real beat is a cutscene. This stands in for its timing so
+## the flow around it (camera move, walker, scene change) is already correct.
+## `delay` holds the rift at its normal output while Meeko takes his last step
+## — the surge belongs to him going through, not to him walking up.
+func open_for_entry(delay: float, seconds: float) -> void:
+	if _content == null:
+		return
+	# The selection ring is a cursor, and a cursor has done its job by now.
+	# Left on, it swells with the rest of the rift and ends up a white hoop
+	# filling the screen.
+	if _ring != null:
+		_ring.visible = false
+	var tw := create_tween()
+	tw.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN)
+	tw.tween_interval(delay)
+	tw.tween_callback(func() -> void: _flash = FLICKER_FLASH)
+	tw.tween_property(_content, "scale", Vector3.ONE * 1.45, seconds)
+	tw.parallel().tween_property(self, "_drive", 3.2, seconds)
 
 
 func _process(delta: float) -> void:
@@ -706,20 +808,20 @@ func _process(delta: float) -> void:
 	_update_flicker(delta)
 	# The flash rides on top of the breathing pulse rather than replacing it, so
 	# a snap brightens whatever the rift was already doing.
-	var lit: float = pulse * boost * dim * (1.0 + _flash)
+	var lit: float = pulse * boost * dim * (1.0 + _flash) * _drive
 
 	for m: StandardMaterial3D in _glow_mats:
 		m.emission_energy_multiplier = _energy_base * lit
 	if _light != null:
 		var closed_light: float = CLOSED_LIGHT if _closed else 1.0
-		_light.light_energy = 3.0 * pulse * boost * (1.0 + _flash * 0.6) * closed_light
+		_light.light_energy = 3.0 * pulse * boost * (1.0 + _flash * 0.6) * closed_light * _drive
 
 	_update_surge(delta)
 	# Cracks run a quarter-cycle behind the tear, which reads as the discharge
 	# reaching the ground a moment after the bolt rather than everything in the
 	# rift breathing as one object.
 	var crack_pulse: float = 0.7 + 0.3 * sin(_pulse_t * rate - PI * 0.5)
-	var crack_energy: float = CRACK_ENERGY * crack_pulse * boost * dim * (1.0 + _flash * 0.5)
+	var crack_energy: float = CRACK_ENERGY * crack_pulse * boost * dim * (1.0 + _flash * 0.5) * _drive
 	for cm: ShaderMaterial in _crack_mats:
 		cm.set_shader_parameter("energy", crack_energy)
 		cm.set_shader_parameter("surge", _surge)
@@ -727,8 +829,6 @@ func _process(delta: float) -> void:
 	for core: ShaderMaterial in _core_mats:
 		core.set_shader_parameter("energy", CORE_ENERGY * lit)
 		core.set_shader_parameter("surge", _surge)
-
-	_aim_tears()
 
 	if _ring != null and _ring.visible:
 		var r: float = 1.0 + 0.04 * sin(_pulse_t * 4.0)
@@ -739,25 +839,6 @@ func _process(delta: float) -> void:
 			ring_mat.emission = col
 			ring_mat.albedo_color = col
 			ring_mat.emission_energy_multiplier = (1.6 if _selected else 0.9) * pulse
-
-
-## Turns every tear to face the map camera.
-##
-## Read from the live camera rather than hard-coded to its bearing: that bearing
-## happens to be fixed today, and a rift silently going edge-on is exactly the
-## kind of thing that would go unnoticed if the camera ever learned to turn.
-func _aim_tears() -> void:
-	if _tears.is_empty():
-		return
-	var cam: Camera3D = get_viewport().get_camera_3d() if is_inside_tree() else null
-	if cam == null:
-		return
-	for tear: Node3D in _tears:
-		var to: Vector3 = cam.global_position - tear.global_position
-		to.y = 0.0
-		if to.length_squared() < 0.01:
-			continue
-		tear.global_rotation.y = atan2(to.x, to.z)
 
 
 ## Runs a pulse of light out along the cracks, then waits before the next one.
@@ -786,26 +867,24 @@ func _update_surge(delta: float) -> void:
 
 ## Snaps the tear to a different shape at irregular intervals.
 ##
-## Every layer of every tear switches on the SAME beat and to the same frame
-## index, so the core, edge and void stay nested. Swapping a prebuilt mesh is
-## effectively free — no vertices are touched at runtime, only which mesh each
-## instance points at.
+## Every layer of every tear shows the SAME frame index, so the core, edge and
+## void stay nested. Swapping a prebuilt mesh is effectively free — no vertices
+## are touched at runtime, only which mesh each instance points at.
 func _update_flicker(delta: float) -> void:
 	_flash = maxf(0.0, _flash - _flash * FLICKER_FLASH_DECAY * delta - 0.01 * delta)
 	if _flicker_layers.is_empty():
 		return
 
-	_flicker_t -= delta
-	if _flicker_t > 0.0:
+	# Straight through the loop at a steady rate. This used to jump to a random
+	# frame at a random interval, which is what made the tear snap; the frames
+	# are a continuous cycle now, so playing them in order is the whole of the
+	# smooth motion.
+	var rate: float = FLICKER_FPS / (FLICKER_CLOSED_SCALE if _closed else 1.0)
+	_flicker_t = fposmod(_flicker_t + delta * rate, float(_frames))
+	var f: int = clampi(int(_flicker_t), 0, _frames - 1)
+	if f == _flicker_frame:
 		return
-
-	var scale: float = FLICKER_CLOSED_SCALE if _closed else 1.0
-	_flicker_t = _rng.randf_range(FLICKER_MIN, FLICKER_MAX) * scale
-	# Step by a random amount that is never zero, so the same shape never comes
-	# up twice running — a repeat reads as the animation having stalled.
-	_flicker_frame = (_flicker_frame + _rng.randi_range(1, FLICKER_FRAMES - 1)) % FLICKER_FRAMES
-	if not _closed:
-		_flash = FLICKER_FLASH
+	_flicker_frame = f
 
 	for layer: Dictionary in _flicker_layers:
 		var frames: Array = layer["frames"]

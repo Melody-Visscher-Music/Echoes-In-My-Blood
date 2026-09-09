@@ -93,7 +93,51 @@ const CAR_COLS: Array[Color] = [
 	Color(0.820, 0.800, 0.780),
 ]
 
-static var _facade_mat: StandardMaterial3D = null
+# ── Facades ──────────────────────────────────────────────────────────────────
+# Windows and doors are what stop a building reading as a painted box, and at
+# this camera height they are the only detail on a wall that is legible at all.
+
+## Floor-to-floor height. Windows are laid out in storeys off this rather than
+## spread evenly over whatever height the building happens to be, so a tall
+## shop and a low house have windows the same size at the same spacings and the
+## street reads as one town.
+const STOREY: float = 3.15
+const WIN_W: float = 1.16
+const WIN_H: float = 1.32
+## Sill height above the floor the window belongs to.
+const WIN_SILL: float = 0.95
+## Nominal spacing between window centres; the real spacing divides the wall.
+const WIN_BAY: float = 3.05
+## How far the frame stands off the wall. Panes are quads laid ON the wall, not
+## holes cut through it — from map distance the difference cannot be seen, and
+## the wall stays one box instead of becoming a mesh with openings in it.
+const WIN_PROUD: float = 0.035
+const DOOR_W: float = 1.08
+const DOOR_H: float = 2.15
+
+const GLASS_COL:     Color = Color(0.150, 0.196, 0.250, 1.0)
+const GLASS_LIT_COL: Color = Color(0.985, 0.855, 0.590, 1.0)
+## Trim comes in two shades and each building takes the one its walls do not
+## drown: cream windows are invisible on a cream house.
+const TRIM_PALE: Color = Color(0.918, 0.906, 0.878, 1.0)
+const TRIM_DARK: Color = Color(0.248, 0.238, 0.252, 1.0)
+## A painted front door is the one flash of colour a plain house is allowed.
+const DOOR_COLS: Array[Color] = [
+	Color(0.560, 0.170, 0.165), Color(0.130, 0.290, 0.420),
+	Color(0.150, 0.330, 0.235), Color(0.320, 0.180, 0.320),
+	Color(0.640, 0.440, 0.140), Color(0.290, 0.235, 0.205),
+	Color(0.860, 0.845, 0.820),
+]
+## Share of panes with a light behind them.
+##
+## This used to be 8.5% — right when the map was permanently at midday and a lit
+## window was a small daytime accent. The map runs a day/night cycle now, so
+## which windows CAN light has to be decided for the darkest hour, not the
+## brightest: the share is baked into the mesh surfaces and cannot change at
+## runtime. How brightly they burn is what varies — StoryMap drives the shared
+## lit material's emission from the clock, and at noon it goes to zero, leaving
+## these reading as ordinary pale blinds.
+const LIT_SHARE: float = 0.34
 
 var _rng := RandomNumberGenerator.new()
 var _unit_box: BoxMesh = null
@@ -101,6 +145,11 @@ var _wall_mats: Array[StandardMaterial3D] = []
 var _roof_mats: Array[StandardMaterial3D] = []
 var _shop_mats: Array[StandardMaterial3D] = []
 var _car_mats: Array[StandardMaterial3D] = []
+var _door_mats: Array[StandardMaterial3D] = []
+var _glass_mat: StandardMaterial3D = null
+var _glass_lit_mat: StandardMaterial3D = null
+var _trim_pale_mat: StandardMaterial3D = null
+var _trim_dark_mat: StandardMaterial3D = null
 var _leaf_mats: Array[StandardMaterial3D] = []
 var _pavement_mat: StandardMaterial3D = null
 var _road_mat: StandardMaterial3D = null
@@ -158,67 +207,6 @@ static func dedupe_points(pts: PackedVector3Array) -> PackedVector3Array:
 		if out.is_empty() or out[out.size() - 1].distance_to(p) > 0.5:
 			out.append(p)
 	return out
-
-
-## Shared wall colour for the buildings the rifts are cut into, so they read as
-## the same city fabric as the blocks around them.
-static func facade_material() -> StandardMaterial3D:
-	if _facade_mat == null:
-		_facade_mat = StandardMaterial3D.new()
-		_facade_mat.albedo_color = BUILDING_STYLES[3][0] as Color
-		_facade_mat.roughness    = 0.86
-	return _facade_mat
-
-
-## The building a wall rift is cut into.
-##
-## This is CITY, not rift, and it matters which. It used to be built as part of
-## the rift node, so it was hidden until that rift unlocked and then appeared
-## out of nowhere — a whole building popping into a street that is supposed to
-## be fixed. Built here it is simply one of the blocks, standing from the first
-## frame, and unlocking a rift only opens a tear in a wall that was always there.
-static func build_rift_facade(parent: Node3D, at: Vector3, facing: Vector3,
-		facade_name: String) -> Node3D:
-	var facade := Node3D.new()
-	facade.name = facade_name
-	facade.position = at
-	facade.rotation.y = atan2(facing.x, facing.z)
-	parent.add_child(facade)
-
-	# Set back from the frontage so the tear sits on its face, not inside it.
-	var body := Node3D.new()
-	body.name = "Massing"
-	body.position = Vector3(0.0, 0.0, -5.2)
-	facade.add_child(body)
-
-	# Built like the rest of the town, not like a slab: a pitched roof and a
-	# render colour off the same palette. It used to be a bare 12x18 box, which
-	# was fine when every building was a grey rectangle and stuck out badly the
-	# moment the streets filled with houses.
-	var wall: StandardMaterial3D = facade_material()
-	var trim := StandardMaterial3D.new()
-	trim.albedo_color = (BUILDING_STYLES[1][1] as Color)
-	trim.roughness    = 0.80
-
-	var w: float = 11.0
-	var d: float = 7.5
-	var h: float = 14.0
-	_hub_box(body, "Wall", Vector3(0.0, h * 0.5, 0.0), Vector3(w, h, d), wall)
-
-	var roof := MeshInstance3D.new()
-	roof.name = "Roof"
-	var pm := PrismMesh.new()
-	pm.size = Vector3(d + 0.8, 2.6, w + 0.8)
-	roof.mesh = pm
-	roof.material_override = trim
-	roof.position = Vector3(0.0, h + pm.size.y * 0.5, 0.0)
-	roof.rotation.y = PI * 0.5
-	body.add_child(roof)
-	_hub_box(body, "Chimney", Vector3(w * 0.28, h + 2.2, d * 0.18),
-		Vector3(0.8, 2.4, 0.8), trim)
-
-	_hub_box(body, "Plinth", Vector3(0.0, 0.5, 0.0), Vector3(w + 0.5, 1.0, d + 0.5), trim)
-	return facade
 
 
 # ── The hub plaza ────────────────────────────────────────────────────────────
@@ -487,6 +475,24 @@ func _build_materials() -> void:
 		_shop_mats.append(_flat_mat(c, 0.55))
 	for c: Color in CAR_COLS:
 		_car_mats.append(_flat_mat(c, 0.35))
+	for c: Color in DOOR_COLS:
+		_door_mats.append(_flat_mat(c, 0.55))
+
+	# Glass is the one thing in this town that is not matte: a low roughness and
+	# a little metallic is what makes a dark rectangle read as a window rather
+	# than as a hole painted on the wall.
+	_glass_mat = _flat_mat(GLASS_COL, 0.14)
+	_glass_mat.metallic = 0.42
+	_glass_lit_mat = _flat_mat(GLASS_LIT_COL, 0.35)
+	_glass_lit_mat.emission_enabled = true
+	_glass_lit_mat.emission = GLASS_LIT_COL
+	_glass_lit_mat.emission_energy_multiplier = 0.55
+	# Named so StoryMap can find this one shared material inside the BAKED city
+	# and drive its emission from the time of day. Nothing else identifies it —
+	# it is one StandardMaterial3D among hundreds once the scene is packed.
+	_glass_lit_mat.resource_name = "LitGlass"
+	_trim_pale_mat = _flat_mat(TRIM_PALE, 0.88)
+	_trim_dark_mat = _flat_mat(TRIM_DARK, 0.88)
 
 	_pavement_mat = _flat_mat(PAVEMENT_COL, 1.0)
 	_road_mat     = _flat_mat(ROAD_COL, 1.0)
@@ -554,6 +560,153 @@ func _slab(parent: Node3D, slab_name: String, poly: PackedVector3Array, y: float
 	mi.material_override = mat
 	parent.add_child(mi)
 	return mi
+
+
+## Windows, a front door and its doorstep — one mesh for the whole building.
+##
+## A house carries a dozen panes and a shop closer to forty. A MeshInstance3D
+## per pane would take the baked city from four thousand nodes past fifty
+## thousand, for detail the map camera reads as texture — so every pane on a
+## building goes into ONE ArrayMesh with three surfaces (trim, glass, lit
+## glass). That is also why this is the only mesh here that carries surface
+## materials instead of a material_override: one node, three materials, still a
+## single thing to select and recolour in the editor.
+##
+## Panes are quads laid a few centimetres ON the wall rather than holes cut
+## through it. From map distance the difference cannot be seen, and the wall
+## stays a scaled box.
+##
+## `front` is the local axis the street is on (+1 for local +Z, -1 for -Z): the
+## door goes on that wall and nowhere else. `base` is the height the window grid
+## starts at, so a shop can carry its glass above its shopfront. `door_skin`
+## pushes the door out past anything already panelled onto the front wall.
+func _facade(host: Node3D, w: float, h: float, d: float, front: float,
+		base: float, wall: Color, shopfront: bool = false,
+		door_skin: float = 0.0) -> void:
+	# Surface buckets: 0 trim, 1 glass, 2 lit glass.
+	var verts: Array[PackedVector3Array] = [PackedVector3Array(), PackedVector3Array(), PackedVector3Array()]
+	var norms: Array[PackedVector3Array] = [PackedVector3Array(), PackedVector3Array(), PackedVector3Array()]
+	var tris: Array[PackedInt32Array] = [PackedInt32Array(), PackedInt32Array(), PackedInt32Array()]
+
+	# The door is worked out before the walls are, because the ground floor of
+	# the front wall has to leave its bay empty.
+	var front_n := Vector3(0.0, 0.0, signf(front))
+	var front_r: Vector3 = Vector3.UP.cross(front_n)
+	var front_bays: int = maxi(1, int((w - 1.0) / WIN_BAY))
+	var door_bay: int = front_bays / 2
+	var door_x: float = _door_offset(w)
+
+	var floors: int = int((h - base) / STOREY)
+	var sides: Array[Vector3] = [Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0),
+		Vector3(0.0, 0.0, -1.0), Vector3(-1.0, 0.0, 0.0)]
+	for normal: Vector3 in sides:
+		var across: bool = absf(normal.z) > 0.5
+		var span: float = w if across else d
+		var out: float = (d if across else w) * 0.5 + WIN_PROUD
+		var right: Vector3 = Vector3.UP.cross(normal)
+		var is_front: bool = across and is_equal_approx(normal.z, front_n.z)
+
+		var bays: int = maxi(1, int((span - 1.0) / WIN_BAY))
+		var pitch: float = span / float(bays)
+		if pitch < WIN_W + 0.6:
+			continue
+
+		for f in floors:
+			var y: float = base + STOREY * float(f) + WIN_SILL + WIN_H * 0.5
+			if y + WIN_H * 0.5 > h - 0.3:
+				break
+			for b in bays:
+				if is_front and f == 0 and b == door_bay and base <= 0.01:
+					continue
+				# A wall with every pane in place reads as an office block. A few
+				# missing is what makes it a house.
+				if _rng.randf() < 0.09:
+					continue
+				var cx: float = -span * 0.5 + pitch * (float(b) + 0.5)
+				var centre: Vector3 = normal * out + right * cx + Vector3(0.0, y, 0.0)
+				_pane(verts, norms, tris, 0, centre, right, normal,
+					WIN_W * 0.5 + 0.11, WIN_H * 0.5 + 0.11)
+				var glass: int = 2 if _rng.randf() < LIT_SHARE else 1
+				_pane(verts, norms, tris, glass, centre + normal * 0.014, right, normal,
+					WIN_W * 0.5, WIN_H * 0.5)
+
+	# Shop display glass: one long pane either side of the door, filling the
+	# painted band. A shopfront that is only a colour reads as a painted wall.
+	if shopfront:
+		var band: float = w * 0.45
+		var gap: float = DOOR_W * 0.5 + 0.28
+		for span_pair: Array in [[-band, door_x - gap], [door_x + gap, band]]:
+			var lo: float = span_pair[0]
+			var hi: float = span_pair[1]
+			if hi - lo < 0.9:
+				continue
+			var centre_x: float = (lo + hi) * 0.5
+			var mid: Vector3 = front_n * (d * 0.5 + door_skin + WIN_PROUD) + front_r * centre_x + Vector3(0.0, 1.78, 0.0)
+			_pane(verts, norms, tris, 0, mid, front_r, front_n, (hi - lo) * 0.5, 0.98)
+			_pane(verts, norms, tris, 1, mid + front_n * 0.014, front_r, front_n,
+				(hi - lo) * 0.5 - 0.12, 0.86)
+
+	# The door leaf is a real box, not a quad: it takes its own paint, and it is
+	# the one piece of a house worth being able to find by name in the editor.
+	var door_face: float = d * 0.5 + door_skin
+	if w > DOOR_W + 0.6:
+		_box(host, "Door", front_n * (door_face + 0.06) + front_r * door_x
+			+ Vector3(0.0, DOOR_H * 0.5, 0.0), Vector3(DOOR_W, DOOR_H, 0.12),
+			_door_mats[_rng.randi() % _door_mats.size()])
+		_pane(verts, norms, tris, 0,
+			front_n * (door_face + WIN_PROUD) + front_r * door_x
+			+ Vector3(0.0, DOOR_H * 0.5 + 0.07, 0.0),
+			front_r, front_n, DOOR_W * 0.5 + 0.14, DOOR_H * 0.5 + 0.07)
+		# Doorstep: a flat trim quad on the ground, which is what tells the eye
+		# the door is a way in rather than a panel.
+		_pane(verts, norms, tris, 0,
+			front_n * (door_face + 0.58) + front_r * door_x + Vector3(0.0, 0.05, 0.0),
+			front_r, Vector3.UP, DOOR_W * 0.5 + 0.34, 0.56)
+
+	var mesh := ArrayMesh.new()
+	var mats: Array[StandardMaterial3D] = [_trim_for(wall), _glass_mat, _glass_lit_mat]
+	for si in 3:
+		if verts[si].is_empty():
+			continue
+		var arrays: Array = []
+		arrays.resize(Mesh.ARRAY_MAX)
+		arrays[Mesh.ARRAY_VERTEX] = verts[si]
+		arrays[Mesh.ARRAY_NORMAL] = norms[si]
+		arrays[Mesh.ARRAY_INDEX]  = tris[si]
+		mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+		mesh.surface_set_material(mesh.get_surface_count() - 1, mats[si])
+	if mesh.get_surface_count() == 0:
+		return
+
+	var mi := MeshInstance3D.new()
+	mi.name = "Windows"
+	mi.mesh = mesh
+	host.add_child(mi)
+
+
+## One quad appended to surface `surf`, wound clockwise seen from the normal
+## side — Godot's front-face order. `right` is passed in rather than derived
+## because a flat quad (the doorstep) has an UP normal, and UP.cross(UP) is
+## nothing.
+func _pane(verts: Array[PackedVector3Array], norms: Array[PackedVector3Array],
+		tris: Array[PackedInt32Array], surf: int, centre: Vector3,
+		right: Vector3, normal: Vector3, hw: float, hh: float) -> void:
+	var up: Vector3 = normal.cross(right)
+	var base: int = verts[surf].size()
+	verts[surf].append(centre - right * hw + up * hh)
+	verts[surf].append(centre + right * hw + up * hh)
+	verts[surf].append(centre + right * hw - up * hh)
+	verts[surf].append(centre - right * hw - up * hh)
+	for _i in 4:
+		norms[surf].append(normal)
+	tris[surf].append_array([base, base + 1, base + 2, base, base + 2, base + 3])
+
+
+## Pale trim on a dark wall, dark trim on a pale one. A cream frame on a cream
+## house is a frame nobody can see.
+func _trim_for(wall: Color) -> StandardMaterial3D:
+	var luma: float = wall.r * 0.299 + wall.g * 0.587 + wall.b * 0.114
+	return _trim_dark_mat if luma > 0.60 else _trim_pale_mat
 
 
 func _build_ground(center: Vector3, radius: float) -> void:
@@ -673,8 +826,12 @@ func _build_blocks(center: Vector3, radius: float, keep_clear: Array[Dictionary]
 				local.append(p - mid)
 			_slab(block, "Pavement", local, 0.0, _pavement_mat)
 
-			_fill_block(block, mid, local, from_center, radius, keep_clear, paths)
-			_build_kerbside(block, mid, local, keep_clear, paths)
+			# What is already standing on this block. Filled in by whatever fills
+			# the block, then read by the kerb — a tree planted at the kerb line
+			# was landing inside the shopfront of a terrace set one metre back.
+			var taken: Array[Dictionary] = []
+			_fill_block(block, mid, local, from_center, radius, keep_clear, paths, taken)
+			_build_kerbside(block, mid, local, keep_clear, paths, taken)
 
 
 static func _centroid(poly: PackedVector3Array) -> Vector3:
@@ -687,8 +844,8 @@ static func _centroid(poly: PackedVector3Array) -> Vector3:
 ## Picks what a block IS, then fills it. A town is not one repeated block type:
 ## mostly houses, shops toward the middle, greens and squares scattered through.
 func _fill_block(block: Node3D, mid: Vector3, quad: PackedVector3Array,
-		from_center: float, radius: float,
-		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array]) -> void:
+		from_center: float, radius: float, keep_clear: Array[Dictionary],
+		paths: Array[PackedVector3Array], taken: Array[Dictionary]) -> void:
 	var closeness: float = 1.0 - clampf(from_center / maxf(1.0, radius), 0.0, 1.0)
 	var roll: float = _rng.randf()
 	var world := PackedVector3Array()
@@ -703,9 +860,9 @@ func _fill_block(block: Node3D, mid: Vector3, quad: PackedVector3Array,
 			_build_square(block, quad)
 			return
 	if roll < 0.20 + closeness * 0.40:
-		_build_terrace(block, mid, quad, closeness, keep_clear, paths)
+		_build_terrace(block, mid, quad, closeness, keep_clear, paths, taken)
 		return
-	_build_houses(block, mid, quad, closeness, keep_clear, paths)
+	_build_houses(block, mid, quad, closeness, keep_clear, paths, taken)
 
 
 # ── Placing things inside an irregular block ─────────────────────────────────
@@ -778,11 +935,67 @@ static func _edge_bearing(quad: PackedVector3Array, p: Vector3) -> float:
 	return best
 
 
+## The outward normal of the block edge nearest a point — the way a BUILDING on
+## that plot should face. _edge_bearing gives the direction the same edge runs,
+## which is what a bench or a parked car lines up with; a house needs the
+## perpendicular, and pointing it outward is what puts its door on the street.
+static func _edge_outward(quad: PackedVector3Array, p: Vector3) -> Vector3:
+	var mid: Vector3 = _centroid(quad)
+	var best := Vector3(0.0, 0.0, 1.0)
+	var best_d: float = INF
+	for k in quad.size():
+		var a: Vector3 = quad[k]
+		var b: Vector3 = quad[(k + 1) % quad.size()]
+		var q: Vector3 = StoryRoads._closest_on_segment(p, a, b)
+		var d: float = Vector2(p.x - q.x, p.z - q.z).length_squared()
+		if d >= best_d:
+			continue
+		var along: Vector3 = b - a
+		var n := Vector3(along.z, 0.0, -along.x)
+		if n.length_squared() < 0.0001:
+			continue
+		best_d = d
+		n = n.normalized()
+		# Away from the middle of the block, whichever way the polygon is wound.
+		if n.dot((a + b) * 0.5 - mid) < 0.0:
+			n = -n
+		best = n
+	return best
+
+
+## Where the front door sits along a building's front wall, measured from the
+## middle. Shared by the facade that draws the door and by anything that has to
+## leave a way through to it.
+static func _door_offset(w: float) -> float:
+	var bays: int = maxi(1, int((w - 1.0) / WIN_BAY))
+	return -w * 0.5 + (w / float(bays)) * (float(bays / 2) + 0.5)
+
+
+## The rotation.y that aims local +Z along `dir`.
+static func _bearing_of(dir: Vector3) -> float:
+	return atan2(dir.x, dir.z)
+
+
+## True when a plot of `radius` at `at` would land on one already placed.
+static func _overlaps(taken: Array[Dictionary], at: Vector3, radius: float,
+		gap: float) -> bool:
+	for t: Dictionary in taken:
+		var p: Vector3 = t["pos"]
+		if Vector2(at.x - p.x, at.z - p.z).length() < radius + float(t["radius"]) + gap:
+			return true
+	return false
+
+
 # ── Block kinds ──────────────────────────────────────────────────────────────
 
+## `taken` is the block's occupancy list — _is_clear only knows about rifts and
+## routes, so nothing stopped the sampler dropping a second house inside the
+## first, and a merged pair is far more obvious now that walls carry windows.
+## More attempts than before, because some of them are now thrown away.
 func _build_houses(block: Node3D, mid: Vector3, quad: PackedVector3Array, closeness: float,
-		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array]) -> void:
-	for _lot in _rng.randi_range(7, 12):
+		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array],
+		taken: Array[Dictionary]) -> void:
+	for _lot in _rng.randi_range(10, 16):
 		var spot: Dictionary = _spot_in(quad, 5.2)
 		if not spot["ok"]:
 			continue
@@ -791,18 +1004,40 @@ func _build_houses(block: Node3D, mid: Vector3, quad: PackedVector3Array, closen
 		var d: float = _rng.randf_range(6.5, 9.0)
 		if not _is_clear(mid + local, Vector2(w, d).length() * 0.5, keep_clear, paths):
 			continue
+		# Half the LONGER side rather than half the diagonal: the corners of two
+		# neighbours may clip, which reads as a terrace, but their walls may not.
+		var foot: float = maxf(w, d) * 0.45
+		if _overlaps(taken, local, foot, 0.8):
+			continue
+		taken.append({"pos": local, "radius": foot})
 
 		var lot := Node3D.new()
 		lot.name = "House_%d" % _building_count
 		lot.position = local
-		# Square to its own street, give or take a few degrees.
-		lot.rotation.y = _edge_bearing(quad, local) + deg_to_rad(_rng.randf_range(-5.0, 5.0))
+		# Local +Z faces the street, give or take a few degrees. This used to be
+		# _edge_bearing, which is the direction the block edge RUNS — so every
+		# house stood side-on to its own road, with the front hedge across the
+		# garden instead of along it. Nothing looked wrong while the walls were
+		# blank; a door on the flank would have been unmissable.
+		var face: float = _bearing_of(_edge_outward(quad, local))
+		lot.rotation.y = face + deg_to_rad(_rng.randf_range(-5.0, 5.0))
 		block.add_child(lot)
 		_building_count += 1
 
 		_box(lot, "Garden", Vector3(0.0, 0.02, 0.0), Vector3(w * 1.24, 0.06, d * 1.30), _grass_mat)
 		if _rng.randf() < 0.5:
-			_box(lot, "Hedge", Vector3(0.0, 0.35, d * 0.65), Vector3(w * 1.24, 0.7, 0.4), _hedge_mat)
+			# Two runs with a gap at the door. One unbroken hedge across the
+			# front was fine while the wall behind it was blank; with a door
+			# there it is a house nobody can walk into.
+			var gate: float = _door_offset(w)
+			var half: float = w * 0.62
+			for run: Array in [[-half, gate - 1.05], [gate + 1.05, half]]:
+				var lo: float = run[0]
+				var hi: float = run[1]
+				if hi - lo < 0.6:
+					continue
+				_box(lot, "Hedge", Vector3((lo + hi) * 0.5, 0.35, d * 0.65),
+					Vector3(hi - lo, 0.7, 0.4), _hedge_mat)
 		_build_house(lot, w, d, _rng.randf_range(5.0, 8.5) + closeness * 2.5)
 		if _rng.randf() < 0.45:
 			_tree(lot, Vector3(w * _rng.randf_range(-0.6, 0.6), 0.0, -d * 0.7),
@@ -814,6 +1049,7 @@ func _build_houses(block: Node3D, mid: Vector3, quad: PackedVector3Array, closen
 func _build_house(lot: Node3D, w: float, d: float, h: float) -> void:
 	var idx: int = _rng.randi() % _wall_mats.size()
 	_box(lot, "Walls", Vector3(0.0, h * 0.5, 0.0), Vector3(w, h, d), _wall_mats[idx])
+	_facade(lot, w, h, d, 1.0, 0.0, (BUILDING_STYLES[idx] as Array)[0] as Color)
 
 	var roof := MeshInstance3D.new()
 	roof.name = "Roof"
@@ -836,18 +1072,18 @@ func _build_house(lot: Node3D, w: float, d: float, h: float) -> void:
 ## A row of shops along one edge of the block, with a coloured front at street
 ## level — the one place a mundane town is allowed to be bright.
 func _build_terrace(block: Node3D, mid: Vector3, quad: PackedVector3Array, closeness: float,
-		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array]) -> void:
+		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array],
+		taken: Array[Dictionary]) -> void:
 	var side: int = _rng.randi() % quad.size()
 	var a: Vector3 = quad[side]
 	var b: Vector3 = quad[(side + 1) % quad.size()]
 	var along: Vector3 = b - a
 	var run: float = along.length()
 	if run < 12.0:
-		_build_houses(block, mid, quad, closeness, keep_clear, paths)
+		_build_houses(block, mid, quad, closeness, keep_clear, paths, taken)
 		return
 	along /= run
 	var inward: Vector3 = (_centroid(quad) - (a + b) * 0.5).normalized()
-	var bearing: float = atan2(along.x, along.z)
 
 	var units: int = clampi(int(run / 9.0), 2, 5)
 	var unit_w: float = (run - 4.0) / float(units)
@@ -863,17 +1099,25 @@ func _build_terrace(block: Node3D, mid: Vector3, quad: PackedVector3Array, close
 			continue
 
 		var h: float = _rng.randf_range(8.0, 12.0) + closeness * 5.0
+		taken.append({"pos": local, "radius": maxf(w, d) * 0.5})
 		var idx: int = _rng.randi() % _wall_mats.size()
 		var unit := Node3D.new()
 		unit.name = "Shop_%d" % _building_count
 		unit.position = local
-		unit.rotation.y = bearing
+		# Local +Z points into the block, so the shopfront on local -Z faces the
+		# road. It used to be the along-the-row bearing, which had every shop
+		# showing its window to the back of the one beside it.
+		unit.rotation.y = _bearing_of(inward)
 		block.add_child(unit)
 		_building_count += 1
 
 		_box(unit, "Walls", Vector3(0.0, h * 0.5, 0.0), Vector3(w, h, d), _wall_mats[idx])
 		_box(unit, "Front", Vector3(0.0, 1.6, -d * 0.5 - 0.06),
 			Vector3(w * 0.9, 3.2, 0.25), _shop_mats[_rng.randi() % _shop_mats.size()])
+		# Glass starts above the painted band, and the door is pushed out past
+		# the band's own thickness so it is not buried inside it.
+		_facade(unit, w, h, d, -1.0, 3.5, (BUILDING_STYLES[idx] as Array)[0] as Color,
+			true, 0.20)
 		_box(unit, "Parapet", Vector3(0.0, h + 0.3, 0.0),
 			Vector3(w + 0.5, 0.6, d + 0.5), _roof_mats[idx])
 
@@ -935,7 +1179,8 @@ static func _shrink(quad: PackedVector3Array, amount: float) -> PackedVector3Arr
 ## per block, sitting where the eye already is, and they do more against a grey
 ## town than anything painted on the buildings.
 func _build_kerbside(block: Node3D, mid: Vector3, quad: PackedVector3Array,
-		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array]) -> void:
+		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array],
+		taken: Array[Dictionary]) -> void:
 	for k in quad.size():
 		var a: Vector3 = quad[k]
 		var b: Vector3 = quad[(k + 1) % quad.size()]
@@ -952,6 +1197,10 @@ func _build_kerbside(block: Node3D, mid: Vector3, quad: PackedVector3Array,
 			var t: float = run * (float(i) + 0.5) / float(count) + _rng.randf_range(-2.5, 2.5)
 			var at: Vector3 = a + along * clampf(t, 3.0, run - 3.0) + inward * 1.9
 			if not _is_clear(mid + at, 2.2, keep_clear, paths):
+				continue
+			# A terrace stands one metre back from the kerb, so anything planted
+			# on the kerb line ends up inside its display window.
+			if _overlaps(taken, at, 1.7, 0.4):
 				continue
 
 			if _rng.randf() < 0.42:

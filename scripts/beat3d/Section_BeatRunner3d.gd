@@ -56,6 +56,29 @@ extends Node3D
 @export var min_gate_preview_distance: float = 36.0
 
 var _song_finish_pending: bool = false
+
+# ── Story Mode gateway rifts ─────────────────────────────────────────────────
+## How far into the song the entry gateway stands, in SECONDS of running.
+##
+## Not at the start line. The camera trails the player by about sixteen metres
+## and the countdown overlay covers the screen until after the music has
+## started, so a gateway behind him is one nobody ever sees — measured, the
+## whole visible window was about half a second and most of it was behind the
+## fading "GO!". A second and a half in, it is in shot for the entire countdown
+## and he runs through it on the opening bars.
+const STORY_GATE_START_S: float = 0.05
+## Prebuilt tear shapes per gateway. The map builds StoryRift.FLICKER_FRAMES of
+## them per rift, which is thousands of meshes — worth it where the rifts are
+## the screen. A doorway seen for a few seconds at each end of a level is not,
+## and this runs inside a level load.
+const STORY_GATE_FRAMES: int = 96
+## The exit: the rift surges, the screen goes, the map loads.
+const STORY_EXIT_TIME: float = 0.25
+
+var _story_entry_rift: StoryRift = null
+var _story_exit_rift:  StoryRift = null
+## _finalise_score()'s cached answer — see the note there on why it is cached.
+var _score_final: Dictionary = {}
 var _end_screen_active:  bool  = false
 var _end_screen_sel:     int   = 0     # 0 = play again, 1 = song select, 2 = main menu
 # Held as a list rather than one var per pill: the navigation used to toggle with
@@ -107,7 +130,7 @@ var _gates_missed: int = 0   # total notes missed
 # Starts at 25 %. This used to have three different answers: the declaration
 # said 0.50, _create_hud() overwrote it with 0.25 at runtime, and the HP readout
 # was built with a hardcoded "50%" placeholder string.
-var _health_pct: float = 0.50   # 0.0 – 1.0
+var _health_pct: float = 0.25   # 0.0 – 1.0
 
 # ── HUD ─────────────────────────────────────────────────────────────────────────
 # The gameplay HUD lives in scripts/ui/GameHud.gd — it used to be ~300 lines of
@@ -678,6 +701,9 @@ func _ready() -> void:
 
 	await _loading_step("Finishing up…", 0.97)
 	_setup_music()   # assigns stream only — does NOT play yet
+	# After _setup_music(): the exit gateway sits at the end of the song, and the
+	# song's length is not known until the stream is on the player.
+	_spawn_story_gateways()
 
 	var cb := Callable(self, "_on_music_finished")
 	if not music.finished.is_connected(cb):
@@ -7060,8 +7086,8 @@ func _on_gate_scored(success: bool) -> void:
 		_gates_hit += 1
 		var _base_gate_pts: int = 1000 if _is_electric_at(_song_time()) else 500
 		_score += _base_gate_pts * _score_multiplier()
-		_health_pct = clamp(_health_pct + 0.02, 0.0, 1.0)
-		_world_vitality = clamp(_world_vitality + 0.07, 0.0, 1.0)
+		_health_pct = clamp(_health_pct + 0.05, 0.0, 1.0)
+		_world_vitality = clamp(_world_vitality + 0.25, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
 		_hud_flash_color(Color(0.20, 1.00, 0.40, 0.08), 0.26)   # every single hit — keep it barely-there
@@ -9234,6 +9260,154 @@ func _estimate_runner_avg_beat_s(beat_events: Array[Dictionary]) -> float:
 	return sum_dt / float(count)
 
 
+## The two rifts that bookend a Story Mode level: one at the start line the
+## player comes out of, one at the end of the song he goes into.
+##
+## Freeplay never sees them. The same chart played from the song list is the
+## same level with no rifts in it, because in Freeplay the player did not arrive
+## through one — the rift is the story's fiction, not the chart's.
+##
+## Both sit on the CENTRE of the lanes rather than in a lane. It is a doorway,
+## not an obstacle, and anything standing in a lane on this track reads as
+## something to dodge.
+func _spawn_story_gateways() -> void:
+	if not Run.in_story_mode():
+		return
+
+	var root := Node3D.new()
+	root.name = "StoryGateways"
+	add_child(root)
+
+	# Middle of the lane spread, whatever the lane count happens to be: the
+	# middle lane itself when there is an odd number, the centreline when even.
+	var mid: float = 0.0
+	if player != null and player.lane_xs.size() >= 2:
+		mid = (player.lane_xs[0] + player.lane_xs[player.lane_xs.size() - 1]) * 0.5
+
+	_story_entry_rift = _story_gateway(root, "story_in",
+		player.forward_speed * STORY_GATE_START_S, mid)
+	_story_exit_rift  = _story_gateway(root, "story_out", _story_end_path_dist(), mid)
+
+
+func _story_gateway(root: Node3D, id: String, pd: float, lateral: float) -> StoryRift:
+	var rift := StoryRift.new()
+	rift.name = id
+	root.add_child(rift)
+	# Same rift the map is built from, so the one he steps into out there and the
+	# one he comes out of in here are the same object with the same colour.
+	rift.setup(id, "", Run.story_accent, STORY_GATE_FRAMES)
+	rift.position = _path_world_pos(pd, lateral, 0.0)
+	rift.rotation_degrees.y = _path_y_rot_at(pd)
+	rift.set_revealed(true)
+	return rift
+
+
+## Where the song runs out, in path metres. Every distance on this track is
+## time x forward_speed, so the end of the music is the end of the run.
+func _story_end_path_dist() -> float:
+	var secs: float = 0.0
+	if music != null and music.stream != null:
+		secs = music.stream.get_length()
+	if secs <= 0.0:
+		secs = maxf(1.0, _last_event_t())   # no stream: fall back to the chart
+	return secs * player.forward_speed
+
+
+## Story Mode's end of a level: no celebration, no results card, out through the
+## rift and back to the map with the numbers in hand.
+##
+## Freeplay keeps both, and should. There, PLAY AGAIN sits on the results card
+## and replaying on the spot is the point. In Story Mode that button would
+## restart the level on the seed already sitting in Run, and a story level is
+## meant to reshape on every attempt — the SETTLED note in StoryMap._enter_level
+## is explicit about it. Taking the card away leaves the map as the only way
+## back in, and the map is the thing that reseeds.
+func _finish_story_run() -> void:
+	Run.song_lives = GameConfig.lives_per_song
+	_sync_hud_lives()
+	# Read the score BEFORE the scene goes: _finalise_score() applies the perfect
+	# bonus and writes the high score, and the map has no way to work any of it
+	# out for itself.
+	Run.story_result = _finalise_score()
+	Run.on_story_level_cleared()
+
+	if player != null:
+		player.input_disabled = true
+	if _story_exit_rift != null:
+		_story_exit_rift.open_for_entry(0.0, STORY_EXIT_TIME)
+
+	# Fade over the cut. The rift blazes out to fill the frame and the screen
+	# goes with it, which is the same beat the map plays going the other way.
+	var root: Control = _overlay_root()
+	if root != null:
+		var fade := ColorRect.new()
+		fade.color = Color(0.0, 0.0, 0.0, 0.0)
+		fade.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		fade.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(fade)
+		var tw := create_tween()
+		tw.tween_interval(STORY_EXIT_TIME * 0.30)
+		tw.tween_property(fade, "color:a", 1.0, STORY_EXIT_TIME * 0.60)
+
+	await get_tree().create_timer(STORY_EXIT_TIME).timeout
+	if not is_inside_tree():
+		return
+	get_tree().change_scene_to_file(Run.level_exit_scene())
+
+
+## The run's final numbers: the perfect bonus applied, the high score written,
+## the letter grade worked out.
+##
+## Split out of the results panel because Story Mode has no results panel and
+## needs every one of these anyway. Cached and handed back on any later call: it
+## MUTATES _score and writes to the save, and a perfect bonus quietly applying
+## twice is not the kind of bug that announces itself.
+func _finalise_score() -> Dictionary:
+	if not _score_final.is_empty():
+		return _score_final
+
+	# Perfect-run bonus: x1.5 on score when zero misses
+	var is_perfect: bool = (_gates_hit > 0 and _gates_missed == 0)
+	if is_perfect:
+		_score = int(float(_score) * 1.5)
+
+	# Save high score and find out if it is a new record
+	var is_new_hs: bool = Save.save_high_score(Run.current_song_key, _score, _max_combo)
+	var hs: Dictionary = Save.get_high_score(Run.current_song_key)
+
+	# Letter grade
+	var total_notes: int = _gates_hit + _gates_missed
+	var acc: float = float(_gates_hit) / float(maxi(1, total_notes))
+	var grade: String
+	var grade_col: Color
+	if _gates_missed == 0 and _gates_hit > 0:
+		grade = "S";  grade_col = Color(1.00, 0.88, 0.20)   # gold
+	elif acc >= 0.90:
+		grade = "A";  grade_col = Color(0.30, 0.90, 1.00)   # cyan
+	elif acc >= 0.75:
+		grade = "B";  grade_col = Color(0.35, 1.00, 0.50)   # green
+	elif acc >= 0.60:
+		grade = "C";  grade_col = Color(1.00, 0.85, 0.25)   # yellow
+	elif acc >= 0.40:
+		grade = "D";  grade_col = Color(1.00, 0.55, 0.20)   # orange
+	else:
+		grade = "F";  grade_col = Color(1.00, 0.30, 0.30)   # red
+
+	_score_final = {
+		"score": _score,
+		"best": int(hs.get("score", 0)),
+		"is_perfect": is_perfect,
+		"is_new_high": is_new_hs,
+		"grade": grade,
+		"grade_color": grade_col,
+		"max_combo": _max_combo,
+		"hit": _gates_hit,
+		"missed": _gates_missed,
+		"accuracy": acc,
+	}
+	return _score_final
+
+
 func _on_music_finished() -> void:
 	if _song_finish_pending:
 		return
@@ -9253,6 +9427,12 @@ func _on_music_finished() -> void:
 			_charge_finalized = true
 			_finalize_charge(_song_time())
 		_despawn_charge_tunnel()
+
+	# Story Mode goes out through the rift instead — no celebration, no results
+	# card. See _finish_story_run().
+	if Run.in_story_mode():
+		_finish_story_run()
+		return
 
 	# Plenty of time for the celebration to breathe
 	auto_quit_delay_s = 6.0
@@ -9600,32 +9780,15 @@ func _spawn_results_panel() -> void:
 
 	var s: float = UiStyle.scale_for(_vp())
 
-	# Perfect-run bonus: x1.5 on score when zero misses
-	var is_perfect: bool = (_gates_hit > 0 and _gates_missed == 0)
-	if is_perfect:
-		_score = int(float(_score) * 1.5)
-
-	# Save high score and find out if it is a new record
-	var is_new_hs: bool = Save.save_high_score(Run.current_song_key, _score, _max_combo)
-	var hs: Dictionary = Save.get_high_score(Run.current_song_key)
-
-	# Letter grade
-	var total_notes: int = _gates_hit + _gates_missed
-	var acc: float = float(_gates_hit) / float(maxi(1, total_notes))
-	var grade: String
-	var grade_col: Color
-	if _gates_missed == 0 and _gates_hit > 0:
-		grade = "S";  grade_col = Color(1.00, 0.88, 0.20)   # gold
-	elif acc >= 0.90:
-		grade = "A";  grade_col = Color(0.30, 0.90, 1.00)   # cyan
-	elif acc >= 0.75:
-		grade = "B";  grade_col = Color(0.35, 1.00, 0.50)   # green
-	elif acc >= 0.60:
-		grade = "C";  grade_col = Color(1.00, 0.85, 0.25)   # yellow
-	elif acc >= 0.40:
-		grade = "D";  grade_col = Color(1.00, 0.55, 0.20)   # orange
-	else:
-		grade = "F";  grade_col = Color(1.00, 0.30, 0.30)   # red
+	# The scoring itself lives in _finalise_score() — Story Mode reports the same
+	# numbers on the map, and neither screen may work them out for itself.
+	var result: Dictionary = _finalise_score()
+	var is_perfect: bool = bool(result["is_perfect"])
+	var is_new_hs: bool  = bool(result["is_new_high"])
+	var acc: float       = float(result["accuracy"])
+	var grade: String    = String(result["grade"])
+	var grade_col: Color = result["grade_color"] as Color
+	var hs: Dictionary   = {"score": int(result["best"])}
 
 	# Backdrop
 	var overlay := ColorRect.new()
