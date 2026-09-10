@@ -1542,7 +1542,9 @@ const SHELTER_MIN_HEIGHT: float = 3.0
 ## it starts fading just before he actually crosses the edge.
 const SHELTER_MARGIN: float = 2.5
 
-## Each entry: {"node", "mat", "center": Vector2, "radius", "base_alpha", "alpha"}
+## Each entry: {"node", "mats": Array[StandardMaterial3D], "base_alpha":
+## PackedFloat32Array, "modes": PackedInt32Array, "center": Vector2, "radius",
+## "alpha"} — one material, base alpha and transparency mode per surface.
 var _shelters: Array[Dictionary] = []
 
 
@@ -1560,26 +1562,43 @@ func _collect_shelters(root: Node) -> void:
 		if world.position.y + world.size.y < SHELTER_MIN_HEIGHT:
 			continue
 
-		# The material is duplicated per shelter: the baked scene shares material
+		# Materials are duplicated per shelter: the baked scene shares material
 		# resources between nodes, and fading a shared one would take unrelated
-		# parts of the city with it.
+		# parts of the city with it. And EVERY surface's, because a house roof is
+		# tiles plus a fascia — fade only the first and the fascia is left
+		# hanging in the air.
+		var mats: Array[StandardMaterial3D] = []
 		var src := mi.material_override as StandardMaterial3D
-		if src == null and mi.mesh.get_surface_count() > 0:
-			src = mi.get_active_material(0) as StandardMaterial3D
-		if src == null:
+		if src != null:
+			var mat := src.duplicate() as StandardMaterial3D
+			mi.material_override = mat
+			mats.append(mat)
+		else:
+			for i in mi.mesh.get_surface_count():
+				var surf := mi.get_active_material(i) as StandardMaterial3D
+				if surf == null:
+					continue
+				var mat := surf.duplicate() as StandardMaterial3D
+				mi.set_surface_override_material(i, mat)
+				mats.append(mat)
+		if mats.is_empty():
 			push_warning("[StoryMap] shelter '%s' has no StandardMaterial3D to fade." % mi.name)
 			continue
-		var mat := src.duplicate() as StandardMaterial3D
-		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-		mi.material_override = mat
+
+		var base_alpha := PackedFloat32Array()
+		var modes := PackedInt32Array()
+		for mat: StandardMaterial3D in mats:
+			base_alpha.append(mat.albedo_color.a)
+			modes.append(mat.transparency)
 
 		var centre := world.get_center()
 		_shelters.append({
 			"node": mi,
-			"mat": mat,
+			"mats": mats,
+			"base_alpha": base_alpha,
+			"modes": modes,
 			"center": Vector2(centre.x, centre.z),
 			"radius": maxf(world.size.x, world.size.z) * 0.5 + SHELTER_MARGIN,
-			"base_alpha": mat.albedo_color.a,
 			"alpha": 1.0,
 		})
 
@@ -1592,12 +1611,33 @@ func _update_shelters(delta: float) -> void:
 
 	for sh: Dictionary in _shelters:
 		var under: bool = here.distance_to(sh["center"] as Vector2) < float(sh["radius"])
-		var a: float = lerpf(float(sh["alpha"]), SHELTER_FADE if under else 1.0, k)
+		var target: float = SHELTER_FADE if under else 1.0
+		var was: float = sh["alpha"]
+		var a: float = lerpf(was, target, k)
+		# Snap the tail of the lerp, so a roof that is not fading comes to rest
+		# and is left alone. Every house roof is a shelter, and rewriting all of
+		# their materials every frame to the values they already hold is not
+		# free.
+		if absf(a - target) < 0.002:
+			a = target
+		if a == was:
+			continue
 		sh["alpha"] = a
 
-		var mat: StandardMaterial3D = sh["mat"]
-		var col: Color = mat.albedo_color
-		mat.albedo_color = Color(col.r, col.g, col.b, float(sh["base_alpha"]) * a)
+		# Blended only while it is actually see-through. An alpha-blended
+		# material skips the depth prepass, so SSAO never reaches it — and every
+		# house roof used to sit in that state permanently, losing its contact
+		# shading for the sake of a fade it almost never does.
+		var mats: Array[StandardMaterial3D] = sh["mats"]
+		var base_alpha: PackedFloat32Array = sh["base_alpha"]
+		var modes: PackedInt32Array = sh["modes"]
+		for i in mats.size():
+			var mat: StandardMaterial3D = mats[i]
+			var mode: int = BaseMaterial3D.TRANSPARENCY_ALPHA if a < 1.0 else modes[i]
+			if mat.transparency != mode:
+				mat.transparency = mode as BaseMaterial3D.Transparency
+			var col: Color = mat.albedo_color
+			mat.albedo_color = Color(col.r, col.g, col.b, base_alpha[i] * a)
 
 		# A roof that has faded out but still casts its shadow would leave Meeko
 		# standing in a dark disc with nothing overhead to explain it.
