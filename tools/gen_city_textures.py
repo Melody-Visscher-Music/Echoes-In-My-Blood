@@ -412,6 +412,123 @@ def membrane(means):
     write("membrane", tinted(value, 0.01 * broad), means, height, ppm)
 
 
+# ── Ground ───────────────────────────────────────────────────────────────────
+# The streets, pavements, lawns and trees. Everything here except the paving is
+# ISOTROPIC — no direction to it — which is what lets StoryCity map these by
+# world position (triplanar) instead of giving every slab, disc and box UVs.
+
+
+def asphalt(means):
+    """Rolled asphalt: aggregate speckle over broad, gentle tone drift. No
+    cracks, no patches — the city is not damaged. Tinted, and shared by the
+    avenues, the lanes and the service yards behind the shops."""
+    xm, ym, ppm = grid(6.0)
+    rng = np.random.default_rng(8101)
+    grain = noise(0.8, 8102)
+    speck = rng.random((N, N))
+    stones = np.where(speck < 0.030, -1.0, np.where(speck > 0.975, 0.9, 0.0))
+    stones = np.real(np.fft.ifft2(np.fft.fft2(stones) * np.exp(-2.0 * np.pi ** 2 * 0.30 * (
+        np.fft.fftfreq(N)[None, :] ** 2 + np.fft.fftfreq(N)[:, None] ** 2))))
+    # Kept faint: broad blotches on a road read as stains from above, not as
+    # the gentle unevenness of a rolled surface.
+    broad = 0.014 * noise(1.5 * ppm, 8103) + 0.010 * noise(4.0 * ppm, 8104)
+    value = 0.80 * (1.0 + 0.07 * grain + 0.40 * stones + broad)
+    height = 0.0008 * grain + 0.0025 * np.clip(stones, 0.0, None)
+    write("asphalt", tinted(value, 0.006 * noise(2.0 * ppm, 8105)), means, height, ppm)
+
+
+def paving(means):
+    """Concrete flags, 600 mm square on sand joints. Each flag sits a hair out
+    of true, which is what a low sun picks out along a pavement. Tinted."""
+    xm, ym, ppm = grid(4.8)
+    F, J = 0.6, 0.005
+    col = np.floor(xm / F).astype(int)
+    row = np.floor(ym / F).astype(int)
+    fu = xm - col * F
+    fv = ym - row * F
+    edge = np.minimum(np.minimum(fu, F - fu), np.minimum(fv, F - fv))
+    flag = (row % 8) * 8 + (col % 8)
+
+    rng = np.random.default_rng(9101)
+    tone = 1.0 + 0.045 * rng.standard_normal(64)
+    warm = 0.010 * rng.standard_normal(64)
+    tilt_u = 0.0025 * rng.standard_normal(64)
+    tilt_v = 0.0025 * rng.standard_normal(64)
+    grain = noise(1.0, 9102)
+    cloud = noise(0.3 * ppm, 9103)
+
+    joint = smoothstep(J * 0.5 + 0.5 / ppm, J * 0.5 - 0.5 / ppm, edge)
+    value = 0.80 * tone[flag] * (1.0 + 0.03 * grain + 0.025 * cloud)
+    value *= (0.90 + 0.10 * smoothstep(J * 0.5, J * 0.5 + 0.012, edge)) * (1.0 - 0.32 * joint)
+    height = (0.002 * smoothstep(J * 0.5, J * 0.5 + 0.006, edge)
+              + (tilt_u[flag] * (fu / F - 0.5) + tilt_v[flag] * (fv / F - 0.5))
+              + 0.0003 * grain)
+    write("paving", tinted(value, warm[flag]), means, height, ppm)
+
+
+def grass(means):
+    """Lawn: blades, clumps, and patches a little yellower or bluer than the
+    rest. The patches are the part that survives map height. Tinted."""
+    xm, ym, ppm = grid(8.0)
+    blades = noise(0.6, 10101)
+    clumps = noise(0.04 * ppm, 10102)
+    patch = noise(0.7 * ppm, 10103)
+    broad = noise(2.6 * ppm, 10104)
+    hue = noise(1.4 * ppm, 10105)
+    value = 0.80 * (1.0 + 0.08 * blades + 0.06 * clumps + 0.06 * patch + 0.04 * broad)
+    height = 0.004 * blades + 0.006 * clumps
+    write("grass", tinted(value, 0.045 * hue), means, height, ppm)
+
+
+def foliage(means):
+    """Leaf clusters for tree crowns and hedges: lit lumps with dark gaps between
+    them. A box with this on it reads as a tree from above, where a flat green
+    box reads as a green box. Tinted; the lit side of each lump runs warmer."""
+    xm, ym, ppm = grid(4.0)
+    # Clumps a hand or two across, lots of them, with only narrow dark gaps —
+    # large flat shadows between big lumps read as camouflage, not leaves.
+    lumps = noise(0.11 * ppm, 11101) + 0.6 * noise(0.045 * ppm, 11102)
+    lumps = lumps / (lumps.std() + 1e-9)
+    body = smoothstep(-1.4, 1.0, lumps)
+    leaves = noise(2.0, 11103)
+    value = 0.80 * (0.58 + 0.42 * body) * (1.0 + 0.12 * leaves)
+    height = 0.03 * body + 0.003 * leaves
+    write("foliage", tinted(value, 0.06 * (body - 0.5)), means, height, ppm)
+
+
+def gravel(means):
+    """Pea gravel for park paths and the inlay on the square: pebbles of 10-20 mm
+    in a spread of tones, each with a little shadow round its foot. Tinted."""
+    from scipy.spatial import cKDTree
+
+    tile = 3.0
+    xm, ym, ppm = grid(tile)
+    rng = np.random.default_rng(12101)
+    count = int((tile / 0.016) ** 2)
+    seeds = rng.random((count, 2)) * tile
+    # Copies shifted by a tile each way, so the nearest pebble across a seam is
+    # the one on the far side of the image — that is what makes it tile.
+    offsets = [(dx, dy) for dx in (-tile, 0.0, tile) for dy in (-tile, 0.0, tile)]
+    tiled = np.concatenate([seeds + o for o in offsets])
+    ids = np.tile(np.arange(count), len(offsets))
+    pts = np.stack([xm.ravel(), ym.ravel()], axis=-1)
+    dist, near = cKDTree(tiled).query(pts, k=2)
+    f1 = dist[:, 0].reshape(N, N)
+    f2 = dist[:, 1].reshape(N, N)
+    pebble = ids[near[:, 0]].reshape(N, N)
+
+    tone = 1.0 + 0.13 * rng.standard_normal(count)
+    warm = 0.04 * rng.standard_normal(count)
+    gap = smoothstep(0.0, 0.005, f2 - f1)          # 0 between pebbles
+    # Rounded: bright on top, falling off toward the edge. Without it the cells
+    # are flat shards and the path looks like crazy paving.
+    dome = np.clip(1.0 - f1 / 0.011, 0.0, 1.0)
+    value = 0.80 * tone[pebble] * (0.74 + 0.26 * gap) * (0.72 + 0.28 * np.sqrt(dome))
+    value *= 1.0 + 0.03 * noise(0.8 * ppm, 12102)
+    height = 0.006 * dome * gap
+    write("gravel", tinted(value, warm[pebble]), means, height, ppm)
+
+
 def main():
     means = {}
     print("writing %s" % OUT)
@@ -426,6 +543,11 @@ def main():
     roof_tile(means)
     slate(means)
     membrane(means)
+    asphalt(means)
+    paving(means)
+    grass(means)
+    foliage(means)
+    gravel(means)
     with open(os.path.join(OUT, "skins.json"), "w", newline="\r\n") as f:
         json.dump(means, f, indent=1, sort_keys=True)
         f.write("\n")

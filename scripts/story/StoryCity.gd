@@ -73,6 +73,14 @@ const LEAF_COL_B: Color = Color(0.330, 0.436, 0.238, 1.0)
 const LEAF_COL_C: Color = Color(0.372, 0.400, 0.212, 1.0)
 const TRUNK_COL: Color = Color(0.300, 0.238, 0.190, 1.0)
 const WATER_COL: Color = Color(0.230, 0.372, 0.408, 1.0)
+## Grass behind the houses: rougher and a shade darker than the mown front
+## gardens, so each plot still reads against the ground it stands on.
+const YARD_GRASS_COL: Color = Color(0.296, 0.382, 0.228, 1.0)
+## Behind a row of shops: service yards and parking, in tarmac.
+const YARD_COL: Color = Color(0.352, 0.342, 0.338, 1.0)
+const KERB_COL: Color = Color(0.640, 0.625, 0.595, 1.0)
+## Dressed stone: pond rims, fountain basins.
+const STONE_COL: Color = Color(0.560, 0.540, 0.505, 1.0)
 
 ## Each style is [wall, roof, wall skin, roof skin]. Red brick, cream stucco,
 ## sage render, sandstone, blue-grey concrete, buff brick and pale concrete — a
@@ -111,6 +119,13 @@ const SKINS: Dictionary = {
 	"roof_tile":  ["roof_tile",  "roof_tile", 4.2, 0.78],
 	"slate":      ["slate",      "slate",     4.2, 0.62],
 	"membrane":   ["membrane",   "membrane",  6.0, 0.92],
+	# Ground. All but the paving have no direction to them, so they go on by
+	# world position (triplanar) — no UVs needed on a single slab, disc or box.
+	"asphalt":    ["asphalt",    "asphalt",   6.0, 0.92],
+	"paving":     ["paving",     "paving",    4.8, 0.88],
+	"grass":      ["grass",      "grass",     8.0, 0.97],
+	"foliage":    ["foliage",    "foliage",   4.0, 0.90],
+	"gravel":     ["gravel",     "gravel",    3.0, 0.95],
 }
 ## Concrete is cast in panels this wide, three to the texture. See _wall_runs.
 const CONCRETE_PANEL: float = 2.1
@@ -137,6 +152,57 @@ const DECK_DROP: float = 0.18
 const COPING_COL: Color = Color(0.600, 0.585, 0.560, 1.0)
 ## Where a shop's upper-floor windows start, above its painted front.
 const SHOP_GLASS_BASE: float = 3.5
+
+# ── Streets ──────────────────────────────────────────────────────────────────
+## The pavement between the kerb and whatever the block is: lawn behind the
+## houses, a yard behind the shops. It used to be the WHOLE block, which is why
+## the map was mostly grey, and it stopped a metre short of the road, which is
+## the dark jagged seam that ran round every block.
+const PAVE_W: float = 2.4
+## The kerbstone along its road edge — a pale line round every block from map
+## height, and most of what makes a street read as built rather than painted.
+const KERB_W: float = 0.18
+## Parked cars sit in the carriageway, this far out from the kerb and no nearer
+## a corner than this. They used to be parked on the pavement.
+const PARK_OUT: float = 1.15
+const PARK_CLEAR: float = 6.0
+## Nose to tail, near enough: a car and its gap.
+const PARK_PITCH: float = 5.4
+## Zebra crossings at the mouth of every avenue junction: stripes this wide and
+## this long, starting just clear of the junction itself.
+const ZEBRA_STRIPE: float = 0.5
+const ZEBRA_DEPTH: float = 3.0
+
+# ── Streetlights ─────────────────────────────────────────────────────────────
+# One mesh shared by every lamp, drawn per block as a MultiMesh: two hundred
+# lamps as separate nodes would be two hundred draw calls, most of them twice
+# over for shadows. What they cost is a block's worth of editing granularity —
+# delete a block's "Streetlights" and its lamps go together.
+const LAMP_SPACING: float = 24.0
+## First lamp this far along from each corner.
+const LAMP_END: float = 5.0
+## How far in from the kerb the post stands.
+const LAMP_INSET: float = 0.55
+const LAMP_HEIGHT: float = 5.4
+## How far the arm reaches out over the road.
+const LAMP_REACH: float = 1.3
+## The pool of light each one lays on the ground after dark.
+const LAMP_POOL_R: float = 4.8
+const LAMP_GLOW_COL: Color = Color(1.00, 0.80, 0.52, 1.0)
+const LAMP_POST_COL: Color = Color(0.180, 0.188, 0.200, 1.0)
+
+# ── Parks ────────────────────────────────────────────────────────────────────
+const PATH_W: float = 2.4
+## Where the paths meet in a park with no pond: a gravel round with a fountain.
+const ROUND_R: float = 3.4
+## The playground: a fenced, rubber-floored rectangle in the park nearest the
+## plaza, so the player actually passes it.
+const PLAY_SIZE := Vector2(10.0, 8.0)
+const RUBBER_COL: Color = Color(0.600, 0.285, 0.225, 1.0)
+## Flower beds, muted — they are a garden, not a signal.
+const FLOWER_COLS: Array[Color] = [
+	Color(0.620, 0.360, 0.420), Color(0.720, 0.560, 0.240), Color(0.500, 0.440, 0.620),
+]
 
 ## Shopfronts and parked cars: the two places the town is allowed to be bright.
 const SHOPFRONT_COLS: Array[Color] = [
@@ -202,6 +268,8 @@ var _rng := RandomNumberGenerator.new()
 ## _rng on purpose: every draw on _rng decides layout, and one extra draw would
 ## move every building after it — dressing the walls must not rebuild the town.
 var _skin_rng := RandomNumberGenerator.new()
+## And a third for street furniture and park dressing, for the same reason.
+var _prop_rng := RandomNumberGenerator.new()
 var _unit_box: BoxMesh = null
 var _wall_mats: Array[StandardMaterial3D] = []
 var _roof_mats: Array[StandardMaterial3D] = []
@@ -225,8 +293,34 @@ var _hedge_mat: StandardMaterial3D = null
 var _trunk_mat: StandardMaterial3D = null
 var _water_mat: StandardMaterial3D = null
 var _path_mat: StandardMaterial3D = null
+var _kerb_mat: StandardMaterial3D = null
+var _yard_mat: StandardMaterial3D = null
+var _yard_grass_mat: StandardMaterial3D = null
+var _lawn_mat: StandardMaterial3D = null
+var _stone_mat: StandardMaterial3D = null
+var _rubber_mat: StandardMaterial3D = null
+var _lamp_mesh: ArrayMesh = null
+var _pool_mesh: ArrayMesh = null
 var _building_count: int = 0
 var _block_count: int = 0
+var _tree_count: int = 0
+
+## The ground of the block being built: its kerb line, the back of the kerb, the
+## inner edge of the pavement, and which street (if any) runs along each side.
+## Set by _build_blocks before a block is filled; see _block_ground().
+var _ground: Dictionary = {}
+## Street trees _build_kerbside planted on the current block, so the lamps can
+## keep clear of them.
+var _kerb_trees := PackedVector3Array()
+## Where cars are already parked along each side of the current block, as
+## distance down the kerb — side index -> PackedFloat32Array.
+var _bays: Dictionary = {}
+## Every park, for the dressing pass once the whole town is standing:
+## {"block", "inner", "pond", "streets"}.
+var _parks: Array[Dictionary] = []
+var _hub_at := Vector3.ZERO
+## skins.json, kept for the few materials made after _build_materials.
+var _means: Dictionary = {}
 
 var _roads: StoryRoads = null
 var _ground_root: Node3D = null
@@ -298,9 +392,17 @@ const CANOPY_RADIUS: float = 14.6
 const CANOPY_HEIGHT: float = 10.4
 const COLUMN_COUNT: int = 8
 const COLUMN_RING: float = 10.4
-## How far the two beds flanking the way in are swung aside and drawn back.
-const ENTRANCE_SPLAY: float = 0.21
-const ENTRANCE_PULL: float = 1.45
+## The two beds flanking the way in: swung this far further AWAY from the
+## opening than their slot, drawn in toward the middle, and turned end-on to it
+## — a funnel into the plaza rather than two more beds round the rim.
+##
+## These are Melody's, from dragging the beds in the baked scene (2026-09-10):
+## the code used to swing them TOWARD the entrance, narrowing it, whatever its
+## comment claimed. The numbers are the average of the two beds as placed.
+const ENTRANCE_SPLAY: float = 0.164
+const ENTRANCE_PULL: float = 1.42
+## How far off radial the entrance beds are turned, flaring outward.
+const ENTRANCE_FLARE: float = 0.301
 
 ## `facing` is which way the plaza opens. The gap in the colonnade and the beds
 ## that frame it are derived from it rather than pinned to a fixed index — flip
@@ -312,16 +414,23 @@ static func build_hub(parent: Node3D, at: Vector3, facing: Vector3 = Vector3(0.0
 	hub.position = at
 	parent.add_child(hub)
 
-	var pale   := _hub_mat(Color(0.545, 0.535, 0.540), 0.82)
-	var stone  := _hub_mat(Color(0.470, 0.462, 0.470), 0.90)
-	var dark   := _hub_mat(Color(0.355, 0.350, 0.358), 0.95)
-	var accent := _hub_mat(Color(0.395, 0.372, 0.345), 0.90)
-	var green  := _hub_mat(Color(0.250, 0.305, 0.235), 1.00)
+	# The same colours as ever, now in stone, paving and concrete. All by world
+	# position: the plaza is discs, rings and cylinders, none of which comes with
+	# UVs a texture could be laid out on, and none of these textures has a grain
+	# that minds which way it runs.
+	var means: Dictionary = _skin_means()
+	var pale   := _skin_mat("stone",    Color(0.545, 0.535, 0.540), means, true)
+	var paving := _skin_mat("paving",   Color(0.470, 0.462, 0.470), means, true)
+	var canopy := _skin_mat("concrete", Color(0.545, 0.535, 0.540), means, true)
+	var beams  := _skin_mat("concrete", Color(0.470, 0.462, 0.470), means, true)
+	var dark   := _skin_mat("stone",    Color(0.355, 0.350, 0.358), means, true)
+	var accent := _skin_mat("stone",    Color(0.395, 0.372, 0.345), means, true)
+	var green  := _skin_mat("foliage",  Color(0.250, 0.305, 0.235), means, true)
 
 	var entrance: float = atan2(facing.z, facing.x)
-	_hub_deck(hub, pale, stone, dark)
+	_hub_deck(hub, pale, paving, dark)
 	_hub_columns(hub, pale, dark, entrance)
-	_hub_canopy(hub, pale, stone, dark)
+	_hub_canopy(hub, canopy, beams, dark)
 	_hub_planters(hub, accent, green, entrance)
 	return hub
 
@@ -412,30 +521,29 @@ static func _hub_planters(hub: Node3D, accent: StandardMaterial3D, green: Standa
 	for i in COLUMN_COUNT:
 		var a: float = slot * float(i) + slot * 0.5
 		var ring: float = COLUMN_RING
-		# The two beds either side of the entrance are swung wider and drawn in,
-		# so they frame the opening instead of narrowing it.
+		# Tangent to the rim, like every other bed.
+		var turn: float = -a
+		# The two beds either side of the entrance: swung away from it and drawn
+		# in, and turned to run out from the middle so they frame the way in.
+		# angle_difference() is entrance - a, so stepping AGAINST its sign is
+		# stepping away from the opening.
 		var off: float = angle_difference(a, entrance)
 		if absf(off) < slot:
-			a += ENTRANCE_SPLAY * signf(off)
+			a -= ENTRANCE_SPLAY * signf(off)
 			ring -= ENTRANCE_PULL
+			var run_dir: float = a - ENTRANCE_FLARE * signf(off)
+			turn = PI * 0.5 - run_dir
 
 		var bed := Node3D.new()
 		bed.name = "Planter_%d" % i
 		bed.position = Vector3(cos(a) * ring, 0.0, sin(a) * ring)
-		bed.rotation.y = -a
+		bed.rotation.y = turn
 		beds.add_child(bed)
 		_hub_box(bed, "Kerb", Vector3(0.0, 0.28, 0.0), Vector3(1.1, 0.56, 4.4), accent)
 		_hub_box(bed, "Planting", Vector3(0.0, 0.52, 0.0), Vector3(0.82, 0.2, 4.1), green)
 
 
 # ── Small builders ───────────────────────────────────────────────────────────
-
-static func _hub_mat(col: Color, rough: float) -> StandardMaterial3D:
-	var m := StandardMaterial3D.new()
-	m.albedo_color = col
-	m.roughness    = rough
-	return m
-
 
 static func _disc(parent: Node3D, disc_name: String, radius: float, height: float,
 		y: float, mat: StandardMaterial3D, segments: int) -> MeshInstance3D:
@@ -510,10 +618,14 @@ func build(center: Vector3, radius: float, keep_clear: Array[Dictionary],
 		paths: Array[PackedVector3Array]) -> void:
 	_rng.seed = CITY_SEED
 	_skin_rng.seed = CITY_SEED + 1
+	_prop_rng.seed = CITY_SEED + 2
+	_hub_at = center
 	_unit_box = BoxMesh.new()
 	_unit_box.size = Vector3.ONE
 	_roads = StoryRoads.shared(center)
 	_build_materials()
+	_lamp_mesh = _build_lamp_mesh()
+	_pool_mesh = _build_pool_mesh()
 
 	_ground_root = _group("Ground")
 	_road_root   = _group("Roads")
@@ -522,6 +634,10 @@ func build(center: Vector3, radius: float, keep_clear: Array[Dictionary],
 	_build_ground(center, radius)
 	_build_streets(center, radius)
 	_build_blocks(center, radius, keep_clear, paths)
+	# After every block, not during: dressing a park moves nothing that was
+	# placed by _rng, it only takes away the trees its paths now run through —
+	# and which park gets the playground depends on all of them existing.
+	_dress_parks()
 	print("[StoryCity] %d buildings across %d blocks, %.0f m radius." % [
 		_building_count, _block_count, radius])
 
@@ -535,6 +651,7 @@ func _group(group_name: String) -> Node3D:
 
 func _build_materials() -> void:
 	var means: Dictionary = _skin_means()
+	_means = means
 	for style: Array in BUILDING_STYLES:
 		var wall: StandardMaterial3D = _skin_mat(String(style[2]), style[0] as Color, means)
 		# The plinth is this same material, darkened by the mesh's vertex colour.
@@ -571,22 +688,39 @@ func _build_materials() -> void:
 	_trim_pale_mat = _flat_mat(TRIM_PALE, 0.88)
 	_trim_dark_mat = _flat_mat(TRIM_DARK, 0.88)
 
-	_pavement_mat = _flat_mat(PAVEMENT_COL, 1.0)
-	_road_mat     = _flat_mat(ROAD_COL, 1.0)
-	_lane_mat     = _flat_mat(LANE_COL, 1.0)
-	_marking_mat  = _flat_mat(MARKING_COL, 0.9)
-	_grass_mat    = _flat_mat(GRASS_COL, 1.0)
-	_hedge_mat    = _flat_mat(HEDGE_COL, 1.0)
-	_leaf_mats.append(_flat_mat(LEAF_COL_A, 0.95))
-	_leaf_mats.append(_flat_mat(LEAF_COL_B, 0.95))
-	_leaf_mats.append(_flat_mat(LEAF_COL_C, 0.95))
-	_trunk_mat    = _flat_mat(TRUNK_COL, 0.95)
-	_water_mat    = _flat_mat(WATER_COL, 0.18)
+	# Paving and kerbs have a grain to them — flags square to the kerb, joints
+	# along it — so they are laid out along each street (_build_block_edge).
+	# Everything else on the ground goes on by world position.
+	#
+	# Slabs are the exception, triplanar or not: they are flat and carry their
+	# own x/z as UVs (see _slab), and triplanar samples every texture three
+	# times over to blend projections a flat surface never shows. The streets
+	# are in world space, so their UVs line up across every junction anyway.
+	_pavement_mat   = _skin_mat("paving", PAVEMENT_COL, means)
+	_kerb_mat       = _skin_mat("concrete", KERB_COL, means)
+	_road_mat       = _skin_mat("asphalt", ROAD_COL, means)
+	_lane_mat       = _skin_mat("asphalt", LANE_COL, means)
+	_yard_mat       = _skin_mat("asphalt", YARD_COL, means)
+	_marking_mat    = _flat_mat(MARKING_COL, 0.9)
+	# Gardens are scaled boxes, so this one stays triplanar; the park lawns
+	# are slabs and get their own.
+	_grass_mat      = _skin_mat("grass", GRASS_COL, means, true)
+	_lawn_mat       = _skin_mat("grass", GRASS_COL, means)
+	_yard_grass_mat = _skin_mat("grass", YARD_GRASS_COL, means)
+	_hedge_mat      = _skin_mat("foliage", HEDGE_COL, means, true)
+	for c: Color in [LEAF_COL_A, LEAF_COL_B, LEAF_COL_C]:
+		_leaf_mats.append(_skin_mat("foliage", c, means, true))
+	_trunk_mat      = _flat_mat(TRUNK_COL, 0.95)
+	_water_mat      = _flat_mat(WATER_COL, 0.18)
 	_water_mat.metallic = 0.25
-	_path_mat     = _flat_mat(GRAVEL_COL, 1.0)
+	_path_mat       = _skin_mat("gravel", GRAVEL_COL, means, true)
+	_stone_mat      = _skin_mat("stone", STONE_COL, means, true)
+	_rubber_mat     = _skin_mat("asphalt", RUBBER_COL, means, true)
 
 
-func _flat_mat(col: Color, rough: float = 1.0) -> StandardMaterial3D:
+## Static so the plaza — built by a static function, for the map and the bake
+## alike — can use the same materials as the rest of the town.
+static func _flat_mat(col: Color, rough: float = 1.0) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.albedo_color = col
 	m.roughness    = rough
@@ -594,7 +728,7 @@ func _flat_mat(col: Color, rough: float = 1.0) -> StandardMaterial3D:
 
 
 ## skins.json: the linear-RGB average of every albedo the generator wrote.
-func _skin_means() -> Dictionary:
+static func _skin_means() -> Dictionary:
 	var path: String = SKIN_DIR + "skins.json"
 	if not FileAccess.file_exists(path):
 		push_warning("[StoryCity] %s is missing — buildings fall back to flat colour. Run tools/gen_city_textures.py." % path)
@@ -612,7 +746,14 @@ func _skin_means() -> Dictionary:
 ##
 ## Falls back to the old flat colour if the textures are not there, so a missing
 ## file costs the look and not the map.
-func _skin_mat(skin: String, col: Color, means: Dictionary) -> StandardMaterial3D:
+##
+## `triplanar` maps the texture by WORLD position instead of UVs. Only for skins
+## with no direction to them — grass, asphalt, gravel, foliage — where it means
+## a scaled box, a cylinder or a bare slab can wear the texture at the right
+## size without anyone building it UVs. A brick wall mapped that way ghosts
+## where its projections blend, which is why the buildings are UV'd instead.
+static func _skin_mat(skin: String, col: Color, means: Dictionary,
+		triplanar: bool = false) -> StandardMaterial3D:
 	var spec: Array = SKINS[skin]
 	var albedo_path: String = SKIN_DIR + String(spec[0]) + ".webp"
 	var normal_path: String = SKIN_DIR + String(spec[1]) + "_n.png"
@@ -630,8 +771,12 @@ func _skin_mat(skin: String, col: Color, means: Dictionary) -> StandardMaterial3
 		m.normal_enabled = true
 		m.normal_texture = load(normal_path) as Texture2D
 	# UVs are in metres (see _walls_mesh), so this is simply one repeat per tile.
+	# Triplanar reads world metres the same way, on all three axes.
 	var tile: float = float(spec[2])
-	m.uv1_scale = Vector3(1.0 / tile, 1.0 / tile, 1.0)
+	m.uv1_scale = Vector3(1.0 / tile, 1.0 / tile, 1.0 / tile if triplanar else 1.0)
+	if triplanar:
+		m.uv1_triplanar = true
+		m.uv1_world_triplanar = true
 	# The map camera sees every wall at a steep slant. Plain trilinear picks the
 	# mip for the squashed direction and blurs the other; anisotropic keeps the
 	# courses along a wall instead of smearing them into its average.
@@ -654,35 +799,32 @@ func _box(parent: Node3D, piece_name: String, pos: Vector3, size: Vector3,
 
 ## A flat polygon lying on the ground. Streets and blocks are arbitrary shapes
 ## now, so neither can be a scaled box any more.
+##
+## UVs are the polygon's own x/z in metres, turned by `uv_angle` — so paving on
+## a square can run true to one of its edges. Triplanar materials ignore them.
 func _slab(parent: Node3D, slab_name: String, poly: PackedVector3Array, y: float,
-		mat: StandardMaterial3D) -> MeshInstance3D:
+		mat: StandardMaterial3D, uv_angle: float = 0.0) -> MeshInstance3D:
 	if poly.size() < 3:
 		return null
-	var verts := PackedVector3Array()
-	var indices := PackedInt32Array()
+	var pts := PackedVector3Array()
+	var uvs := PackedVector2Array()
 	for p: Vector3 in poly:
-		verts.append(Vector3(p.x, y, p.z))
-	# Fan from the first corner: every shape here is convex, so this is safe.
-	for i in range(1, poly.size() - 1):
-		indices.append_array([0, i, i + 1])
-
-	var normals := PackedVector3Array()
-	for _i in verts.size():
-		normals.append(Vector3.UP)
-
-	var arrays: Array = []
-	arrays.resize(Mesh.ARRAY_MAX)
-	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_NORMAL] = normals
-	arrays[Mesh.ARRAY_INDEX]  = indices
+		pts.append(Vector3(p.x, y, p.z))
+		uvs.append(Vector2(p.x, p.z).rotated(-uv_angle))
+	# A fan: every shape here is convex, so this is safe.
+	var s := Surf.new()
+	s.face(pts, uvs, Vector3.UP)
 	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	s.commit(mesh, mat, true)
+	return _flat_node(parent, slab_name, mesh)
 
-	var mi := MeshInstance3D.new()
-	mi.name = slab_name
-	mi.mesh = mesh
-	mi.material_override = mat
-	parent.add_child(mi)
+
+## A mesh node for something lying flat on the ground. It casts no shadow: there
+## is nothing for it to shadow, and every caster is drawn again in each of the
+## sun's four shadow splits.
+func _flat_node(parent: Node3D, piece_name: String, mesh: Mesh) -> MeshInstance3D:
+	var mi := _mesh_node(parent, piece_name, mesh)
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	return mi
 
 
@@ -1157,6 +1299,7 @@ func _build_ground(center: Vector3, radius: float) -> void:
 	plane.size = Vector2(radius * 2.6, radius * 2.6)
 	ground.mesh = plane
 	ground.material_override = _flat_mat(GROUND_COL)
+	ground.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	# Well below the streets. At 2 cm the two surfaces z-fought over the whole
 	# map and the city came out under a grey haze.
 	ground.position = center + Vector3(0.0, -ROAD_DROP - 0.6, 0.0)
@@ -1166,7 +1309,10 @@ func _build_ground(center: Vector3, radius: float) -> void:
 ## Every street in the network, drawn as a quad, plus a patch at each junction
 ## to fill the wedge the quads leave between them.
 func _build_streets(center: Vector3, radius: float) -> void:
-	var marks := _group("Markings")
+	# Every dash and crossing stripe in town, as one mesh. They used to be a box
+	# node each — a hundred and more draw calls for paint.
+	var marks := Surf.new()
+	var paint_y: float = -ROAD_DROP + 0.021
 
 	for ei in _roads.edges.size():
 		var e: Vector2i = _roads.edges[ei]
@@ -1193,16 +1339,33 @@ func _build_streets(center: Vector3, radius: float) -> void:
 
 		if not avenue:
 			continue
+		var across: Vector3 = side.normalized()
 		# Centre dashes, stopping short of both junctions.
 		var step: float = 9.0
 		var runs: int = int((length - 16.0) / step)
 		for k in maxi(runs, 0):
 			var t: float = 8.0 + step * (float(k) + 0.5)
-			var mid: Vector3 = a + along * t
-			var dash := _box(marks, "Dash_%d_%d" % [ei, k],
-				mid + Vector3(0.0, -ROAD_DROP + 0.02, 0.0),
-				Vector3(0.35, 0.02, 3.6), _marking_mat)
-			dash.rotation.y = atan2(along.x, along.z)
+			_paint(marks, a + along * t, along, across, 3.6, 0.35, paint_y)
+
+		# A zebra across the mouth of every junction the avenue meets — a real
+		# junction, three streets or more, not a bend. From the map camera these
+		# are the one road marking bold enough to read, and they say "town" in a
+		# way a centre line does not.
+		for end in 2:
+			var at_point: int = e.x if end == 0 else e.y
+			if (_roads.adjacency[at_point] as Array).size() < 3:
+				continue
+			var from: Vector3 = a if end == 0 else b
+			var into: Vector3 = along if end == 0 else -along
+			var start: float = _junction_radius(at_point) + 1.2
+			if start + ZEBRA_DEPTH > length * 0.5 - 1.0:
+				continue
+			var stripes: int = int((_roads.half_width(ei) - 0.6) / ZEBRA_STRIPE)
+			var span: float = float(stripes * 2 - 1) * ZEBRA_STRIPE
+			for sn in stripes:
+				var off: float = -span * 0.5 + ZEBRA_STRIPE * (0.5 + 2.0 * float(sn))
+				_paint(marks, from + into * (start + ZEBRA_DEPTH * 0.5) + across * off,
+					into, across, ZEBRA_DEPTH, ZEBRA_STRIPE, paint_y)
 
 	# Junction fillets. A DISC, sized to the widest street actually meeting at
 	# that corner — the first pass used an avenue-sized square, which at a
@@ -1218,26 +1381,45 @@ func _build_streets(center: Vector3, radius: float) -> void:
 		var links: Array = _roads.adjacency[pi]
 		if links.is_empty():
 			continue
-		var w: float = 0.0
+		var w: float = _junction_radius(pi)
 		var avenue_here: bool = false
 		for link: Array in links:
-			var hw: float = _roads.half_width(int(link[1]))
-			w = maxf(w, hw)
 			if _roads.major[int(link[1])] == 1:
 				avenue_here = true
 
-		var fillet := MeshInstance3D.new()
-		fillet.name = "Junction_%d" % pi
-		var disc := CylinderMesh.new()
-		disc.top_radius      = w
-		disc.bottom_radius   = w
-		disc.height          = 0.04
-		disc.radial_segments = 14
-		disc.rings           = 1
-		fillet.mesh = disc
-		fillet.material_override = _road_mat if avenue_here else _lane_mat
-		fillet.position = p + Vector3(0.0, -ROAD_DROP + 0.018, 0.0)
-		_road_root.add_child(fillet)
+		# A flat polygon in world space, like the streets, so the asphalt runs
+		# straight through the junction with no seam. Its top a few millimetres
+		# over the highest street, no more: it used to be a disc four
+		# centimetres proud, invisible on flat grey and a visible curved step
+		# once the asphalt had texture to catch the light.
+		var ring := PackedVector3Array()
+		for s in 14:
+			var ang: float = TAU * float(s) / 14.0
+			ring.append(p + Vector3(cos(ang), 0.0, sin(ang)) * w)
+		_slab(_road_root, "Junction_%d" % pi, ring, -ROAD_DROP + 0.015,
+			_road_mat if avenue_here else _lane_mat)
+
+	var paint := ArrayMesh.new()
+	marks.commit(paint, _marking_mat, false)
+	_flat_node(self, "Markings", paint)
+
+
+## Radius of the fillet disc at a junction: the widest street meeting there.
+func _junction_radius(point: int) -> float:
+	var w: float = 0.0
+	for link: Array in (_roads.adjacency[point] as Array):
+		w = maxf(w, _roads.half_width(int(link[1])))
+	return w
+
+
+## One painted rectangle on the carriageway: `length` along `dir`, `width` across.
+static func _paint(s: Surf, centre: Vector3, dir: Vector3, across: Vector3,
+		length: float, width: float, y: float) -> void:
+	var c := Vector3(centre.x, y, centre.z)
+	var l: Vector3 = dir * (length * 0.5)
+	var w: Vector3 = across * (width * 0.5)
+	s.face(PackedVector3Array([c - l - w, c + l - w, c + l + w, c - l + w]),
+		PackedVector2Array(_NO_UV), Vector3.UP)
 
 
 func _build_blocks(center: Vector3, radius: float, keep_clear: Array[Dictionary],
@@ -1265,14 +1447,168 @@ func _build_blocks(center: Vector3, radius: float, keep_clear: Array[Dictionary]
 			var local := PackedVector3Array()
 			for p: Vector3 in quad:
 				local.append(p - mid)
-			_slab(block, "Pavement", local, 0.0, _pavement_mat)
+			# Kerb and pavement now; what fills the middle is up to the block
+			# kind, which _fill_block has not decided yet.
+			_ground = _block_ground(i, j, mid, local)
+			_build_block_edge(block)
 
 			# What is already standing on this block. Filled in by whatever fills
 			# the block, then read by the kerb — a tree planted at the kerb line
 			# was landing inside the shopfront of a terrace set one metre back.
 			var taken: Array[Dictionary] = []
+			_kerb_trees = PackedVector3Array()
+			_bays = {}
 			_fill_block(block, mid, local, from_center, radius, keep_clear, paths, taken)
 			_build_kerbside(block, mid, local, keep_clear, paths, taken)
+			_build_streetlights(block, mid, keep_clear, paths, i + j)
+
+
+## Where a block's ground actually is, worked out from the street network.
+##
+## The buildable quad is only an approximation — corners pulled in along their
+## diagonals — and it stops about a metre short of the carriageway. So the kerb
+## is built from the cell itself: each side offset inward by exactly the
+## half-width of ITS street, the sides meeting wherever those offsets cross. That
+## lands the kerb on the road's edge all the way round, corners included. A side
+## with no street is not offset at all, so a merged block runs straight into its
+## neighbour with no seam.
+##
+## Returns {"ok", "kerb", "back" (behind the kerbstone), "inner" (inside the
+## pavement), "streets" (edge index per side, -1 for none)} in block-local
+## space. If any of that comes out folded — a narrow cell between wide streets —
+## "ok" is false and "inner" is the old buildable quad, so the block still gets
+## a ground, just not a pavement.
+func _block_ground(i: int, j: int, mid: Vector3, fallback: PackedVector3Array) -> Dictionary:
+	var out := {"ok": false, "inner": fallback, "streets": PackedInt32Array([-1, -1, -1, -1])}
+	var cell: PackedVector3Array = _roads.cell_corners(i, j)
+	if cell.size() != 4:
+		return out
+	var streets := PackedInt32Array()
+	var to_kerb := PackedFloat32Array()
+	var to_back := PackedFloat32Array()
+	var to_inner := PackedFloat32Array()
+	for k in 4:
+		var e: int = _roads.side_edge(i, j, k)
+		streets.append(e)
+		to_kerb.append(_roads.half_width(e) if e >= 0 else 0.0)
+		to_back.append(KERB_W if e >= 0 else 0.0)
+		to_inner.append(KERB_W + PAVE_W if e >= 0 else 0.0)
+	var flat := PackedVector3Array()
+	for p: Vector3 in cell:
+		flat.append(Vector3(p.x, 0.0, p.z))
+	var kerb: PackedVector3Array = _offset_poly(flat, to_kerb)
+	var back: PackedVector3Array = _offset_poly(kerb, to_back)
+	var inner: PackedVector3Array = _offset_poly(kerb, to_inner)
+	if not (_same_shape(flat, kerb) and _same_shape(flat, back) and _same_shape(flat, inner)):
+		return out
+
+	var to_local := func(poly: PackedVector3Array) -> PackedVector3Array:
+		var l := PackedVector3Array()
+		for p: Vector3 in poly:
+			l.append(Vector3(p.x - mid.x, 0.0, p.z - mid.z))
+		return l
+	return {"ok": true, "kerb": to_local.call(kerb), "back": to_local.call(back),
+		"inner": to_local.call(inner), "streets": streets}
+
+
+## Moves each side of a convex polygon inward by its own distance, and returns
+## the corners where the moved sides now meet.
+static func _offset_poly(poly: PackedVector3Array, insets: PackedFloat32Array) -> PackedVector3Array:
+	var n: int = poly.size()
+	var turn: float = signf(_signed_area(poly))
+	var starts: Array[Vector2] = []
+	var dirs: Array[Vector2] = []
+	for k in n:
+		var a := Vector2(poly[k].x, poly[k].z)
+		var b := Vector2(poly[(k + 1) % n].x, poly[(k + 1) % n].z)
+		var d: Vector2 = (b - a).normalized()
+		starts.append(a + Vector2(-d.y, d.x) * turn * insets[k])
+		dirs.append(d)
+	var out := PackedVector3Array()
+	for k in n:
+		var prev: int = (k + n - 1) % n
+		var denom: float = dirs[prev].cross(dirs[k])
+		var p: Vector2 = starts[k]
+		if absf(denom) > 0.0001:
+			p = starts[prev] + dirs[prev] * ((starts[k] - starts[prev]).cross(dirs[k]) / denom)
+		out.append(Vector3(p.x, 0.0, p.y))
+	return out
+
+
+## True when `b` is still `a` pulled in — same winding, every side still
+## pointing the way it did — rather than folded through itself.
+static func _same_shape(a: PackedVector3Array, b: PackedVector3Array) -> bool:
+	if a.size() != b.size():
+		return false
+	var sa: float = _signed_area(a)
+	var sb: float = _signed_area(b)
+	if signf(sa) != signf(sb) or absf(sb) < 25.0:
+		return false
+	for k in a.size():
+		var da: Vector3 = a[(k + 1) % a.size()] - a[k]
+		var db: Vector3 = b[(k + 1) % b.size()] - b[k]
+		if db.length() < 0.05:
+			continue
+		if da.normalized().dot(db.normalized()) < 0.5:
+			return false
+	return true
+
+
+## The kerb and pavement round a block, on the sides that have a street.
+##
+## Both are laid out ALONG each street: U runs down the kerb from its corner,
+## V in from the road. That is what squares the paving flags to the kerb and
+## puts the kerbstone joints across it, whichever way the street runs.
+func _build_block_edge(block: Node3D) -> void:
+	if not bool(_ground["ok"]):
+		return
+	var kerb: PackedVector3Array = _ground["kerb"]
+	var back: PackedVector3Array = _ground["back"]
+	var inner: PackedVector3Array = _ground["inner"]
+	var streets: PackedInt32Array = _ground["streets"]
+	var turn: float = signf(_signed_area(kerb))
+	# Down past the carriageway, so the face closes the step to the road
+	# whichever street it is — they sit a few millimetres apart.
+	var drop := Vector3(0.0, -(ROAD_DROP + 0.03), 0.0)
+
+	var paving := Surf.new()
+	var stone := Surf.new()
+	for k in kerb.size():
+		if streets[k] < 0:
+			continue
+		var n: int = kerb.size()
+		var a: Vector3 = kerb[k]
+		var b: Vector3 = kerb[(k + 1) % n]
+		var along: Vector3 = (b - a).normalized()
+		var inward := Vector3(-along.z, 0.0, along.x) * turn
+		var run: float = a.distance_to(b)
+		var ba: Vector3 = back[k]
+		var bb: Vector3 = back[(k + 1) % n]
+		var ia: Vector3 = inner[k]
+		var ib: Vector3 = inner[(k + 1) % n]
+
+		stone.face(PackedVector3Array([a, b, bb, ba]), PackedVector2Array([
+			Vector2(0.0, 0.0), Vector2(run, 0.0),
+			_along_uv(bb, a, along, inward), _along_uv(ba, a, along, inward)]), Vector3.UP)
+		stone.face(PackedVector3Array([a + drop, b + drop, b, a]), PackedVector2Array([
+			Vector2(0.0, -drop.y), Vector2(run, -drop.y), Vector2(run, 0.0), Vector2(0.0, 0.0)]),
+			-inward)
+		paving.face(PackedVector3Array([ba, bb, ib, ia]), PackedVector2Array([
+			_along_uv(ba, a, along, inward), _along_uv(bb, a, along, inward),
+			_along_uv(ib, a, along, inward), _along_uv(ia, a, along, inward)]), Vector3.UP)
+
+	var pave_mesh := ArrayMesh.new()
+	paving.commit(pave_mesh, _pavement_mat, true)
+	if pave_mesh.get_surface_count() > 0:
+		_flat_node(block, "Pavement", pave_mesh)
+	var kerb_mesh := ArrayMesh.new()
+	stone.commit(kerb_mesh, _kerb_mat, true)
+	if kerb_mesh.get_surface_count() > 0:
+		_flat_node(block, "Kerb", kerb_mesh)
+
+
+static func _along_uv(p: Vector3, origin: Vector3, along: Vector3, inward: Vector3) -> Vector2:
+	return Vector2((p - origin).dot(along), (p - origin).dot(inward))
 
 
 static func _centroid(poly: PackedVector3Array) -> Vector3:
@@ -1436,6 +1772,9 @@ static func _overlaps(taken: Array[Dictionary], at: Vector3, radius: float,
 func _build_houses(block: Node3D, mid: Vector3, quad: PackedVector3Array, closeness: float,
 		keep_clear: Array[Dictionary], paths: Array[PackedVector3Array],
 		taken: Array[Dictionary]) -> void:
+	# Back gardens and verges between the houses, where there used to be bare
+	# pavement right across the block.
+	_block_floor(block, mid, "Lawn", _yard_grass_mat)
 	for _lot in _rng.randi_range(10, 16):
 		var spot: Dictionary = _spot_in(quad, 5.2)
 		if not spot["ok"]:
@@ -1533,6 +1872,8 @@ func _build_terrace(block: Node3D, mid: Vector3, quad: PackedVector3Array, close
 		return
 	along /= run
 	var inward: Vector3 = (_centroid(quad) - (a + b) * 0.5).normalized()
+	# Behind a row of shops: the service yard and the parking, in tarmac.
+	_block_floor(block, mid, "Yard", _yard_mat)
 
 	var units: int = clampi(int(run / 9.0), 2, 5)
 	var unit_w: float = (run - 4.0) / float(units)
@@ -1576,9 +1917,25 @@ func _build_terrace(block: Node3D, mid: Vector3, quad: PackedVector3Array, close
 			skin["roof_u0"]))
 
 
-func _build_park(block: Node3D, quad: PackedVector3Array) -> void:
-	_slab(block, "Lawn", _shrink(quad, 1.2), 0.03, _grass_mat)
+## The ground inside the pavement. The block the plaza stands on is paved right
+## across instead: it is the town square, not somebody's back garden or the
+## yard behind the shops, and the plaza sitting in a car park said so.
+func _block_floor(block: Node3D, mid: Vector3, floor_name: String,
+		mat: StandardMaterial3D) -> void:
+	var inner: PackedVector3Array = _ground["inner"]
+	if _inside(inner, _hub_at - mid, 0.0):
+		var first: Vector3 = inner[1] - inner[0]
+		_slab(block, "Square", inner, 0.0, _pavement_mat, atan2(first.z, first.x))
+		return
+	_slab(block, floor_name, inner, 0.0, mat)
 
+
+## A lawn, maybe a pond, and trees scattered over it. The paths, benches, beds
+## and playground come later, in _dress_parks — see there for why.
+func _build_park(block: Node3D, quad: PackedVector3Array) -> void:
+	_slab(block, "Lawn", _ground["inner"], 0.0, _lawn_mat)
+
+	var pond_at: Dictionary = {}
 	var spot: Dictionary = _spot_in(quad, 4.0)
 	if spot["ok"] and _rng.randf() < 0.4:
 		var pond := MeshInstance3D.new()
@@ -1587,20 +1944,41 @@ func _build_park(block: Node3D, quad: PackedVector3Array) -> void:
 		disc.top_radius      = _rng.randf_range(4.0, 6.5)
 		disc.bottom_radius   = disc.top_radius
 		disc.height          = 0.1
-		disc.radial_segments = 16
+		disc.radial_segments = 24
 		pond.mesh = disc
 		pond.material_override = _water_mat
+		pond.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 		pond.position = (spot["pos"] as Vector3) + Vector3(0.0, 0.06, 0.0)
 		block.add_child(pond)
+		# A dressed stone edge. Water meeting grass with nothing between reads as
+		# a hole in the lawn from above; with a rim it is a pond someone built.
+		var rim := MeshInstance3D.new()
+		rim.name = "PondRim"
+		var ring := CylinderMesh.new()
+		ring.top_radius      = disc.top_radius + 0.55
+		ring.bottom_radius   = ring.top_radius
+		ring.height          = 0.08
+		ring.radial_segments = 24
+		rim.mesh = ring
+		rim.material_override = _stone_mat
+		rim.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		rim.position = (spot["pos"] as Vector3) + Vector3(0.0, 0.03, 0.0)
+		block.add_child(rim)
+		pond_at = {"pos": spot["pos"], "radius": disc.top_radius + 0.55}
 
 	for _t in _rng.randi_range(7, 13):
 		var s: Dictionary = _spot_in(quad, 2.5)
 		if s["ok"]:
 			_tree(block, s["pos"], _rng.randf_range(3.4, 6.0))
 
+	_parks.append({"block": block, "inner": _ground["inner"], "pond": pond_at,
+		"streets": _ground["streets"]})
+
 
 func _build_square(block: Node3D, quad: PackedVector3Array) -> void:
-	_slab(block, "Paving", _shrink(quad, 1.0), 0.02, _pavement_mat)
+	# Flags true to the square's first side, the way it would have been laid.
+	var first: Vector3 = quad[1] - quad[0]
+	_slab(block, "Paving", _ground["inner"], 0.0, _pavement_mat, atan2(first.z, first.x))
 	_slab(block, "Inlay", _shrink(quad, 7.0), 0.04, _path_mat)
 
 	for i in 4:
@@ -1659,22 +2037,64 @@ func _build_kerbside(block: Node3D, mid: Vector3, quad: PackedVector3Array,
 
 			if _rng.randf() < 0.42:
 				_tree(block, at, _rng.randf_range(3.2, 4.8))
+				_kerb_trees.append(at)
+				continue
+			# Both draws happen whether or not the car is then placed: skipping
+			# one would shift every building in every block after this one.
+			var yaw: float = bearing + deg_to_rad(_rng.randf_range(-3.0, 3.0))
+			var col: StandardMaterial3D = _car_mats[_rng.randi() % _car_mats.size()]
+			var bay: Dictionary = _parking_bay(k, at)
+			if bay.is_empty():
 				continue
 			var car := Node3D.new()
 			car.name = "Car_%d_%d" % [k, i]
-			car.position = at
-			car.rotation.y = bearing + deg_to_rad(_rng.randf_range(-3.0, 3.0))
+			car.position = bay["pos"]
+			car.rotation.y = yaw
 			block.add_child(car)
-			var col: StandardMaterial3D = _car_mats[_rng.randi() % _car_mats.size()]
 			_box(car, "Body", Vector3(0.0, 0.62, 0.0), Vector3(1.9, 1.05, 4.3), col)
 			_box(car, "Cabin", Vector3(0.0, 1.35, -0.25), Vector3(1.7, 0.75, 2.1), col)
+
+
+## Where a car picked at `at` actually parks: level with it, in the carriageway
+## just off the kerb of side `k`, slid back along the kerb if that would put it
+## in the mouth of a junction. Empty where that side has no street, or where
+## the bay is already taken.
+##
+## These used to stand where they were picked — on the pavement, two metres in
+## from where the kerb is now.
+func _parking_bay(k: int, at: Vector3) -> Dictionary:
+	if not bool(_ground["ok"]):
+		return {"pos": at}
+	var streets: PackedInt32Array = _ground["streets"]
+	if streets[k] < 0:
+		return {}
+	var kerb: PackedVector3Array = _ground["kerb"]
+	var a: Vector3 = kerb[k]
+	var b: Vector3 = kerb[(k + 1) % kerb.size()]
+	var run: float = a.distance_to(b)
+	if run < PARK_CLEAR * 2.0 + PARK_PITCH:
+		return {}
+	var along: Vector3 = (b - a) / run
+	var t: float = clampf((at - a).dot(along), PARK_CLEAR, run - PARK_CLEAR)
+	var parked: PackedFloat32Array = _bays.get(k, PackedFloat32Array())
+	for other: float in parked:
+		if absf(other - t) < PARK_PITCH:
+			return {}
+	parked.append(t)
+	_bays[k] = parked
+	var out: Vector3 = Vector3(along.z, 0.0, -along.x) * signf(_signed_area(kerb))
+	var pos: Vector3 = a + along * t + out * PARK_OUT
+	return {"pos": Vector3(pos.x, -ROAD_DROP, pos.z)}
 
 
 ## A tree: trunk plus two offset canopy blocks. Two boxes rather than one makes
 ## the crown read as foliage instead of as a green cube.
 func _tree(parent: Node3D, at: Vector3, height: float) -> void:
 	var t := Node3D.new()
-	t.name = "Tree"
+	# Numbered: a block full of siblings all called "Tree" got auto-renamed to
+	# @Node3D@123 in the baked scene, which nobody can find in the editor.
+	t.name = "Tree_%d" % _tree_count
+	_tree_count += 1
 	t.position = at
 	t.rotation.y = _rng.randf_range(0.0, TAU)
 	parent.add_child(t)
@@ -1685,6 +2105,601 @@ func _tree(parent: Node3D, at: Vector3, height: float) -> void:
 	_box(t, "Crown", Vector3(0.0, height * 0.72, 0.0), Vector3(spread, height * 0.5, spread), leaf)
 	_box(t, "CrownTop", Vector3(0.0, height * 0.95, 0.0),
 		Vector3(spread * 0.62, height * 0.3, spread * 0.62), leaf)
+
+
+# ── Dressing the parks ───────────────────────────────────────────────────────
+
+## Paths, benches, flower beds and a fountain for every park, and a playground
+## in one of them.
+##
+## Done once the whole town stands, not inside _build_park. The trees were
+## scattered by _rng, and a path laid first would have had to steer round them
+## or change how many there are — either of which changes what _rng hands out
+## next and moves every building after it. Laid afterwards, the paths go where a
+## park's paths belong, and the few trees standing in the way are taken out.
+func _dress_parks() -> void:
+	if _parks.is_empty():
+		return
+	# Nearest the plaza first: that park gets the playground if it has room —
+	# Meeko starts at the plaza, so it is the one the player passes most.
+	var order: Array = range(_parks.size())
+	order.sort_custom(func(x: int, y: int) -> bool:
+		return _park_distance(x) < _park_distance(y))
+	var play_done: bool = false
+	for n: int in order:
+		var keep_out: Array = _dress_park(_parks[n])
+		if not play_done:
+			play_done = _place_playground(_parks[n], keep_out)
+	if not play_done:
+		print("[StoryCity] no park had room for the playground.")
+
+
+func _park_distance(n: int) -> float:
+	var at: Vector3 = (_parks[n]["block"] as Node3D).position
+	return Vector2(at.x - _hub_at.x, at.z - _hub_at.z).length()
+
+
+## Lays one park out and returns what the playground must stay clear of: a list
+## of ["seg", a, b, clearance] and ["disc", centre, radius].
+func _dress_park(park: Dictionary) -> Array:
+	var block: Node3D = park["block"]
+	var inner: PackedVector3Array = park["inner"]
+	var streets: PackedInt32Array = park["streets"]
+	var pond: Dictionary = park["pond"]
+	var has_pond: bool = not pond.is_empty()
+	var centre: Vector3 = (pond["pos"] as Vector3) if has_pond else _centroid(inner)
+	centre.y = 0.0
+	var shapes: Array = []
+
+	# Every way in from a street walks to the middle: to a promenade round the
+	# pond, or to a gravel round with a fountain on it.
+	var ring_r: float = float(pond["radius"]) + 1.3 + PATH_W * 0.5 if has_pond else ROUND_R
+	var gravel := Surf.new()
+	var spokes: Array = []
+	for k in inner.size():
+		if streets[k] < 0:
+			continue
+		var gate: Vector3 = (inner[k] + inner[(k + 1) % inner.size()]) * 0.5
+		var to_middle: Vector3 = centre - gate
+		var dist: float = to_middle.length()
+		if dist < ring_r + 3.0:
+			continue
+		var dir: Vector3 = to_middle / dist
+		# Into the round by half a metre, or to the middle of the promenade.
+		var end: Vector3 = centre - dir * (ring_r - (0.0 if has_pond else 0.5))
+		_path_strip(gravel, gate - dir * 0.05, end)
+		spokes.append([gate, end])
+		shapes.append(["seg", gate, end, PATH_W * 0.5 + 0.4])
+
+	if has_pond:
+		var segs: int = 28
+		for s in segs:
+			var a0: float = TAU * float(s) / float(segs)
+			var a1: float = TAU * float(s + 1) / float(segs)
+			var mid_dir := Vector3(cos((a0 + a1) * 0.5), 0.0, sin((a0 + a1) * 0.5))
+			# Only where it stays on the lawn: a pond near the edge of a park gets
+			# a promenade round the side that has room, not one over the kerb.
+			if not _inside(inner, centre + mid_dir * ring_r, PATH_W * 0.5 + 0.2):
+				continue
+			var p0 := Vector3(cos(a0), 0.0, sin(a0))
+			var p1 := Vector3(cos(a1), 0.0, sin(a1))
+			var lo: float = ring_r - PATH_W * 0.5
+			var hi: float = ring_r + PATH_W * 0.5
+			gravel.face(PackedVector3Array([centre + p0 * lo + Vector3.UP * 0.012,
+				centre + p1 * lo + Vector3.UP * 0.012, centre + p1 * hi + Vector3.UP * 0.012,
+				centre + p0 * hi + Vector3.UP * 0.012]), PackedVector2Array(_NO_UV), Vector3.UP)
+		shapes.append(["disc", centre, ring_r + PATH_W * 0.5 + 0.5])
+	else:
+		var round_pts := PackedVector3Array()
+		for s in 28:
+			var ang: float = TAU * float(s) / 28.0
+			round_pts.append(centre + Vector3(cos(ang), 0.0, sin(ang)) * ROUND_R + Vector3.UP * 0.012)
+		var round_uv := PackedVector2Array()
+		round_uv.resize(round_pts.size())
+		gravel.face(round_pts, round_uv, Vector3.UP)
+		_fountain(block, centre)
+		shapes.append(["disc", centre, ROUND_R + 0.6])
+
+	var paths := ArrayMesh.new()
+	gravel.commit(paths, _path_mat, false)
+	if paths.get_surface_count() > 0:
+		_flat_node(block, "Paths", paths)
+
+	# Benches beside each path, a little way in from the street, facing it.
+	for spoke: Array in spokes:
+		var gate: Vector3 = spoke[0]
+		var end: Vector3 = spoke[1]
+		var dir: Vector3 = (end - gate).normalized()
+		var side := Vector3(-dir.z, 0.0, dir.x) * (1.0 if _prop_rng.randf() < 0.5 else -1.0)
+		var at: Vector3 = gate.lerp(end, 0.45) + side * (PATH_W * 0.5 + 0.55)
+		var bench := _box(block, "Bench", at + Vector3(0.0, 0.26, 0.0),
+			Vector3(2.0, 0.42, 0.6), _bench_mat)
+		bench.rotation.y = atan2(-dir.z, dir.x)
+		shapes.append(["disc", at, 1.4])
+
+	# Beds round the fountain, between the paths — the colour a park is for.
+	if not has_pond:
+		var angles: Array[float] = []
+		for spoke: Array in spokes:
+			var d: Vector3 = (spoke[0] as Vector3) - centre
+			angles.append(atan2(d.z, d.x))
+		angles.sort()
+		if angles.size() < 2:
+			angles = [0.0, PI * 0.5, PI, PI * 1.5]
+		for n in angles.size():
+			var a: float = angles[n]
+			var b: float = angles[(n + 1) % angles.size()] + (TAU if n == angles.size() - 1 else 0.0)
+			var mid_a: float = (a + b) * 0.5
+			var at: Vector3 = centre + Vector3(cos(mid_a), 0.0, sin(mid_a)) * (ROUND_R + 2.3)
+			if not _inside(inner, at, 2.0):
+				continue
+			_flower_bed(block, at, FLOWER_COLS[_prop_rng.randi() % FLOWER_COLS.size()])
+			shapes.append(["disc", at, 2.0])
+
+	# Take out whatever the new layout now runs through.
+	var clear: Array = shapes.duplicate()
+	if has_pond:
+		clear.append(["disc", centre, float(pond["radius"]) + 0.8])
+	_clear_trees(block, clear, 0.9)
+	return shapes
+
+
+## A gravel path from `a` to `b`, as one strip on the lawn.
+static func _path_strip(s: Surf, a: Vector3, b: Vector3) -> void:
+	var dir: Vector3 = (b - a).normalized()
+	var w := Vector3(-dir.z, 0.0, dir.x) * (PATH_W * 0.5)
+	var y := Vector3.UP * 0.012
+	s.face(PackedVector3Array([a - w + y, b - w + y, b + w + y, a + w + y]),
+		PackedVector2Array(_NO_UV), Vector3.UP)
+
+
+## A stone basin with a pedestal and a little upper bowl, on the park's round.
+func _fountain(block: Node3D, at: Vector3) -> void:
+	var f := Node3D.new()
+	f.name = "Fountain"
+	f.position = at
+	block.add_child(f)
+	_disc(f, "Basin", 1.75, 0.5, 0.25, _stone_mat, 24)
+	var water := _disc(f, "Water", 1.5, 0.1, 0.47, _water_mat, 24)
+	water.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_cylinder(f, "Pedestal", 0.26, 1.0, 0.9, _stone_mat, 12)
+	_disc(f, "Bowl", 0.62, 0.14, 1.42, _stone_mat, 16)
+
+
+func _flower_bed(block: Node3D, at: Vector3, col: Color) -> void:
+	var bed := Node3D.new()
+	bed.name = "FlowerBed"
+	bed.position = at
+	block.add_child(bed)
+	_disc(bed, "Edging", 1.45, 0.16, 0.08, _stone_mat, 20)
+	_disc(bed, "Flowers", 1.25, 0.3, 0.16, _skin_mat("foliage", col, _means, true), 20)
+
+
+## Removes every tree on `block` standing inside one of `shapes`, or within
+## `margin` of it. Used after the fact, so it costs _rng nothing.
+func _clear_trees(block: Node3D, shapes: Array, margin: float) -> void:
+	for child: Node in block.get_children():
+		if not String(child.name).begins_with("Tree_"):
+			continue
+		var p: Vector3 = (child as Node3D).position
+		p.y = 0.0
+		for shape: Array in shapes:
+			var hit: bool = false
+			if shape[0] == "seg":
+				hit = _point_to_segment(p, shape[1], shape[2]) < float(shape[3]) + margin
+			else:
+				hit = p.distance_to(shape[1] as Vector3) < float(shape[2]) + margin
+			if hit:
+				block.remove_child(child)
+				# free(), not queue_free(): the bake packs the scene in this same
+				# frame, and a node only queued for deletion would be packed.
+				child.free()
+				break
+
+
+## Finds room for the playground in one quarter of the park, and builds it.
+## Tries each quarter at full size and then a little smaller before giving up
+## on the park — the caller then tries the next one.
+func _place_playground(park: Dictionary, keep_out: Array) -> bool:
+	var inner: PackedVector3Array = park["inner"]
+	var centre: Vector3 = _centroid(inner)
+	for scale: float in [1.0, 0.85]:
+		var half := PLAY_SIZE * 0.5 * scale
+		for k in inner.size():
+			var at: Vector3 = centre.lerp(inner[k], 0.5)
+			at.y = 0.0
+			var edge: Vector3 = inner[(k + 1) % inner.size()] - inner[k]
+			var yaw: float = atan2(-edge.z, edge.x)
+			var basis := Basis(Vector3.UP, yaw)
+			# Gate side (+Z) toward the middle of the park, where the paths are.
+			if basis.z.dot(centre - at) < 0.0:
+				yaw += PI
+				basis = Basis(Vector3.UP, yaw)
+			if _playground_fits(inner, at, basis, half, keep_out):
+				_build_playground(park["block"], at, yaw, half)
+				return true
+	return false
+
+
+func _playground_fits(inner: PackedVector3Array, at: Vector3, basis: Basis,
+		half: Vector2, keep_out: Array) -> bool:
+	var ext := Vector2(half.x + 0.6, half.y + 1.8)   # room for the benches at the gate
+	for c: Vector3 in [Vector3(-ext.x, 0, -half.y - 0.6), Vector3(ext.x, 0, -half.y - 0.6),
+			Vector3(ext.x, 0, ext.y), Vector3(-ext.x, 0, ext.y)]:
+		if not _inside(inner, at + basis * c, 0.6):
+			return false
+	var inv: Basis = basis.inverse()
+	for shape: Array in keep_out:
+		if shape[0] == "seg":
+			var a: Vector3 = shape[1]
+			var b: Vector3 = shape[2]
+			var steps: int = maxi(2, int(a.distance_to(b) / 0.5))
+			for s in steps + 1:
+				var local: Vector3 = inv * (a.lerp(b, float(s) / float(steps)) - at)
+				if absf(local.x) < ext.x + float(shape[3]) and absf(local.z) < ext.y + float(shape[3]):
+					return false
+		else:
+			var local: Vector3 = inv * ((shape[1] as Vector3) - at)
+			var near := Vector2(clampf(local.x, -ext.x, ext.x), clampf(local.z, -ext.y, ext.y))
+			if Vector2(local.x, local.z).distance_to(near) < float(shape[2]):
+				return false
+	return true
+
+
+## The playground itself: a rubber floor, a low fence with a gate, a slide
+## tower, swings, a roundabout, a seesaw and a sandpit, and a pair of benches
+## outside the gate for whoever is watching.
+##
+## All the equipment is ONE mesh, a surface per paint colour — thirty-odd
+## pieces as nodes would be thirty draw calls for something a few pixels high.
+## Local +Z faces the gate.
+func _build_playground(block: Node3D, at: Vector3, yaw: float, half: Vector2) -> void:
+	var pg := Node3D.new()
+	pg.name = "Playground"
+	pg.position = at
+	pg.rotation.y = yaw
+	block.add_child(pg)
+
+	var floor_mi := _box(pg, "Surface", Vector3(0.0, 0.025, 0.0),
+		Vector3(half.x * 2.0, 0.05, half.y * 2.0), _rubber_mat)
+	floor_mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+
+	var red := Surf.new()
+	var yellow := Surf.new()
+	var blue := Surf.new()
+	var green := Surf.new()
+	var metal := Surf.new()
+	var timber := Surf.new()
+	var sand := Surf.new()
+	var sx: float = half.x / (PLAY_SIZE.x * 0.5)
+	var sz: float = half.y / (PLAY_SIZE.y * 0.5)
+
+	# Fence: posts, and two rails with a gap for the gate in the middle of +Z.
+	var corners: Array[Vector3] = [Vector3(-half.x, 0, -half.y), Vector3(half.x, 0, -half.y),
+		Vector3(half.x, 0, half.y), Vector3(-half.x, 0, half.y)]
+	for k in 4:
+		var a: Vector3 = corners[k]
+		var b: Vector3 = corners[(k + 1) % 4]
+		var posts: int = int(ceil(a.distance_to(b) / 2.0))
+		for p in posts:
+			var pos: Vector3 = a.lerp(b, float(p) / float(posts))
+			_box_faces(green, Transform3D(Basis(), pos + Vector3(0, 0.45, 0)), Vector3(0.07, 0.9, 0.07))
+		var runs: Array = [[a, b]]
+		if k == 2:   # the +Z side, running +X to -X: leave the gate open
+			runs = [[a, Vector3(0.8, 0, half.y)], [Vector3(-0.8, 0, half.y), b]]
+		for run: Array in runs:
+			var r0: Vector3 = run[0]
+			var r1: Vector3 = run[1]
+			var along: Vector3 = r1 - r0
+			var basis := Basis(Vector3.UP, atan2(-along.z, along.x))
+			for y: float in [0.45, 0.86]:
+				_box_faces(green, Transform3D(basis, (r0 + r1) * 0.5 + Vector3(0, y, 0)),
+					Vector3(along.length(), 0.05, 0.05))
+
+	# Slide tower, back left.
+	var tower := Vector3(-2.9 * sx, 0.0, -2.1 * sz)
+	for c: Vector3 in [Vector3(-0.7, 0, -0.7), Vector3(0.7, 0, -0.7), Vector3(0.7, 0, 0.7), Vector3(-0.7, 0, 0.7)]:
+		_box_faces(blue, Transform3D(Basis(), tower + c + Vector3(0, 1.4, 0)), Vector3(0.12, 2.8, 0.12))
+	_box_faces(yellow, Transform3D(Basis(), tower + Vector3(0, 1.5, 0)), Vector3(1.6, 0.1, 1.6))
+	_box_faces(red, Transform3D(Basis(), tower + Vector3(0, 2.86, 0)), Vector3(1.9, 0.12, 1.9))
+	for rung in 5:
+		_box_faces(metal, Transform3D(Basis(), tower + Vector3(-0.95, 0.3 + 0.3 * float(rung), 0)),
+			Vector3(0.05, 0.04, 0.5))
+	for z: float in [-0.26, 0.26]:
+		_box_faces(metal, Transform3D(Basis(), tower + Vector3(-0.95, 0.8, z)), Vector3(0.05, 1.6, 0.05))
+	var drop: float = 1.35
+	var reach: float = 2.4
+	var chute_len: float = Vector2(reach, drop).length()
+	var chute := Basis(Vector3(0, 0, 1), -atan2(drop, reach))
+	var chute_at: Vector3 = tower + Vector3(0.8 + reach * 0.5, 0.15 + drop * 0.5, 0.0)
+	_box_faces(yellow, Transform3D(chute, chute_at), Vector3(chute_len, 0.06, 0.6))
+	for z: float in [-0.32, 0.32]:
+		_box_faces(red, Transform3D(chute, chute_at + Vector3(0, 0.09, z)), Vector3(chute_len, 0.18, 0.05))
+
+	# Swings, back right.
+	var swings := Vector3(2.7 * sx, 0.0, -2.0 * sz)
+	_box_faces(blue, Transform3D(Basis(), swings + Vector3(0, 2.3, 0)), Vector3(3.4, 0.12, 0.12))
+	var lean: float = atan2(0.9, 2.3)
+	for x: float in [-1.7, 1.7]:
+		for z: float in [-1.0, 1.0]:
+			# Each leg stands out at z and leans in to the beam overhead.
+			_box_faces(blue, Transform3D(Basis(Vector3(1, 0, 0), -lean * z),
+				swings + Vector3(x, 1.15, 0.45 * z)), Vector3(0.1, 2.47, 0.1))
+	for x: float in [-0.7, 0.7]:
+		_box_faces(red, Transform3D(Basis(), swings + Vector3(x, 0.45, 0)), Vector3(0.46, 0.05, 0.2))
+		for cx: float in [-0.2, 0.2]:
+			_box_faces(metal, Transform3D(Basis(), swings + Vector3(x + cx, 1.37, 0)),
+				Vector3(0.02, 1.8, 0.02))
+
+	# Roundabout, front right.
+	var spin := Vector3(3.1 * sx, 0.0, 1.9 * sz)
+	_prism_faces(yellow, spin, 1.1, 0.2, 0.3, 12)
+	_box_faces(red, Transform3D(Basis(), spin + Vector3(0, 0.75, 0)), Vector3(0.1, 0.9, 0.1))
+	for n in 4:
+		_box_faces(red, Transform3D(Basis(Vector3.UP, PI * 0.25 * float(n)), spin + Vector3(0, 0.75, 0)),
+			Vector3(1.7, 0.05, 0.05))
+
+	# Seesaw, front middle.
+	var saw := Vector3(0.5 * sx, 0.0, 2.2 * sz)
+	_box_faces(metal, Transform3D(Basis(), saw + Vector3(0, 0.17, 0)), Vector3(0.3, 0.34, 0.3))
+	var tilt := Basis(Vector3(0, 0, 1), deg_to_rad(9.0))
+	_box_faces(red, Transform3D(tilt, saw + Vector3(0, 0.42, 0)), Vector3(3.0, 0.06, 0.3))
+	for x: float in [-1.25, 1.25]:
+		_box_faces(blue, Transform3D(tilt, saw + tilt * Vector3(x, 0.2, 0) + Vector3(0, 0.42, 0)),
+			Vector3(0.05, 0.3, 0.3))
+
+	# Sandpit, front left.
+	var pit := Vector3(-3.0 * sx, 0.0, 2.0 * sz)
+	for side: float in [-1.0, 1.0]:
+		_box_faces(timber, Transform3D(Basis(), pit + Vector3(0, 0.11, 1.13 * side)), Vector3(2.4, 0.22, 0.14))
+		_box_faces(timber, Transform3D(Basis(), pit + Vector3(1.13 * side, 0.11, 0)), Vector3(0.14, 0.22, 2.12))
+	_box_faces(sand, Transform3D(Basis(), pit + Vector3(0, 0.07, 0)), Vector3(2.12, 0.08, 2.12))
+
+	var kit := ArrayMesh.new()
+	red.commit(kit, _flat_mat(Color(0.720, 0.205, 0.170), 0.55), false)
+	yellow.commit(kit, _flat_mat(Color(0.860, 0.660, 0.160), 0.55), false)
+	blue.commit(kit, _flat_mat(Color(0.180, 0.380, 0.660), 0.55), false)
+	green.commit(kit, _flat_mat(Color(0.200, 0.420, 0.280), 0.60), false)
+	metal.commit(kit, _flat_mat(Color(0.560, 0.575, 0.600), 0.45), false)
+	timber.commit(kit, _flat_mat(Color(0.460, 0.320, 0.200), 0.90), false)
+	sand.commit(kit, _flat_mat(Color(0.820, 0.740, 0.560), 1.00), false)
+	_mesh_node(pg, "Equipment", kit)
+
+	for x: float in [-2.2, 2.2]:
+		var bench := _box(pg, "Bench", Vector3(x * sx, 0.26, half.y + 1.1),
+			Vector3(2.0, 0.42, 0.6), _bench_mat)
+		bench.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+
+	var basis := Basis(Vector3.UP, yaw)
+	var reach_out: float = Vector2(half.x, half.y + 1.8).length()
+	var clear_pts: Array = []
+	for c: Vector3 in [Vector3(-half.x, 0, -half.y), Vector3(half.x, 0, -half.y),
+			Vector3(half.x, 0, half.y + 1.8), Vector3(-half.x, 0, half.y + 1.8)]:
+		clear_pts.append(at + basis * c)
+	# Trees out of the fence line and off the gate, by the rectangle's edges.
+	var shapes: Array = []
+	for k in 4:
+		shapes.append(["seg", clear_pts[k], clear_pts[(k + 1) % 4], 0.0])
+	shapes.append(["disc", at, reach_out * 0.72])
+	_clear_trees(block, shapes, 1.4)
+
+
+## A flat many-sided disc, as faces: the roundabout's deck.
+static func _prism_faces(s: Surf, at: Vector3, r: float, y0: float, y1: float, sides: int) -> void:
+	var top := PackedVector3Array()
+	var bottom := PackedVector3Array()
+	var no_uv := PackedVector2Array()
+	no_uv.resize(sides)
+	for n in sides:
+		var ang: float = TAU * float(n) / float(sides)
+		var rim := Vector3(cos(ang), 0.0, sin(ang)) * r
+		top.append(at + rim + Vector3.UP * y1)
+		bottom.append(at + rim + Vector3.UP * y0)
+	s.face(top, no_uv, Vector3.UP)
+	s.face(bottom, no_uv, Vector3.DOWN)
+	for n in sides:
+		var m: int = (n + 1) % sides
+		var mid_ang: float = TAU * (float(n) + 0.5) / float(sides)
+		s.face(PackedVector3Array([bottom[n], bottom[m], top[m], top[n]]),
+			PackedVector2Array(_NO_UV), Vector3(cos(mid_ang), 0.0, sin(mid_ang)))
+
+
+# ── Streetlights ─────────────────────────────────────────────────────────────
+
+## Lamps down every side of the block that has a street, on the pavement just
+## in from the kerb with their arms out over the road.
+##
+## `parity` staggers the two sides of a street against each other: a lamp
+## facing a lamp across the road looks like a gateway, alternating looks like a
+## street.
+func _build_streetlights(block: Node3D, mid: Vector3, keep_clear: Array[Dictionary],
+		paths: Array[PackedVector3Array], parity: int) -> void:
+	if not bool(_ground["ok"]):
+		return
+	var kerb: PackedVector3Array = _ground["kerb"]
+	var streets: PackedInt32Array = _ground["streets"]
+	var turn: float = signf(_signed_area(kerb))
+	var lamps: Array[Transform3D] = []
+	for k in kerb.size():
+		if streets[k] < 0:
+			continue
+		var a: Vector3 = kerb[k]
+		var b: Vector3 = kerb[(k + 1) % kerb.size()]
+		var run: float = a.distance_to(b)
+		var along: Vector3 = (b - a) / run
+		var inward := Vector3(-along.z, 0.0, along.x) * turn
+		var t: float = LAMP_END + (LAMP_SPACING * 0.5 if (parity + k) % 2 == 1 else 0.0)
+		while t <= run - LAMP_END:
+			var at: Vector3 = a + along * t + inward * (KERB_W + LAMP_INSET)
+			if _lamp_fits(mid + at, at, keep_clear, paths):
+				# Local +Z is the arm, so it goes out over the road.
+				lamps.append(Transform3D(Basis(Vector3.UP, _bearing_of(-inward)), at))
+			t += LAMP_SPACING
+	if lamps.is_empty():
+		return
+
+	var pools: Array[Transform3D] = []
+	for lamp: Transform3D in lamps:
+		var under: Vector3 = lamp.origin + lamp.basis.z * (LAMP_REACH - 0.1)
+		pools.append(Transform3D(Basis(), Vector3(under.x, 0.035, under.z)))
+	_multimesh(block, "Streetlights", _lamp_mesh, lamps, true)
+	_multimesh(block, "LampLight", _pool_mesh, pools, false)
+
+
+## A lamp keeps out of a rift's way, off the spur a route walks up to one, and
+## clear of the street trees. Not the full keep-clear radius a building needs:
+## a post is thin, and a rift standing on a lit street is the point.
+func _lamp_fits(world: Vector3, local: Vector3, keep_clear: Array[Dictionary],
+		paths: Array[PackedVector3Array]) -> bool:
+	for entry: Dictionary in keep_clear:
+		var c: Vector3 = entry.get("pos", Vector3.ZERO)
+		var r: float = minf(float(entry.get("radius", 10.0)) * 0.5, 6.0)
+		if Vector2(world.x - c.x, world.z - c.z).length() < r:
+			return false
+	for line: PackedVector3Array in paths:
+		for i in range(1, line.size()):
+			if _point_to_segment(world, line[i - 1], line[i]) < 1.8:
+				return false
+	for tree: Vector3 in _kerb_trees:
+		if Vector2(local.x - tree.x, local.z - tree.z).length() < 2.8:
+			return false
+	return true
+
+
+func _multimesh(parent: Node3D, piece_name: String, mesh: Mesh,
+		xforms: Array[Transform3D], shadows: bool) -> MultiMeshInstance3D:
+	var mm := MultiMesh.new()
+	# Format before count: changing it afterwards clears the instances.
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = xforms.size()
+	for n in xforms.size():
+		mm.set_instance_transform(n, xforms[n])
+	var mmi := MultiMeshInstance3D.new()
+	mmi.name = piece_name
+	mmi.multimesh = mm
+	mmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON if shadows \
+		else GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	parent.add_child(mmi)
+	return mmi
+
+
+## One streetlight, shared by every lamp in town: a dark post and arm, and a
+## head that is the glowing part.
+##
+## The WHOLE head glows, not just a lens underneath it. The camera looks down
+## from above and would never see a lens; what reads at night from up there is a
+## bright point at the end of every arm and the pool of light below it.
+func _build_lamp_mesh() -> ArrayMesh:
+	var metal := Surf.new()
+	var head := Surf.new()
+	_box_faces(metal, Transform3D(Basis(), Vector3(0.0, 0.2, 0.0)), Vector3(0.28, 0.4, 0.28))
+	_box_faces(metal, Transform3D(Basis(), Vector3(0.0, LAMP_HEIGHT * 0.5, 0.0)),
+		Vector3(0.12, LAMP_HEIGHT, 0.12))
+	_box_faces(metal, Transform3D(Basis(), Vector3(0.0, LAMP_HEIGHT - 0.05, LAMP_REACH * 0.5)),
+		Vector3(0.08, 0.08, LAMP_REACH))
+	_box_faces(head, Transform3D(Basis(), Vector3(0.0, LAMP_HEIGHT - 0.12, LAMP_REACH - 0.1)),
+		Vector3(0.34, 0.14, 0.62))
+
+	var post_mat := _flat_mat(LAMP_POST_COL, 0.55)
+	post_mat.metallic = 0.4
+	var glow := _flat_mat(Color(0.86, 0.84, 0.78), 0.4)
+	glow.emission_enabled = true
+	glow.emission = LAMP_GLOW_COL
+	glow.emission_energy_multiplier = 1.0
+	# Found by name inside the baked city, like LitGlass, and driven by the clock:
+	# StoryMap turns these up at dusk and off at noon.
+	glow.resource_name = "LampGlow"
+
+	var mesh := ArrayMesh.new()
+	metal.commit(mesh, post_mat, false)
+	head.commit(mesh, glow, false)
+	return mesh
+
+
+## The light a lamp throws on the ground: a disc, white in the middle and black
+## at the rim, drawn additively. Black adds nothing, so in daylight — when
+## StoryMap has its colour at zero — it is simply not there. Real lights would
+## cost a clustered light each, two hundred of them; this costs one draw per
+## block and reads the same from above.
+func _build_pool_mesh() -> ArrayMesh:
+	var segments: int = 20
+	# Bright in the middle and falling away fast, then a long faint tail — a
+	# linear ramp to the rim reads as a flat disc with a soft edge, and two
+	# hundred of those from above is a polka-dot street.
+	var rings: Array = [[0.38, Color(0.40, 0.40, 0.40)], [1.0, Color.BLACK]]
+	var verts := PackedVector3Array([Vector3.ZERO])
+	var cols := PackedColorArray([Color.WHITE])
+	for ring: Array in rings:
+		for s in segments:
+			var ang: float = TAU * float(s) / float(segments)
+			verts.append(Vector3(cos(ang), 0.0, sin(ang)) * LAMP_POOL_R * float(ring[0]))
+			cols.append(ring[1])
+	var tris := PackedInt32Array()
+	for s in segments:
+		var n: int = (s + 1) % segments
+		_pool_tri(tris, verts, 0, 1 + s, 1 + n)
+		var a: int = 1 + s
+		var b: int = 1 + n
+		_pool_tri(tris, verts, a, a + segments, b + segments)
+		_pool_tri(tris, verts, a, b + segments, b)
+	var norms := PackedVector3Array()
+	for _v in verts.size():
+		norms.append(Vector3.UP)
+	var arrays: Array = []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_NORMAL] = norms
+	arrays[Mesh.ARRAY_COLOR] = cols
+	arrays[Mesh.ARRAY_INDEX] = tris
+
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	mat.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+	mat.vertex_color_use_as_albedo = true
+	mat.albedo_color = Color.BLACK
+	# Fog mixes toward its own colour, and on an ADDITIVE material that is fog
+	# ADDED to the ground: every pool showed as a grey disc at noon and a violet
+	# one at dusk, lamps off.
+	mat.disable_fog = true
+	mat.resource_name = "LampPool"
+
+	var mesh := ArrayMesh.new()
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	mesh.surface_set_material(0, mat)
+	return mesh
+
+
+## One triangle of the pool disc, wound clockwise seen from above — Godot's
+## front face for something facing up.
+static func _pool_tri(tris: PackedInt32Array, verts: PackedVector3Array, a: int, b: int, c: int) -> void:
+	if (verts[b] - verts[a]).cross(verts[c] - verts[a]).dot(Vector3.UP) > 0.0:
+		tris.append_array(PackedInt32Array([a, c, b]))
+	else:
+		tris.append_array(PackedInt32Array([a, b, c]))
+
+
+## A box as six faces on a surface under construction, placed by `xf` — for
+## props built out of many small parts that should still be one mesh.
+static func _box_faces(s: Surf, xf: Transform3D, size: Vector3) -> void:
+	var h: Vector3 = size * 0.5
+	var no_uv := PackedVector2Array(_NO_UV)
+	for axis in 3:
+		for sgn: float in [-1.0, 1.0]:
+			var n := Vector3.ZERO
+			n[axis] = sgn
+			var u := Vector3.ZERO
+			u[(axis + 1) % 3] = 1.0
+			var v := Vector3.ZERO
+			v[(axis + 2) % 3] = 1.0
+			var c: Vector3 = n * h[axis]
+			var du: Vector3 = u * h[(axis + 1) % 3]
+			var dv: Vector3 = v * h[(axis + 2) % 3]
+			var pts := PackedVector3Array([c - du - dv, c + du - dv, c + du + dv, c - du + dv])
+			for i in 4:
+				pts[i] = xf * pts[i]
+			s.face(pts, no_uv, (xf.basis * n).normalized())
 
 
 ## True when one of the keep-clear points (a rift, or the hub) sits on this

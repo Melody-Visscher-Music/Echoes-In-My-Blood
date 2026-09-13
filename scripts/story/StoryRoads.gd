@@ -448,6 +448,24 @@ func buildable_quad(i: int, j: int) -> PackedVector3Array:
 	return out
 
 
+## The street along side `k` of a cell (0 = south, 1 = east, 2 = north,
+## 3 = west), as an index into `edges` — or -1 where no street runs and the
+## block simply carries on into its neighbour. Side k runs from corner k to
+## corner k + 1 of cell_corners(), in that order.
+func side_edge(i: int, j: int, k: int) -> int:
+	var slots: Array[Vector2i] = [Vector2i(i, j), Vector2i(i + 1, j),
+		Vector2i(i + 1, j + 1), Vector2i(i, j + 1)]
+	var a: Vector2i = slots[k]
+	var b: Vector2i = slots[(k + 1) % 4]
+	if not (_slot.has(a) and _slot.has(b)):
+		return -1
+	var ib: int = _slot[b]
+	for link: Array in (adjacency[_slot[a]] as Array):
+		if int(link[0]) == ib:
+			return int(link[1])
+	return -1
+
+
 ## Inset for side `k` of a cell: 0 = south, 1 = east, 2 = north, 3 = west.
 func _edge_inset(i: int, j: int, k: int) -> float:
 	var a: Vector2i

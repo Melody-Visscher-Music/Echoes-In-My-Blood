@@ -419,6 +419,23 @@ var _time_hold: int = -1
 ## The one shared lit-window material inside the baked city, found by name. The
 ## share of windows that CAN light is baked; how brightly they burn is not.
 var _lit_mats: Array[StandardMaterial3D] = []
+## The streetlights' heads and the pools of light under them, found the same
+## way and driven off the same `lit` curve as the windows: on from dusk, off by
+## noon.
+var _lamp_glow_mats: Array[StandardMaterial3D] = []
+var _lamp_pool_mats: Array[StandardMaterial3D] = []
+## The pools' nodes, hidden outright while the lamps are off. Additive black
+## adds nothing, but it is still two hundred discs drawn over the whole street
+## network for no pixel of difference.
+var _lamp_pool_nodes: Array[GeometryInstance3D] = []
+## How hard a lamp head burns against a window at the same hour — a lamp is a
+## bare bulb, a window is a lit room behind glass.
+const LAMP_GLOW_GAIN: float = 1.7
+## What a pool of lamplight adds to the ground at full night. It is drawn
+## additively, so this is light ON TOP of the scene, not a colour painted over it.
+const LAMP_POOL_COL: Color = Color(0.50, 0.38, 0.23)
+## `lit` at full night, which is where the pools reach LAMP_POOL_COL.
+const LIT_FULL: float = 1.75
 
 
 func _build_environment() -> void:
@@ -548,6 +565,16 @@ func _apply_time(t: float) -> void:
 	var lit: float = lerpf(a["lit"], b["lit"], k)
 	for m: StandardMaterial3D in _lit_mats:
 		m.emission_energy_multiplier = lit
+	for m: StandardMaterial3D in _lamp_glow_mats:
+		m.emission_energy_multiplier = lit * LAMP_GLOW_GAIN
+	var pool: float = clampf(lit / LIT_FULL, 0.0, 1.0)
+	for m: StandardMaterial3D in _lamp_pool_mats:
+		m.albedo_color = Color(LAMP_POOL_COL.r * pool, LAMP_POOL_COL.g * pool,
+			LAMP_POOL_COL.b * pool)
+	var pools_on: bool = pool > 0.002
+	for pool_node: GeometryInstance3D in _lamp_pool_nodes:
+		if pool_node.visible != pools_on:
+			pool_node.visible = pools_on
 
 
 ## The name of the hour, for the dev readout.
@@ -562,21 +589,39 @@ func _time_name() -> String:
 		TIME_PRESETS[(i + 1) % n]["name"], int(k * 100.0)]
 
 
-## Finds the one shared lit-window material inside the baked city.
+## Finds the shared lit-window material inside the baked city, and the
+## streetlights' glow and pool materials.
 ##
-## By resource_name, set in StoryCity._build_materials(). Nothing else marks it
-## out: once the city is packed it is one StandardMaterial3D among hundreds, and
-## walking for "the emissive one" would also catch anything emissive added later.
+## By resource_name, set in StoryCity. Nothing else marks them out: once the
+## city is packed they are StandardMaterial3Ds among hundreds, and walking for
+## "the emissive one" would also catch anything emissive added later. The lamps
+## are MultiMeshes, so their mesh hangs off the multimesh, not the node.
 func _collect_lit_glass(root: Node) -> void:
 	for child in root.get_children():
 		_collect_lit_glass(child)
-		var mi := child as MeshInstance3D
-		if mi == null or mi.mesh == null:
+		var mesh: Mesh = null
+		if child is MeshInstance3D:
+			mesh = (child as MeshInstance3D).mesh
+		elif child is MultiMeshInstance3D and (child as MultiMeshInstance3D).multimesh != null:
+			mesh = (child as MultiMeshInstance3D).multimesh.mesh
+		if mesh == null:
 			continue
-		for i in mi.mesh.get_surface_count():
-			var m := mi.mesh.surface_get_material(i) as StandardMaterial3D
-			if m != null and m.resource_name == "LitGlass" and not _lit_mats.has(m):
-				_lit_mats.append(m)
+		for i in mesh.get_surface_count():
+			var m := mesh.surface_get_material(i) as StandardMaterial3D
+			if m == null:
+				continue
+			match m.resource_name:
+				"LitGlass":
+					if not _lit_mats.has(m):
+						_lit_mats.append(m)
+				"LampGlow":
+					if not _lamp_glow_mats.has(m):
+						_lamp_glow_mats.append(m)
+				"LampPool":
+					if not _lamp_pool_mats.has(m):
+						_lamp_pool_mats.append(m)
+					if not _lamp_pool_nodes.has(child):
+						_lamp_pool_nodes.append(child as GeometryInstance3D)
 
 
 ## Puts the city on screen.
