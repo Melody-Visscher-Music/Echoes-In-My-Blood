@@ -27,6 +27,8 @@ const RUNNER_SCENE: String = "res://scenes/beat3d/Section_BeatRunner3D.tscn"
 const BEATMAP_DIR: String = "res://data/beatmaps"
 ## Where shots land.
 const SHOT_DIR: String = "user://devshots"
+## The copy of the save every run works on. Never the player's own file.
+const RUN_SAVE: String = "user://devsave_run.cfg"
 
 var _failures: int = 0
 var _checks: int = 0
@@ -37,6 +39,7 @@ func _ready() -> void:
 	var mode: String = args[0] if args.size() > 0 else "verify"
 	var arg: String = args[1] if args.size() > 1 else ""
 	print("-- dev harness: %s --" % mode)
+	_sandbox_save()
 	match mode:
 		"verify":
 			await _verify()
@@ -55,7 +58,25 @@ func _ready() -> void:
 			print("unknown mode '%s' - try verify | perf | loadtime | shots | bake" % mode)
 	if _checks > 0:
 		print("-- %d checks, %d failed --" % [_checks, _failures])
+	_release_save()
 	get_tree().quit(1 if _failures > 0 else 0)
+
+
+## Every mode here boots the map or a level, and both of those write as they go:
+## the map persists the time of day, a death rolls a seed off the never-seen
+## list, a finished song files a high score. So the whole run works on a COPY of
+## the save and deletes it afterwards — a dev run must not move the player's
+## clock or spend their seeds.
+func _sandbox_save() -> void:
+	var copy := ConfigFile.new()
+	if copy.load(Save.PATH) == OK:
+		copy.save(RUN_SAVE)
+	Save.dev_use_path(RUN_SAVE)
+
+
+func _release_save() -> void:
+	Save.dev_use_path(Save.PATH)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(RUN_SAVE))
 
 
 # ── Checking ─────────────────────────────────────────────────────────────────
@@ -75,6 +96,7 @@ func _verify() -> void:
 	await _verify_baked_city()
 	await _verify_boots()
 	_verify_save()
+	await _verify_menus()
 	await _verify_lazy_gates()
 
 
@@ -328,10 +350,83 @@ func _verify_save() -> void:
 			kept += 1
 	_check(kept > 0, "a broken save was not kept aside")
 
-	Save.dev_use_path(Save.PATH)   # back to the real one before anything else runs
+	Save.dev_use_path(RUN_SAVE)   # back to the run's copy, never the real file
 	for name: String in DirAccess.open("user://").get_files():
 		if name.begins_with("devsave_") or name.begins_with("save.corrupt-"):
 			DirAccess.remove_absolute(ProjectSettings.globalize_path("user://" + name))
+
+
+## The three overlays a level puts up. Each one is opened for real, navigated,
+## and photographed — none of them is confirmed, because every entry on them
+## changes scene. Both the death and the results panel write as they open, which
+## is why the whole run is on a copy of the save (see _sandbox_save).
+func _verify_menus() -> void:
+	print("menus:")
+	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
+	_story_context()
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	var section: Node = _find_section(level)
+	var menus: Node = section.get("_menus")
+	if not _check(menus != null, "the level built no LevelMenus"):
+		return
+
+	# Pause: opens, the stick and the keys move the lit entry, and it closes.
+	section.call("_pause_game")
+	await _frames(20)
+	_check(bool(menus.call("is_pause_open")), "pause menu did not open")
+	_check(get_tree().paused, "pausing did not freeze the tree")
+	var before: int = int(menus.get("_pause_option"))
+	menus.call("handle_pause_key", _key(KEY_DOWN))
+	_check(int(menus.get("_pause_option")) != before, "pause selection did not move")
+	await _shoot("menu_pause")
+	section.call("_resume_game")
+	await _frames(20)
+	_check(not bool(menus.call("is_pause_open")), "pause menu did not close")
+	_check(not get_tree().paused, "resuming did not unfreeze the tree")
+
+	# Death: the card arrives behind a fade, so give it time to land.
+	section.call("_trigger_death")
+	await _frames(90)
+	_check(bool(menus.call("is_death_open")), "death card did not open")
+	var death_before: int = int(menus.get("_death_sel"))
+	menus.call("handle_death_key", _key(KEY_DOWN))
+	_check(int(menus.get("_death_sel")) != death_before, "death selection did not move")
+	await _shoot("menu_death")
+
+	# Results, on a second level — the first one has just died.
+	_shut_down(level)
+	await _frames(5)
+	level = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	section = _find_section(level)
+	menus = section.get("_menus")
+	section.call("_spawn_results_panel")
+	await _frames(90)
+	_check(bool(menus.call("is_results_open")), "results panel did not open")
+	var results_before: int = int(menus.get("_results_sel"))
+	menus.call("handle_results_key", _key(KEY_RIGHT))
+	_check(int(menus.get("_results_sel")) != results_before, "results selection did not move")
+	await _shoot("menu_results")
+
+	_shut_down(level)
+	await _frames(5)
+
+
+func _key(code: Key) -> InputEventKey:
+	var ev := InputEventKey.new()
+	ev.physical_keycode = code
+	ev.keycode = code
+	ev.pressed = true
+	return ev
+
+
+func _shoot(shot_name: String) -> void:
+	await _frames(2)
+	get_viewport().get_texture().get_image().save_png("%s/%s.png" % [SHOT_DIR, shot_name])
+	print("  %s" % shot_name)
 
 
 # ── Measuring ────────────────────────────────────────────────────────────────

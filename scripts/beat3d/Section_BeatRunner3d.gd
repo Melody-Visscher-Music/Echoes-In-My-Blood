@@ -79,11 +79,6 @@ var _story_entry_rift: StoryRift = null
 var _story_exit_rift:  StoryRift = null
 ## _finalise_score()'s cached answer — see the note there on why it is cached.
 var _score_final: Dictionary = {}
-var _end_screen_active:  bool  = false
-var _end_screen_sel:     int   = 0     # 0 = play again, 1 = song select, 2 = main menu
-# Held as a list rather than one var per pill: the navigation used to toggle with
-# `1 - _end_screen_sel`, which silently cannot reach a third option.
-var _end_nav_labels:     Array[PlateButton] = []
 var _gameplay_pulse_index: int = 0
 var _runner_avg_beat_s: float = 0.5
 
@@ -167,9 +162,6 @@ const _WJ_MULT_FADE_S: float = 0.35
 var _wj_climb_top_z: float = -1.0
 
 # ── Death screen state ───────────────────────────────────────────────────────
-var _death_menu_active: bool = false
-var _death_menu_option: int  = 0          # 0 = RETRY/NEW SEED, 1 = SONG SELECT, 2 = MAIN MENU
-var _death_option_nodes: Array[Control]   = []   # [retry, song_select, main_menu]
 
 # ── Level start — countdown before music begins ───────────────────────────────
 # All heavy setup (gates, decorations, city) happens in _ready(). We then wait
@@ -197,15 +189,10 @@ var _loading_bar_rect: ColorRect = null   # shader meter, same component as the 
 var _paused: bool = false
 @warning_ignore("unused_private_class_variable")
 var _pause_canvas: CanvasLayer  = null
-var _pause_root:   Control      = null
-var _pause_option: int          = 0       # 0 = RESUME, 1 = RESTART, 2 = MAIN MENU, 3 = SONG SELECT
-var _pause_buttons: Array[PlateButton] = []   # index matches _PAUSE_OPTIONS
 
 # Left stick for the pause / death / results overlays. Those read discrete
 # key and D-pad events in _unhandled_input; a stick emits motion events that
 # never look like a press, so it is polled per frame instead.
-var _menu_stick_v := MenuNav.AxisRepeat.new()
-var _menu_stick_h := MenuNav.AxisRepeat.new()
 
 # ── Gate spawn animation ──────────────────────────────────────────────────────
 var _gate_animated: Array[bool] = []      # true once the gate's intro tween has fired
@@ -449,6 +436,9 @@ var _gate_vis_built: Array[bool] = []
 var _pieces: GatePieces = null
 ## What a gate looks like — see GateLooks. Built alongside _pieces.
 var _looks: GateLooks = null
+## The pause, death and results overlays — see LevelMenus. It draws them and
+## says which entry is lit; what an entry DOES stays here.
+var _menus: LevelMenus = null
 ## Metres of track built during the loading screen, and how far beyond the
 ## visible window a gate is fleshed out once the song is running. The gap
 ## between the two is slack: by the time a gate is shown it has been standing
@@ -652,6 +642,12 @@ func _ready() -> void:
 	# while that's happening. Re-enabled in _start_level() as before.
 	player.input_disabled = true
 	player.set_physics_process(false)
+	_menus = LevelMenus.new()
+	_menus.name = "Menus"
+	add_child(_menus)
+	_menus.pause_chosen.connect(_pause_confirm)
+	_menus.death_chosen.connect(_death_confirm)
+	_menus.results_chosen.connect(_end_confirm)
 	_build_loading_ui()
 
 	# Apply user settings before any world/material setup
@@ -858,7 +854,7 @@ func _process(delta: float) -> void:
 	# Overlay navigation first: the pause menu is up while the rest of this
 	# function is short-circuited, and the results screen appears after the
 	# song clock has stopped mattering.
-	_menu_stick_poll(delta)
+	_menus.stick_poll(delta)
 
 	# HUD "echoes" rainbow chrome — always animating, independent of countdown/pause/song
 	# state, so the colour drift never visibly stutters or freezes. The hue moves
@@ -6507,44 +6503,6 @@ func _update_hud_rainbow(delta: float) -> void:
 
 # (The lightning arc survives as the bolt_amount mode of
 # shaders/hud_bar.gdshader, tuning intact.)
-
-
-## The same chevron pips the HUD draws under the HP bar, as a standalone row for
-## the death card — two readouts of the same number should look like the same
-## thing rather than one being pips and the other the words "2 lives remaining".
-func _make_life_pip_row(remaining: int, total: int, s: float) -> Control:
-	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", int(8 * s))
-	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-
-	var bar_shader: Shader = load("res://shaders/hud_bar.gdshader") as Shader
-	for i in maxi(total, 0):
-		var spent: bool = i >= remaining
-		var pip := ColorRect.new()
-		pip.color = Color.WHITE
-		pip.custom_minimum_size = Vector2(46 * s, 12 * s)
-		pip.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var m := ShaderMaterial.new()
-		m.shader = bar_shader
-		m.set_shader_parameter("rect_size",   Vector2(46 * s, 12 * s))
-		m.set_shader_parameter("skew_px",     5.0)
-		m.set_shader_parameter("tick_count",  0.0)
-		m.set_shader_parameter("bolt_amount", 0.0)
-		m.set_shader_parameter("fill_pct",    0.0 if spent else 1.0)
-		m.set_shader_parameter("ghost_pct",   0.0)
-		m.set_shader_parameter("ghost_color", Color(0, 0, 0, 0))
-		m.set_shader_parameter("fill_color",  UiStyle.PINK)
-		m.set_shader_parameter("fill_color2", UiStyle.VIOLET)
-		m.set_shader_parameter("edge_color",  UiStyle.PINK)
-		pip.material = m
-		pip.modulate = Color(1, 1, 1, 0.55) if spent else Color.WHITE
-		row.add_child(pip)
-	return row
-
-
-## Pushes the current life count to the HUD's pips. Called wherever
-## Run.song_lives changes while a level is still on screen.
 func _sync_hud_lives() -> void:
 	if _hud != null:
 		_hud.set_lives(Run.song_lives, GameConfig.lives_per_song)
@@ -6697,133 +6655,16 @@ func _trigger_death() -> void:
 	# Big red death flash
 	_hud_flash_color(Color(1.00, 0.05, 0.05, 0.75), 0.15)
 
-	var root: Control = _overlay_root()
-	if root == null:
-		return
-
-	var s: float = UiStyle.scale_for(_vp())
-
-	# ── Phase 1: fade to solid black ────────────────────────────────
-	var blackout := ColorRect.new()
-	blackout.color        = Color(0.02, 0.01, 0.04, 1.0)
-	blackout.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	blackout.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	blackout.modulate.a   = 0.0
-	root.add_child(blackout)
-
-	# ── Phase 2: the card, built now and revealed once the blackout lands ───
-	var card := PlatePanel.create(int(36 * s), UiStyle.DANGER, 28.0 * s)
-	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
-	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	card.custom_minimum_size = Vector2(600 * s, 0)
-	card.modulate.a = 0.0
-	root.add_child(card)
-
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", int(6 * s))
-	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	card.content.add_child(vbox)
-
-	var title_col: Color = Color(1.00, 0.62, 0.12) if lives_exhausted else UiStyle.DANGER
-	var title: Label = UiStyle.label(
-		"OUT OF TRIES" if lives_exhausted else "FAILED",
-		UiStyle.display(900, 3.0), int((52 if lives_exhausted else 64) * s), Color.WHITE)
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.self_modulate = title_col
-	vbox.add_child(title)
-
-	var score_cap: Label = UiStyle.label("SCORE", UiStyle.caption(4.0), int(11 * s), Color.WHITE)
-	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_cap.self_modulate = Color(0.70, 0.62, 0.88, 0.80)
-	vbox.add_child(score_cap)
-
-	var score_lbl: Label = UiStyle.label(
-		UiStyle.group_digits(_score), UiStyle.display(800), int(34 * s), Color.WHITE)
-	score_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_lbl.self_modulate = UiStyle.signature_color(0.30)
-	vbox.add_child(score_lbl)
-
-	# Lives remaining, as the same pips the HUD uses — so the two readouts of the
-	# same number look like the same thing.
-	if lives_exhausted:
-		var note: Label = UiStyle.label(
-			"ALL TRIES USED — A BRAND NEW ROUTE HAS BEEN GENERATED",
-			UiStyle.caption(1.5), int(11 * s), Color.WHITE)
-		note.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		note.self_modulate = Color(1.00, 0.78, 0.24, 0.95)
-		vbox.add_child(note)
-	else:
-		vbox.add_child(_make_life_pip_row(Run.song_lives, GameConfig.lives_per_song, s))
-
-	var rule := ColorRect.new()
-	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.50)
-	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
-	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(rule)
-
-	var gap := Control.new()
-	gap.custom_minimum_size = Vector2(0, 10 * s)
-	vbox.add_child(gap)
-
-	var opt_texts: Array[String] = [
-		"▶  PLAY NEW SEED" if lives_exhausted else "▶  RETRY",
-		"↩  %s" % Run.level_exit_name(),
-		"⌂  MAIN MENU",
-	]
-	_death_option_nodes.clear()
-	for i in opt_texts.size():
-		var btn := PlateButton.create(opt_texts[i], Callable(), int(19 * s), UiStyle.PINK)
-		btn.focus_mode = Control.FOCUS_NONE   # selection is driven by _death_menu_option
-		btn.custom_minimum_size = Vector2(0, 52 * s)
-		vbox.add_child(btn)
-		_death_option_nodes.append(btn)
-	_death_menu_option = 0
-
-	# Mouse rides the same selection index. Gated on _death_menu_active so a
-	# click landing during the fade-to-black cannot pick an entry that is not
-	# on screen yet.
-	MenuNav.wire_pointer(_death_option_nodes,
-		func(i: int) -> void:
-			_death_menu_option = i
-			_death_update_selection(),
-		_death_confirm,
-		func() -> bool: return _death_menu_active)
-
-	var hint_gap := Control.new()
-	hint_gap.custom_minimum_size = Vector2(0, 8 * s)
-	vbox.add_child(hint_gap)
-
-	var hint: Label = UiStyle.label(
-		"↑↓ / D-PAD CHOOSE  ·  CLICK OR ENTER / A CONFIRM",
-		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.self_modulate = Color(0.58, 0.52, 0.72, 0.75)
-	vbox.add_child(hint)
-
-	# ── Sequence: fade to black → reveal the card on top ───────────────
-	var ftw := create_tween()
-	ftw.tween_property(blackout, "modulate:a", 1.0, 0.55)
-	ftw.tween_property(card, "modulate:a", 1.0, 0.32)
-	ftw.tween_callback(func() -> void:
-		_death_menu_active = true
-		_death_update_selection()
-	)
+	_menus.open_death(_overlay_root(), {
+		"score": _score,
+		"lives_left": Run.song_lives,
+		"lives_max": GameConfig.lives_per_song,
+		"exhausted": lives_exhausted,
+	})
 
 
-# Highlight the currently selected death-menu option.
-# Highlight the currently selected death-menu option.
-func _death_update_selection() -> void:
-	for i in range(_death_option_nodes.size()):
-		var btn := _death_option_nodes[i] as PlateButton
-		if btn != null:
-			btn.set_highlight(i == _death_menu_option)
-
-
-func _death_confirm() -> void:
-	_death_menu_active = false
-	match _death_menu_option:
+func _death_confirm(option: int) -> void:
+	match option:
 		0:  # RETRY / PLAY NEW SEED — Run.run_seed already holds the correct seed
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
 		1:  # SONG SELECT / STORY MAP — reset so the next song picked starts fresh
@@ -6854,23 +6695,9 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 
 	# ── End screen navigation ────────────────────────────────────────────────
-	if _end_screen_active:
-		var nav_count: int = maxi(_end_nav_labels.size(), 1)
-		if event.is_action("ui_left"):
+	if _menus.is_results_open():
+		if _menus.handle_results_key(event):
 			get_viewport().set_input_as_handled()
-			_end_screen_sel = posmod(_end_screen_sel - 1, nav_count)
-			_end_update_nav_highlight()
-		elif event.is_action("ui_right"):
-			get_viewport().set_input_as_handled()
-			_end_screen_sel = posmod(_end_screen_sel + 1, nav_count)
-			_end_update_nav_highlight()
-		elif event.is_action("ui_accept"):
-			get_viewport().set_input_as_handled()
-			_end_confirm()
-		elif event.is_action("ui_cancel"):
-			get_viewport().set_input_as_handled()
-			_end_screen_sel = 1   # Esc backs out the way the level was entered
-			_end_confirm()
 		return
 
 	# ── Pause toggle: ESC or gamepad Start ───────────────────────────────────
@@ -6879,7 +6706,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	var is_gamepad_start: bool = (event is InputEventJoypadButton and
 		(event as InputEventJoypadButton).button_index == JOY_BUTTON_START)
 
-	if (is_esc or is_gamepad_start) and not _death_menu_active and not _song_finish_pending:
+	if (is_esc or is_gamepad_start) and not _menus.is_death_open() and not _song_finish_pending:
 		get_viewport().set_input_as_handled()
 		if _paused:
 			_resume_game()
@@ -6887,41 +6714,13 @@ func _unhandled_input(event: InputEvent) -> void:
 			_pause_game()
 		return
 
-	# ── Pause menu navigation ─────────────────────────────────────────────────
+	# ── Pause and death menu navigation ──────────────────────────────────────
 	if _paused:
-		# Gamepad B backs out of the pause menu the way it backs out of every
-		# other screen. (Esc never reaches here — the toggle above claims it.)
-		if event.is_action("ui_cancel"):
+		if _menus.handle_pause_key(event):
 			get_viewport().set_input_as_handled()
-			_resume_game()
-		elif event.is_action("ui_up"):
-			get_viewport().set_input_as_handled()
-			_pause_option = posmod(_pause_option - 1, _PAUSE_OPTIONS.size())
-			_pause_update_selection()
-		elif event.is_action("ui_down"):
-			get_viewport().set_input_as_handled()
-			_pause_option = posmod(_pause_option + 1, _PAUSE_OPTIONS.size())
-			_pause_update_selection()
-		elif event.is_action("ui_accept"):
-			get_viewport().set_input_as_handled()
-			_pause_confirm()
 		return
-
-	# ── Death menu navigation ─────────────────────────────────────────────────
-	if not _death_menu_active:
-		return
-
-	if event.is_action("ui_up"):
+	if _menus.handle_death_key(event):
 		get_viewport().set_input_as_handled()
-		_death_menu_option = posmod(_death_menu_option - 1, _death_option_nodes.size())
-		_death_update_selection()
-	elif event.is_action("ui_down"):
-		get_viewport().set_input_as_handled()
-		_death_menu_option = posmod(_death_menu_option + 1, _death_option_nodes.size())
-		_death_update_selection()
-	elif event.is_action("ui_accept"):
-		get_viewport().set_input_as_handled()
-		_death_confirm()
 # ── Camera FX ────────────────────────────────────────────────────────────────
 func _update_camera_fx(delta: float) -> void:
 	if _camera == null or not _level_started or _paused:
@@ -7410,17 +7209,8 @@ func _update_hud_progress(t_s: float) -> void:
 
 
 # ── Pause / resume ────────────────────────────────────────────────────────────
-## Single source of truth for the pause menu's entries. _pause_update_selection()
-## and the up/down navigation both used their own hardcoded counts, which is how
-## the fifth option ended up unreachable-looking.
-const _PAUSE_OPTIONS: Array[String] = [
-	"▶  RESUME",
-	"↺  RESTART  (-1 life)",
-	"⌂  MAIN MENU",
-	"⏹  SONG SELECT",
-	"⊙  CALIBRATE AUDIO",
-]
-
+# The overlays themselves live in LevelMenus; what is left here is what pausing
+# and resuming DO to the level.
 
 ## The Control that full-screen overlays parent themselves to. Prefer this over
 ## the old `_hud_flash.get_parent()` idiom, which is only still around because
@@ -7446,126 +7236,11 @@ func _pause_game() -> void:
 	music.stream_paused = true
 	player.set_physics_process(false)
 	player.set_process(false)
-
-	# Built on the HUD's own CanvasLayer, so it sits above every readout.
-	var hud_root: Control = _overlay_root()
-	if hud_root == null:
-		return
-
-	_pause_option = 0
-	_pause_buttons.clear()
-
-	var s: float = UiStyle.scale_for(_vp())
-
-	var veil := ColorRect.new()
-	veil.name = "PauseVeil"
-	veil.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	veil.color = Color(0.02, 0.01, 0.07, 0.86)
-	veil.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hud_root.add_child(veil)
-	_pause_root = veil
-
-	# One centred chassis instead of the old four-loose-border-rects frame.
-	var card := PlatePanel.create(int(34 * s), UiStyle.VIOLET, 26.0 * s)
-	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
-	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	card.custom_minimum_size = Vector2(520 * s, 0)
-	veil.add_child(card)
-
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", int(10 * s))
-	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	card.content.add_child(vbox)
-
-	var title: Label = UiStyle.label("PAUSED", UiStyle.caption(7.0), int(34 * s), Color.WHITE)
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	title.self_modulate = UiStyle.signature_color(0.15)
-	vbox.add_child(title)
-
-	var rule := ColorRect.new()
-	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.55)
-	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
-	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(rule)
-
-	var gap := Control.new()
-	gap.custom_minimum_size = Vector2(0, 8 * s)
-	vbox.add_child(gap)
-
-	for i in _PAUSE_OPTIONS.size():
-		# RESTART costs a life, so it wears the warning accent rather than the
-		# signature one - the cost should be visible before it is confirmed.
-		var accent: Color = Color(1.00, 0.52, 0.16) if i == 1 else UiStyle.PINK
-		# Entry 3 is the "back to where this level was started from" exit, so its
-		# wording follows the run: the song list in Freeplay, the map in a story run.
-		var opt_text: String = _PAUSE_OPTIONS[i]
-		if i == 3:
-			opt_text = "⏹  %s" % Run.level_exit_name()
-		var btn := PlateButton.create(opt_text, Callable(), int(19 * s), accent)
-		btn.name = "PauseOpt%d" % i
-		# Selection is driven by _pause_option, not by Godot focus - otherwise
-		# ui_up/ui_down would move both and the highlight would skip entries.
-		btn.focus_mode = Control.FOCUS_NONE
-		btn.custom_minimum_size = Vector2(0, 52 * s)
-		vbox.add_child(btn)
-		_pause_buttons.append(btn)
-
-	# The overlay drives its own selection index, which left it with no mouse
-	# support whatsoever — the entries lit up on hover and did nothing on click.
-	# Route hover and click through the same index the keys and the pad use.
-	MenuNav.wire_pointer(_pause_buttons,
-		func(i: int) -> void:
-			_pause_option = i
-			_pause_update_selection(),
-		_pause_confirm,
-		func() -> bool: return _paused)
-
-	var hint_gap := Control.new()
-	hint_gap.custom_minimum_size = Vector2(0, 10 * s)
-	vbox.add_child(hint_gap)
-
-	var hint: Label = UiStyle.label(
-		"ESC / START / B  ·  ↑↓ NAVIGATE  ·  CLICK OR ENTER / A CONFIRM",
-		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.self_modulate = Color(0.62, 0.55, 0.78, 0.75)
-	vbox.add_child(hint)
-
-	veil.modulate.a = 0.0
-	create_tween().tween_property(veil, "modulate:a", 1.0, 0.18)
-
-	_pause_update_selection()
+	_menus.open_pause(_overlay_root())
 
 
-## Analog-stick navigation for whichever overlay is currently up.
-func _menu_stick_poll(delta: float) -> void:
-	var v: int = _menu_stick_v.step(MenuNav.stick(JOY_AXIS_LEFT_Y), delta)
-	var h: int = _menu_stick_h.step(MenuNav.stick(JOY_AXIS_LEFT_X), delta)
-
-	if _end_screen_active:
-		if h != 0 and not _end_nav_labels.is_empty():
-			_end_screen_sel = posmod(_end_screen_sel + h, _end_nav_labels.size())
-			_end_update_nav_highlight()
-	elif _paused:
-		if v != 0:
-			_pause_option = posmod(_pause_option + v, _PAUSE_OPTIONS.size())
-			_pause_update_selection()
-	elif _death_menu_active:
-		if v != 0 and not _death_option_nodes.is_empty():
-			_death_menu_option = posmod(_death_menu_option + v, _death_option_nodes.size())
-			_death_update_selection()
-
-
-func _pause_update_selection() -> void:
-	for i in _pause_buttons.size():
-		var btn: PlateButton = _pause_buttons[i]
-		if btn != null:
-			btn.set_highlight(i == _pause_option)
-
-
-func _pause_confirm() -> void:
-	match _pause_option:
+func _pause_confirm(option: int) -> void:
+	match option:
 		0:  # Resume
 			_resume_game()
 		1:  # Restart — costs one life, reloads the game scene
@@ -7596,16 +7271,13 @@ func _pause_confirm() -> void:
 
 func _launch_audio_calibrator() -> void:
 	# Hide the pause overlay while calibrating (it comes back on cancel/complete).
-	if _pause_root != null:
-		_pause_root.visible = false
+	_menus.set_pause_visible(false)
 	var cal: Node = load("res://scripts/AudioCalibrator.gd").new()
 	cal.calibration_complete.connect(func(_ms: float) -> void:
-		if _pause_root != null:
-			_pause_root.visible = true
+		_menus.set_pause_visible(true)
 	)
 	cal.calibration_cancelled.connect(func() -> void:
-		if _pause_root != null:
-			_pause_root.visible = true
+		_menus.set_pause_visible(true)
 	)
 	add_child(cal)   # Section is PROCESS_MODE_ALWAYS while paused — calibrator inherits it
 
@@ -7624,11 +7296,7 @@ func _resume_game() -> void:
 	player.set_physics_process(_level_started)
 	player.set_process(true)
 
-	if _pause_root != null:
-		var ftw := create_tween()
-		ftw.tween_property(_pause_root, "modulate:a", 0.0, 0.14)
-		ftw.tween_callback(_pause_root.queue_free)
-		_pause_root = null
+	_menus.close_pause()
 
 
 func _mark_gate_result(idx: int, success: bool) -> void:
@@ -9049,210 +8717,23 @@ func _spawn_finish_orb_burst() -> void:
 			otw.parallel().tween_property(orb, "rotation:y", orb.rotation.y + TAU * 2.0, dur)
 			otw.tween_callback(orb.queue_free)
 
-# ── End-screen results panel ─────────────────────────────────────────────────
+
+## The run is over: freeze the runner, settle the score, and hand the numbers to
+## the results panel. The panel itself lives in LevelMenus; what it shows is
+## decided here, because _finalise_score() is also what writes the high score.
 func _spawn_results_panel() -> void:
-	var hud_root: Control = _overlay_root()
-	if hud_root == null:
-		return
-
-	var s: float = UiStyle.scale_for(_vp())
-
-	# The scoring itself lives in _finalise_score() — Story Mode reports the same
-	# numbers on the map, and neither screen may work them out for itself.
-	var result: Dictionary = _finalise_score()
-	var is_perfect: bool = bool(result["is_perfect"])
-	var is_new_hs: bool  = bool(result["is_new_high"])
-	var acc: float       = float(result["accuracy"])
-	var grade: String    = String(result["grade"])
-	var grade_col: Color = result["grade_color"] as Color
-	var hs: Dictionary   = {"score": int(result["best"])}
-
-	# Backdrop
-	var overlay := ColorRect.new()
-	overlay.color = Color(0.015, 0.008, 0.045, 0.94)
-	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	overlay.modulate.a   = 0.0
-	hud_root.add_child(overlay)
-
-	# Card — accent follows the grade, so an S run and an F run do not look alike
-	var card := PlatePanel.create(int(38 * s), grade_col, 32.0 * s)
-	card.set_anchors_and_offsets_preset(Control.PRESET_CENTER)
-	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
-	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
-	card.custom_minimum_size = Vector2(840 * s, 0)
-	card.modulate.a = 0.0
-	hud_root.add_child(card)
-
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", int(4 * s))
-	vbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	card.content.add_child(vbox)
-
-	if is_perfect:
-		var perf: Label = UiStyle.label("\u2726  PERFECT  \u2726", UiStyle.caption(6.0), int(22 * s), Color.WHITE)
-		perf.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		perf.self_modulate = Color(0.40, 1.00, 0.60)
-		vbox.add_child(perf)
-		var ptw := perf.create_tween().set_loops()
-		ptw.tween_property(perf, "modulate", Color(1.25, 1.25, 1.0), 0.70)
-		ptw.tween_property(perf, "modulate", Color(1.0, 1.0, 1.0), 0.70)
-
-	var score_cap: Label = UiStyle.label(
-		"SCORE  \u00b7  \u00d71.5 PERFECT BONUS" if is_perfect else "SCORE",
-		UiStyle.caption(5.0), int(11 * s), Color.WHITE)
-	score_cap.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_cap.self_modulate = Color(0.40, 0.95, 0.60) if is_perfect else Color(0.65, 0.58, 0.85, 0.85)
-	vbox.add_child(score_cap)
-
-	var score_val: Label = UiStyle.label(
-		UiStyle.group_digits(_score), UiStyle.display(800), int(72 * s), Color.WHITE)
-	score_val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	score_val.self_modulate = Color(1.00, 0.95, 0.42)
-	vbox.add_child(score_val)
-
-	# Grade on its own chip
-	var grade_row := HBoxContainer.new()
-	grade_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	grade_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(grade_row)
-
-	var grade_chip := PlatePanel.create(int(10 * s), grade_col, 18.0 * s)
-	grade_chip.custom_minimum_size = Vector2(150 * s, 0)
-	grade_row.add_child(grade_chip)
-
-	var grade_box := VBoxContainer.new()
-	grade_box.add_theme_constant_override("separation", 0)
-	grade_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	grade_chip.content.add_child(grade_box)
-
-	var grade_lbl: Label = UiStyle.label(grade, UiStyle.display(900), int(58 * s), Color.WHITE)
-	grade_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	grade_lbl.self_modulate = grade_col
-	grade_box.add_child(grade_lbl)
-
-	var acc_lbl: Label = UiStyle.label("%.1f%%" % (acc * 100.0), UiStyle.display(700), int(15 * s), Color.WHITE)
-	acc_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	acc_lbl.self_modulate = grade_col.lightened(0.20)
-	grade_box.add_child(acc_lbl)
-
-	if grade == "S":
-		var gtw := grade_lbl.create_tween().set_loops()
-		gtw.tween_property(grade_lbl, "modulate", Color(1.45, 1.35, 0.65), 0.60)
-		gtw.tween_property(grade_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.60)
-
-	# Record line
-	if is_new_hs:
-		var hs_lbl: Label = UiStyle.label("\u2605  NEW HIGH SCORE  \u2605", UiStyle.caption(5.0), int(17 * s), Color.WHITE)
-		hs_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		hs_lbl.self_modulate = Color(1.00, 0.38, 0.68)
-		vbox.add_child(hs_lbl)
-		var htw := hs_lbl.create_tween().set_loops()
-		htw.tween_property(hs_lbl, "modulate", Color(1.35, 0.9, 1.35), 0.55)
-		htw.tween_property(hs_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.55)
-	else:
-		var prev: Label = UiStyle.label(
-			"BEST  %s" % UiStyle.group_digits(int(hs.get("score", 0))),
-			UiStyle.caption(3.0), int(12 * s), Color.WHITE)
-		prev.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		prev.self_modulate = Color(0.58, 0.52, 0.75, 0.85)
-		vbox.add_child(prev)
-
-	vbox.add_child(_results_rule(s))
-
-	# Stats row
-	var stat_row := HBoxContainer.new()
-	stat_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	stat_row.add_theme_constant_override("separation", int(70 * s))
-	stat_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(stat_row)
-
-	var miss_col: Color = UiStyle.DANGER if _gates_missed > 0 else Color(0.50, 0.46, 0.68)
-	var stats: Array = [
-		["BEST COMBO", "\u00d7%d" % _max_combo, UiStyle.CYAN],
-		["HIT", str(_gates_hit), Color(0.40, 1.00, 0.55)],
-		["MISSED", str(_gates_missed), miss_col],
-	]
-	for st in stats:
-		var col := VBoxContainer.new()
-		col.add_theme_constant_override("separation", 0)
-		col.mouse_filter = Control.MOUSE_FILTER_IGNORE
-		var val: Label = UiStyle.label(String(st[1]), UiStyle.display(800), int(40 * s), Color.WHITE)
-		val.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		val.self_modulate = st[2]
-		col.add_child(val)
-		var key: Label = UiStyle.label(String(st[0]), UiStyle.caption(3.0), int(10 * s), Color.WHITE)
-		key.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		key.self_modulate = Color(0.58, 0.52, 0.75, 0.85)
-		col.add_child(key)
-		stat_row.add_child(col)
-
-	vbox.add_child(_results_rule(s))
-
-	# Navigation
-	var nav_row := HBoxContainer.new()
-	nav_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	nav_row.add_theme_constant_override("separation", int(16 * s))
-	nav_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	vbox.add_child(nav_row)
-
-	_end_nav_labels.clear()
-	for txt in ["\u25b6  PLAY AGAIN", "\u21a9  %s" % Run.level_exit_name(), "\u2302  MAIN MENU"]:
-		var btn := PlateButton.create(txt, Callable(), int(16 * s), UiStyle.PINK)
-		btn.focus_mode = Control.FOCUS_NONE   # selection is driven by _end_screen_sel
-		btn.custom_minimum_size = Vector2(230 * s, 50 * s)
-		nav_row.add_child(btn)
-		_end_nav_labels.append(btn)
-
-	MenuNav.wire_pointer(_end_nav_labels,
-		func(i: int) -> void:
-			_end_screen_sel = i
-			_end_update_nav_highlight(),
-		_end_confirm,
-		func() -> bool: return _end_screen_active)
-
-	var hint: Label = UiStyle.label(
-		"\u25c0\u25b6 / D-PAD CHOOSE  \u00b7  CLICK OR ENTER / A CONFIRM",
-		UiStyle.caption(2.0), int(11 * s), Color.WHITE)
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	hint.self_modulate = Color(0.55, 0.50, 0.70, 0.75)
-	vbox.add_child(hint)
-
-	# Fade in
-	var itw := create_tween()
-	itw.parallel().tween_property(overlay, "modulate:a", 1.0, 0.40)
-	itw.parallel().tween_property(card, "modulate:a", 1.0, 0.40)
-	itw.tween_callback(func() -> void:
-		player.input_disabled = true
-		_end_screen_sel = 0
-		_end_update_nav_highlight()
-		_end_screen_active = true
-	)
+	player.input_disabled = true
+	_menus.open_results(_overlay_root(), {
+		"result": _finalise_score(),
+		"score": _score,
+		"gates_hit": _gates_hit,
+		"gates_missed": _gates_missed,
+		"max_combo": _max_combo,
+	})
 
 
-## Thin signature-band rule. Replaces HSeparator, whose theme colour is one flat
-## line with no way to carry the palette.
-func _results_rule(s: float) -> Control:
-	var rule := ColorRect.new()
-	rule.color = Color(UiStyle.VIOLET.r, UiStyle.VIOLET.g, UiStyle.VIOLET.b, 0.50)
-	rule.custom_minimum_size = Vector2(0, maxf(1.0, 2.0 * s))
-	rule.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	return rule
-
-
-# (Results nav pills are PlateButtons now — see _spawn_results_panel.)
-
-
-func _end_update_nav_highlight() -> void:
-	for i in _end_nav_labels.size():
-		var btn := _end_nav_labels[i]
-		if btn != null:
-			btn.set_highlight(i == _end_screen_sel)
-
-
-func _end_confirm() -> void:
-	_end_screen_active = false
-	match _end_screen_sel:
+func _end_confirm(option: int) -> void:
+	match option:
 		0:  # Play Again — relaunch with the same song key and mode
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
 		1:  # Song Select / Story Map
