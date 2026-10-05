@@ -265,7 +265,10 @@ func _sweep_track(song_key: String) -> void:
 			built += 1
 	_check(empty_shown == 0, "%d gates were shown with nothing in them" % empty_shown)
 	_check(built == gates.size(), "%d of %d gates never built" % [gates.size() - built, gates.size()])
-	print("  %-22s %d gates, all built by the end of the track" % [song_key, gates.size()])
+	var looks: Variant = section.get("_looks")
+	var arcs: int = (looks.arc_lights as Array).size() if looks != null else 0
+	print("  %-22s %d gates, all built by the end of the track (%d arc lights)" % [
+		song_key, gates.size(), arcs])
 	_shut_down(level)
 	await _frames(3)
 
