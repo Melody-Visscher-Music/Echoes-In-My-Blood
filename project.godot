@@ -36,6 +36,7 @@ RNG="*res://autoload/RNG.gd"
 Save="*res://autoload/Save.gd"
 ContentDB="*res://autoload/ContentDB.gd"
 GamepadSetup="*res://autoload/GamepadSetup.gd"
+Preload="*res://autoload/Preload.gd"
 
 [debug]
 

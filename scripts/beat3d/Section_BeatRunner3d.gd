@@ -7173,6 +7173,7 @@ func _trigger_death() -> void:
 	if _song_finish_pending:
 		return
 	_song_finish_pending = true   # blocks further scoring and re-entry
+	_warm_exit_screen()
 
 	music.stop()
 
@@ -8197,6 +8198,7 @@ func _vp() -> Vector2:
 
 
 func _pause_game() -> void:
+	_warm_exit_screen()
 	_paused = true
 	self.process_mode   = Node.PROCESS_MODE_ALWAYS  # keep input + HUD alive
 	get_tree().paused   = true                       # freeze everything else
@@ -8368,6 +8370,8 @@ func _launch_audio_calibrator() -> void:
 
 
 func _resume_game() -> void:
+	# Back into the song: the map warmed on pause is not needed after all.
+	Preload.drop("map")
 	self.process_mode   = Node.PROCESS_MODE_INHERIT  # restore normal processing
 	get_tree().paused   = false                       # unfreeze everything
 	_paused = false
@@ -9313,6 +9317,22 @@ func _story_end_path_dist() -> float:
 	return secs * player.forward_speed
 
 
+## Reads the screen this level will go back to while it is still on screen.
+##
+## Only ever called when the level is already over or frozen — the song has
+## stopped for a death, the game is paused, or the exit fade has started. A
+## worker thread reading a few megabytes mid-song could cost a frame, and a
+## dropped frame in a rhythm game is a missed note; none of these moments can
+## drop anything the player would feel.
+##
+## The map gains the most from this: ~370 ms of its ~1.1 s is reading the baked
+## city, and unlike a level it has no loading screen to do that behind.
+func _warm_exit_screen() -> void:
+	if not Run.in_story_mode():
+		return
+	Preload.warm("map", PackedStringArray([Run.level_exit_scene(), StoryMap.BAKED_CITY]))
+
+
 ## Story Mode's end of a level: no celebration, no results card, out through the
 ## rift and back to the map with the numbers in hand.
 ##
@@ -9323,6 +9343,7 @@ func _story_end_path_dist() -> float:
 ## is explicit about it. Taking the card away leaves the map as the only way
 ## back in, and the map is the thing that reseeds.
 func _finish_story_run() -> void:
+	_warm_exit_screen()
 	Run.song_lives = GameConfig.lives_per_song
 	_sync_hud_lives()
 	# Read the score BEFORE the scene goes: _finalise_score() applies the perfect

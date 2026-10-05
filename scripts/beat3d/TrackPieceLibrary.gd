@@ -193,6 +193,37 @@ func instance_character() -> Node3D:
 
 # ── Scanning ──────────────────────────────────────────────────────────────────
 
+## Every piece file under PIECES_DIR, without opening any of them.
+##
+## For Preload: the map warms these in the background while the player is still
+## choosing a rift, so scan() finds them in the resource cache instead of going
+## to disk. It lists exactly what _scan_dir() would pick up — same suffix
+## trimming, same extensions — so the two cannot drift into warming one set of
+## files and loading another.
+static func source_paths(path: String = PIECES_DIR, out: PackedStringArray = PackedStringArray()) -> PackedStringArray:
+	var dir: DirAccess = DirAccess.open(path)
+	if dir == null:
+		return out
+	dir.list_dir_begin()
+	var fn: String = dir.get_next()
+	while fn != "":
+		var full: String = path.path_join(fn)
+		if dir.current_is_dir():
+			if not fn.begins_with("."):
+				source_paths(full, out)
+		else:
+			if full.ends_with(".remap"):
+				full = full.trim_suffix(".remap")
+			elif full.ends_with(".import"):
+				full = full.trim_suffix(".import")
+			var ext: String = full.get_extension().to_lower()
+			if (ext == "glb" or ext == "gltf" or ext == "tscn" or ext == "scn") 					and not out.has(full):
+				out.append(full)
+		fn = dir.get_next()
+	dir.list_dir_end()
+	return out
+
+
 func _scan_dir(path: String) -> void:
 	var dir: DirAccess = DirAccess.open(path)
 	if dir == null:

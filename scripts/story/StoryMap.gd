@@ -37,6 +37,9 @@ const MAIN_SCENE: String = "res://scenes/Main.tscn"
 ## level and a Freeplay run of the same chart are the same level — the only
 ## difference is the story context Run carries in with it.
 const LEVEL_SCENE: String = "res://scenes/GameScene.tscn"
+## The section the level actually builds. GameScene is a two-node shell that
+## loads this; warming the shell alone would warm nothing worth having.
+const RUNNER_SCENE: String = "res://scenes/beat3d/Section_BeatRunner3D.tscn"
 ## The hand-editable city. Present = the map instances it; absent = the map
 ## generates one and Ctrl+Alt+B can bake it here.
 const BAKED_CITY: String = "res://scenes/story/CalderCity.tscn"
@@ -116,6 +119,10 @@ var _hovered: String = ""
 ## rift, and it locks input: the beat ends in a scene change, so there is
 ## nothing left to cancel back to.
 var _entering: bool = false
+## Warming waits until the map is up, and remembers which song it last asked
+## for so that cycling back and forth does not re-request it.
+var _warm_armed: bool = false
+var _warmed_key: String = ""
 var _entry_focus: Vector3 = Vector3.ZERO
 ## Camera offset from whatever it is looking at. Constant at map distance; the
 ## entry beat is the only thing that moves it.
@@ -196,6 +203,12 @@ func _ready() -> void:
 	if _data.load_error != "":
 		_name_label.text = _data.load_error
 		return
+
+	# Only now: while the map was building, the disk was busy with the map.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	_warm_armed = true
+	_warm_selected_level()
 
 	if just_cleared != "":
 		_play_return_reveal(just_cleared, cleared_now, result)
@@ -1256,6 +1269,7 @@ func _set_selected(id: String) -> void:
 	if now != null:
 		now.set_selected(true)
 	_update_hud()
+	_warm_selected_level()
 
 
 ## Left/right walk the unlocked rifts in authored order, with the hub folded in
@@ -1269,6 +1283,34 @@ func _cycle_selection(delta: int) -> void:
 	if idx == -1:
 		idx = 0
 	_set_selected(ids[posmod(idx + delta, ids.size())])
+
+
+## Reads the selected rift's level in the background while the map sits there.
+##
+## Everything a level opens off the disk: the section scene, the song, and the
+## authored track pieces. What it does NOT cover is the building — gates, path,
+## floors — which is generated on the main thread once the level is up, and is
+## most of that loading screen. See Preload for the measured split.
+##
+## Called on every selection change, so by the time a rift is confirmed its
+## song has usually been in memory for a while. Switching selection switches
+## the song being warmed; the set is held until a level warms the map back.
+func _warm_selected_level() -> void:
+	if not _warm_armed or _entering:
+		return
+	var key: String = _data.song_key_of(_selected)
+	if key == "" or key == _warmed_key:
+		return
+	_warmed_key = key
+
+	var paths := PackedStringArray([LEVEL_SCENE, RUNNER_SCENE])
+	# Reading the chart here also leaves it parsed in ContentDB's cache, which
+	# the level would otherwise do itself.
+	var song: String = String(ContentDB.get_beatmap(key).get("song_path", ""))
+	if song != "":
+		paths.append(song)
+	paths.append_array(TrackPieceLibrary.source_paths())
+	Preload.warm("level", paths)
 
 
 # ── Travel ───────────────────────────────────────────────────────────────────
