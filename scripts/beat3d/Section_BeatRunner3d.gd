@@ -6681,6 +6681,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	if not (event is InputEventKey or event is InputEventJoypadButton):
 		return
 
+	# Held, not re-fetched. Picking a menu entry runs its action immediately —
+	# and most of those actions change scene, which can take this node out of
+	# the tree before the handler is done with the event. get_viewport() then
+	# returns null and marking the event handled crashes. The viewport itself
+	# is the root window's and outlives the scene, so one reference taken up
+	# front stays valid all the way through.
+	var vp: Viewport = get_viewport()
+	if vp == null:
+		return
+
 	var just_pressed: bool = event.is_pressed() and not event.is_echo()
 	if not just_pressed:
 		return
@@ -6689,7 +6699,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	var key_ev := event as InputEventKey
 	if key_ev != null and key_ev.ctrl_pressed and key_ev.alt_pressed \
 			and key_ev.physical_keycode == KEY_H:
-		get_viewport().set_input_as_handled()
+		vp.set_input_as_handled()
 		Save.clear_all_high_scores()
 		_hud_show_dev_toast("High scores cleared")
 		return
@@ -6697,7 +6707,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	# ── End screen navigation ────────────────────────────────────────────────
 	if _menus.is_results_open():
 		if _menus.handle_results_key(event):
-			get_viewport().set_input_as_handled()
+			vp.set_input_as_handled()
 		return
 
 	# ── Pause toggle: ESC or gamepad Start ───────────────────────────────────
@@ -6707,7 +6717,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		(event as InputEventJoypadButton).button_index == JOY_BUTTON_START)
 
 	if (is_esc or is_gamepad_start) and not _menus.is_death_open() and not _song_finish_pending:
-		get_viewport().set_input_as_handled()
+		vp.set_input_as_handled()
 		if _paused:
 			_resume_game()
 		else:
@@ -6717,10 +6727,10 @@ func _unhandled_input(event: InputEvent) -> void:
 	# ── Pause and death menu navigation ──────────────────────────────────────
 	if _paused:
 		if _menus.handle_pause_key(event):
-			get_viewport().set_input_as_handled()
+			vp.set_input_as_handled()
 		return
 	if _menus.handle_death_key(event):
-		get_viewport().set_input_as_handled()
+		vp.set_input_as_handled()
 # ── Camera FX ────────────────────────────────────────────────────────────────
 func _update_camera_fx(delta: float) -> void:
 	if _camera == null or not _level_started or _paused:

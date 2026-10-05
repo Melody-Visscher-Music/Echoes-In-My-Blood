@@ -51,6 +51,13 @@ func _build() -> void:
 	content.add_theme_constant_override("margin_top",    _margin)
 	content.add_theme_constant_override("margin_bottom", _margin)
 	content.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# The panel reports `content`'s minimum as its own, but Godot only carries a
+	# minimum-size change up through Containers — and a panel is a plain Control,
+	# so nothing would tell it its content had re-measured. Without this the card
+	# keeps whatever height the FIRST layout pass produced: an autowrapping label
+	# reports a tall minimum until it knows its width, and the card stayed that
+	# tall for good.
+	content.minimum_size_changed.connect(update_minimum_size)
 	add_child(content)
 
 	if not resized.is_connected(_on_resized):

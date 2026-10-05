@@ -123,11 +123,33 @@ static func signature_color(phase: float, offset: float = 0.0) -> Color:
 
 # ── Scale ────────────────────────────────────────────────────────────────────
 
+## The canvas these sizes were authored against. Every `n * scale_for(...)` in
+## the UI means "n pixels at 1920×1080", so 1.0 is the size it was designed at.
+const REF_W: float = 1920.0
+const REF_H: float = 1080.0
+
+
 ## Viewport-relative UI scale against the 1920×1080 authoring reference.
 ## Clamped so the UI never grows large enough to crowd the play lanes on an
 ## ultrawide, nor shrinks to unreadable in a small window.
+##
+## The ceiling follows the project's own base viewport rather than a fixed
+## number, because `canvas_items` stretch means `vp` is the VIRTUAL canvas, not
+## the monitor: it reads 3840×2160 on a 4K project even in a small window. So
+## raising the project to 4K multiplies every UI number by 2 and a hardcoded
+## ceiling would quietly leave the whole interface at two-thirds size. Tying the
+## two together means the next resolution change carries the UI with it.
 static func scale_for(vp: Vector2) -> float:
-	return clampf(minf(vp.x / 1920.0, vp.y / 1080.0), 0.75, 1.3)
+	return clampf(minf(vp.x / REF_W, vp.y / REF_H), 0.75, max_scale())
+
+
+## The scale a canvas at the project's configured size asks for.
+static func max_scale() -> float:
+	var base_w: float = float(ProjectSettings.get_setting(
+		"display/window/size/viewport_width", REF_W))
+	var base_h: float = float(ProjectSettings.get_setting(
+		"display/window/size/viewport_height", REF_H))
+	return maxf(1.0, minf(base_w / REF_W, base_h / REF_H))
 
 
 # ── Styleboxes ───────────────────────────────────────────────────────────────

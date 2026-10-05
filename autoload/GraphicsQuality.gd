@@ -6,6 +6,9 @@ extends Node
 ##
 ## The tier drives:
 ##   - 3D render resolution scale + antialiasing on the main viewport
+##     (NB: measured, SDFGI is near-free in this game — switching it off
+##      entirely moved the frame by -0.3 ms. The resolution scale and the mesh
+##      LOD threshold are what actually cost; see the note on the max preset.)
 ##   - SSR/SSAO/SSIL/SDFGI on the runner's world environment
 ##   - directional + positional shadow atlas resolution
 ##   - fur shell count (so_fluffy density)
@@ -144,27 +147,39 @@ const PRESETS: Dictionary = {
 		"initial_max_fps": 120,
 	},
 	"max": {
-		# The practical ceiling: 1.75x supersampling + 4x MSAA (originally
-		# pushed to 2.0x/8x, but stacking that much supersampling with that
-		# much MSAA on top of SDFGI + volumetric fog GI-inject caused a real
-		# GPU device-lost crash (Vulkan fence_wait failure / Windows TDR
-		# reset) during a busy scene — dialed back the redundant AA stacking
-		# and turned off fog GI-inject, kept everything else), deep SSR
-		# raymarching, real-time SDFGI with strong bounce feedback, volumetric
-		# fog (the one thing no lower tier has at all — real light shafts
-		# through the neon, not just sharper pixels), ultra soft-shadow
-		# filtering, max shadow atlases, LOD almost fully held off, and the
-		# densest fur. Never auto-detected, never the default recommendation
-		# — this is for a confirmed strong rig only.
-		"scaling_3d_scale": 1.75,
+		# Everything that gives max its look: volumetric fog (the one thing no
+		# lower tier has at all — real light shafts through the neon, not just
+		# sharper pixels), real-time SDFGI with strong bounce feedback, SSR,
+		# SSIL, ultra soft-shadow filtering, the biggest shadow atlases, 4x
+		# MSAA and the densest fur.
+		#
+		# What it no longer does is pay for pixels nobody can see. The base
+		# viewport is 3840 wide, so the canvas already carries four times the
+		# pixels of a 1080p panel before any supersampling; 1.75x on top of
+		# that rendered 28 MP to show 2.3 MP — about 49 samples per visible
+		# pixel once MSAA was counted. Measured in a level (harness: `ablate`,
+		# `candidates`), dropping to 1.0 and letting mesh LOD work again took
+		# max from 40.2 ms to 13.1 ms a frame, 25 fps to 76, while the frozen
+		# frame changed by a mean of 6.5/255 — against 33/255 for ultra. In
+		# other words: three times the speed, and it still reads as max.
+		#
+		# (The old 1.75x came down from an even heavier 2.0x/8x MSAA, which
+		# caused a real GPU device-lost crash — Vulkan fence_wait failure /
+		# Windows TDR reset — in a busy scene. That stacking is gone for good.)
+		"scaling_3d_scale": 1.0,
 		"msaa_3d": Viewport.MSAA_4X,
 		"screen_space_aa": Viewport.SCREEN_SPACE_AA_FXAA,
-		"ssr": true, "ssr_steps": 256,
+		# 256 steps cost 3.8 ms over 128 and bought reflection trace length
+		# that the fog hides anyway.
+		"ssr": true, "ssr_steps": 128,
 		"ssao": true, "ssil": true, "sdfgi": true, "sdfgi_bounce": 1.5,
 		"volumetric_fog": true,
 		"directional_shadow_size": 8192, "positional_shadow_atlas_size": 4096,
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_ULTRA,
-		"mesh_lod_threshold": 1.0,
+		# 1.0 switched the LOD system off in practice: the same ~855 draw calls
+		# carried 3.06M primitives a frame instead of 356k, for detail that is
+		# sub-pixel at this distance, and every shadow split re-rasterised it.
+		"mesh_lod_threshold": 4.0,
 		"fur_scale": 1.3,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
 		"deco_window_ahead_m": 300.0,

@@ -49,13 +49,23 @@ func _ready() -> void:
 			await _loadtime()
 		"shots":
 			await _shots(arg if arg != "" else "shot")
+		"ui":
+			await _ui_shots()
+		"tiers":
+			await _tiers(arg)
+		"ablate":
+			await _ablate()
+		"candidates":
+			await _candidates()
+		"compare":
+			await _compare_looks()
 		"bake":
 			await _bake()
 		"play":
 			await _play(float(arg) if arg != "" else 14.0,
 				args[2] if args.size() > 2 else "")
 		_:
-			print("unknown mode '%s' - try verify | perf | loadtime | shots | bake" % mode)
+			print("unknown mode '%s' - try verify | perf | loadtime | shots | ui | tiers | ablate | candidates | bake" % mode)
 	if _checks > 0:
 		print("-- %d checks, %d failed --" % [_checks, _failures])
 	_release_save()
@@ -451,6 +461,294 @@ func _perf() -> void:
 			float(Time.get_ticks_usec() - t0) / 1000.0 / 240.0])
 
 
+## Why one quality tier stutters when the one below it runs clean. Plays the
+## same chart on each tier named (default: the top two) and reports what a frame
+## actually costs — plus the video memory it took to get there, because a
+## stutter is usually memory being evicted rather than maths being slow.
+func _tiers(arg: String) -> void:
+	Engine.max_fps = 0   # the project caps at 120, which hides the whole story
+	var want: PackedStringArray = (arg if arg != "" else "ultra,max").split(",")
+	var was: String = GraphicsQuality.tier
+	for t: String in want:
+		if not GraphicsQuality.PRESETS.has(t):
+			print("  no such tier: %s" % t)
+			continue
+		# Before the level builds: the environment reads the tier as it is made.
+		GraphicsQuality.set_tier(t)
+		await _frames(10)
+		_story_context()
+		var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+		add_child(level)
+		await _until_level_ready(level)
+		# Let SDFGI converge and the shaders finish compiling before counting.
+		await _frames(240)
+
+		var times: PackedFloat32Array = PackedFloat32Array()
+		var calls: int = 0
+		var prims: int = 0
+		for i in 600:
+			await get_tree().process_frame
+			times.append(get_process_delta_time() * 1000.0)
+			calls += RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)
+			prims += RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_PRIMITIVES_IN_FRAME)
+		var sorted: Array = Array(times)
+		sorted.sort()
+		var mean: float = 0.0
+		for ms: float in times:
+			mean += ms
+		mean /= float(times.size())
+		var spikes: int = 0
+		for ms: float in times:
+			if ms > mean * 2.0:
+				spikes += 1
+
+		var vp: Viewport = get_viewport()
+		var canvas: Vector2 = vp.get_visible_rect().size
+		var scale: float = float(GraphicsQuality.PRESETS[t]["scaling_3d_scale"])
+		var samples: int = 4 if int(GraphicsQuality.PRESETS[t]["msaa_3d"]) == Viewport.MSAA_4X else 1
+		print("  %-6s %6.2f ms mean  %6.2f p99  %7.2f worst  %3d spikes>2x" % [
+			t, mean, sorted[int(sorted.size() * 0.99)], sorted[-1], spikes])
+		print("         %5.1f fps   %5d draw calls   %7d primitives" % [
+			1000.0 / mean, calls / 600, prims / 600])
+		print("         3D buffer %.0fx%.0f = %.1f MP x%d samples = %.1f MSamples" % [
+			canvas.x * scale, canvas.y * scale,
+			canvas.x * scale * canvas.y * scale / 1e6, samples,
+			canvas.x * scale * canvas.y * scale * samples / 1e6])
+		print("         video memory %.0f MB (textures %.0f MB)" % [
+			Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0,
+			Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED) / 1048576.0])
+		_shut_down(level)
+		await _frames(30)
+	GraphicsQuality.set_tier(was)   # the player's own tier, put back
+	print("  (tier restored to %s)" % was)
+
+
+## Which knob in a tier is actually paying for the frame. Boots a level on
+## "max", then puts ONE setting back to what "ultra" uses and measures again —
+## the difference is what that setting costs, which a table of preset values
+## cannot tell you.
+func _ablate() -> void:
+	Engine.max_fps = 0
+	GraphicsQuality.set_tier("max")
+	var was: String = "ultra"
+	await _frames(10)
+	_story_context()
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	await _frames(240)
+
+	var vp: Viewport = get_viewport()
+	var env: Environment = null
+	for node: Node in _find_section(level).get_children():
+		if node is WorldEnvironment:
+			env = (node as WorldEnvironment).environment
+	if env == null:
+		print("  no environment found")
+		return
+
+	var base: float = await _measure()
+	print("  max as it ships           %6.2f ms  (%5.1f fps)" % [base, 1000.0 / base])
+	print("  ── one setting back to what ultra uses ──")
+	for step: Array in [
+		["3D scale 1.75 -> 1.20", func() -> void: vp.scaling_3d_scale = 1.2,
+			func() -> void: vp.scaling_3d_scale = 1.75],
+		["mesh LOD 1.0 -> 4.0", func() -> void: vp.mesh_lod_threshold = 4.0,
+			func() -> void: vp.mesh_lod_threshold = 1.0],
+		["SSR steps 256 -> 64", func() -> void: env.ssr_max_steps = 64,
+			func() -> void: env.ssr_max_steps = 256],
+		["volumetric fog off", func() -> void: env.volumetric_fog_enabled = false,
+			func() -> void: env.volumetric_fog_enabled = true],
+		["SDFGI bounce 1.5 -> 0.6", func() -> void: env.sdfgi_bounce_feedback = 0.6,
+			func() -> void: env.sdfgi_bounce_feedback = 1.5],
+		["SDFGI off entirely", func() -> void: env.sdfgi_enabled = false,
+			func() -> void: env.sdfgi_enabled = true],
+		["SSIL off", func() -> void: env.ssil_enabled = false,
+			func() -> void: env.ssil_enabled = true],
+		["shadow atlas 8192 -> 4096", func() -> void:
+			RenderingServer.directional_shadow_atlas_set_size(4096, true)
+			vp.positional_shadow_atlas_size = 2048,
+			func() -> void:
+				RenderingServer.directional_shadow_atlas_set_size(8192, true)
+				vp.positional_shadow_atlas_size = 4096],
+		["soft shadows ULTRA -> HIGH", func() -> void:
+			RenderingServer.directional_soft_shadow_filter_set_quality(
+				RenderingServer.SHADOW_QUALITY_SOFT_HIGH)
+			RenderingServer.positional_soft_shadow_filter_set_quality(
+				RenderingServer.SHADOW_QUALITY_SOFT_HIGH),
+			func() -> void:
+				RenderingServer.directional_soft_shadow_filter_set_quality(
+					RenderingServer.SHADOW_QUALITY_SOFT_ULTRA)
+				RenderingServer.positional_soft_shadow_filter_set_quality(
+					RenderingServer.SHADOW_QUALITY_SOFT_ULTRA)],
+		["MSAA 4x -> off", func() -> void: vp.msaa_3d = Viewport.MSAA_DISABLED,
+			func() -> void: vp.msaa_3d = Viewport.MSAA_4X],
+	]:
+		(step[1] as Callable).call()
+		await _frames(150)
+		var ms: float = await _measure()
+		print("  %-26s %6.2f ms  (%5.1f fps)   %+6.2f ms saved" % [
+			step[0], ms, 1000.0 / ms, base - ms])
+		(step[2] as Callable).call()
+		await _frames(90)
+
+	_shut_down(level)
+	await _frames(10)
+	GraphicsQuality.set_tier(was)
+	print("  (tier restored to %s)" % was)
+
+
+## Candidate settings for a cheaper "max" that still looks like max. Each one
+## plays the SAME seed to the same point in the song, is photographed there, and
+## is then measured — so the look and the cost can be judged against each other
+## instead of one being argued from the other.
+##
+## It applies the settings straight to the viewport and the environment and
+## never calls GraphicsQuality.set_tier(), which would write the player's own
+## quality setting to disk.
+const ABLATE_SEED: int = 20251005
+
+
+func _candidates() -> void:
+	Engine.max_fps = 0
+	var maxp: Dictionary = GraphicsQuality.PRESETS["max"]
+	print("  level built under tier '%s' (fur and CPU knobs come from there)" % GraphicsQuality.tier)
+	for cand: Array in [
+		["max_stock", {}],
+		["max_tuned", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0, "ssr_steps": 128}],
+		["max_tuned_plus", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0,
+			"ssr_steps": 128, "msaa_3d": Viewport.MSAA_2X,
+			"directional_shadow_size": 4096, "positional_shadow_atlas_size": 2048}],
+	]:
+		var over: Dictionary = cand[1]
+		_story_context()
+		Run.run_seed = ABLATE_SEED   # same track every candidate, and never recorded
+		var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+		add_child(level)
+		await _until_level_ready(level)
+
+		var vp: Viewport = get_viewport()
+		var env: Environment = null
+		for node: Node in _find_section(level).get_children():
+			if node is WorldEnvironment:
+				env = (node as WorldEnvironment).environment
+		if env == null:
+			print("  no environment found")
+			return
+
+		# Max in full, then whatever this candidate changes about it.
+		var g := func(key: String) -> Variant: return over.get(key, maxp[key])
+		vp.scaling_3d_scale = float(g.call("scaling_3d_scale"))
+		vp.msaa_3d = int(g.call("msaa_3d"))
+		vp.screen_space_aa = int(g.call("screen_space_aa"))
+		vp.mesh_lod_threshold = float(g.call("mesh_lod_threshold"))
+		vp.positional_shadow_atlas_size = int(g.call("positional_shadow_atlas_size"))
+		RenderingServer.directional_shadow_atlas_set_size(
+			int(g.call("directional_shadow_size")), true)
+		RenderingServer.directional_soft_shadow_filter_set_quality(
+			g.call("shadow_soft_quality"))
+		RenderingServer.positional_soft_shadow_filter_set_quality(
+			g.call("shadow_soft_quality"))
+		env.ssr_enabled = bool(g.call("ssr"))
+		env.ssr_max_steps = int(g.call("ssr_steps"))
+		env.ssao_enabled = bool(g.call("ssao"))
+		env.ssil_enabled = bool(g.call("ssil"))
+		env.sdfgi_enabled = bool(g.call("sdfgi"))
+		env.sdfgi_bounce_feedback = float(g.call("sdfgi_bounce"))
+		env.volumetric_fog_enabled = bool(g.call("volumetric_fog"))
+
+		# Same point in the same song for every candidate, so the shots line up.
+		var elapsed: float = 0.0
+		while elapsed < 9.0:
+			await get_tree().process_frame
+			elapsed += get_process_delta_time()
+		get_viewport().get_texture().get_image().save_png(
+			"%s/tier_%s.png" % [SHOT_DIR, cand[0]])
+
+		var ms: float = await _measure()
+		var canvas: Vector2 = vp.get_visible_rect().size
+		var sc: float = vp.scaling_3d_scale
+		print("  %-15s %6.2f ms (%5.1f fps)   3D %.0fx%.0f = %4.1f MP   vram %.0f MB" % [
+			cand[0], ms, 1000.0 / ms, canvas.x * sc, canvas.y * sc,
+			canvas.x * sc * canvas.y * sc / 1e6,
+			Performance.get_monitor(Performance.RENDER_VIDEO_MEM_USED) / 1048576.0])
+		_shut_down(level)
+		await _frames(30)
+	print("  written to %s" % ProjectSettings.globalize_path(SHOT_DIR))
+
+
+## The same frozen frame under each candidate. _candidates() measures what they
+## COST, but its shots drift apart — a slower candidate reaches the nine-second
+## mark further down the track. Here the scene is stopped first and the settings
+## are changed underneath it, so the only difference left between the images is
+## the settings themselves.
+func _compare_looks() -> void:
+	Engine.max_fps = 0
+	var maxp: Dictionary = GraphicsQuality.PRESETS["max"]
+	_story_context()
+	Run.run_seed = ABLATE_SEED
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+
+	var elapsed: float = 0.0
+	while elapsed < 9.0:
+		await get_tree().process_frame
+		elapsed += get_process_delta_time()
+	get_tree().paused = true   # one viewpoint for every shot
+
+	var vp: Viewport = get_viewport()
+	var env: Environment = null
+	for node: Node in _find_section(level).get_children():
+		if node is WorldEnvironment:
+			env = (node as WorldEnvironment).environment
+	for cand: Array in [
+		["max_stock", {}],
+		["max_tuned", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0, "ssr_steps": 128}],
+		["max_tuned_plus", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0,
+			"ssr_steps": 128, "msaa_3d": Viewport.MSAA_2X,
+			"directional_shadow_size": 4096, "positional_shadow_atlas_size": 2048}],
+		["ultra_for_reference", GraphicsQuality.PRESETS["ultra"]],
+	]:
+		var over: Dictionary = cand[1]
+		var g := func(key: String) -> Variant: return over.get(key, maxp[key])
+		vp.scaling_3d_scale = float(g.call("scaling_3d_scale"))
+		vp.msaa_3d = int(g.call("msaa_3d"))
+		vp.screen_space_aa = int(g.call("screen_space_aa"))
+		vp.mesh_lod_threshold = float(g.call("mesh_lod_threshold"))
+		vp.positional_shadow_atlas_size = int(g.call("positional_shadow_atlas_size"))
+		RenderingServer.directional_shadow_atlas_set_size(
+			int(g.call("directional_shadow_size")), true)
+		RenderingServer.directional_soft_shadow_filter_set_quality(g.call("shadow_soft_quality"))
+		RenderingServer.positional_soft_shadow_filter_set_quality(g.call("shadow_soft_quality"))
+		env.ssr_enabled = bool(g.call("ssr"))
+		env.ssr_max_steps = int(g.call("ssr_steps"))
+		env.ssao_enabled = bool(g.call("ssao"))
+		env.ssil_enabled = bool(g.call("ssil"))
+		env.sdfgi_enabled = bool(g.call("sdfgi"))
+		env.sdfgi_bounce_feedback = float(g.call("sdfgi_bounce"))
+		env.volumetric_fog_enabled = bool(g.call("volumetric_fog"))
+		# GI and fog need frames to re-converge after a settings change.
+		await _frames(240)
+		get_viewport().get_texture().get_image().save_png(
+			"%s/look_%s.png" % [SHOT_DIR, cand[0]])
+		print("  look_%s" % cand[0])
+	get_tree().paused = false
+	_shut_down(level)
+	await _frames(10)
+
+
+## Mean frame time over 300 frames, in milliseconds.
+func _measure() -> float:
+	var total: float = 0.0
+	for i in 300:
+		await get_tree().process_frame
+		total += get_process_delta_time() * 1000.0
+	return total / 300.0
+
+
 ## What the two long waits cost, and how much Preload takes off them.
 func _loadtime() -> void:
 	for warmed: bool in [false, true]:
@@ -507,6 +805,44 @@ func _shots(prefix: String) -> void:
 		await _shot(map, prefix + "_night_rift", 3.0, data.position_of(data.order[3]))
 	if play != null:
 		await _shot(map, prefix + "_day_park", 1.0, play.global_position)
+	print("  written to %s" % ProjectSettings.globalize_path(SHOT_DIR))
+
+
+## Every screen that has UI on it, photographed at the project's own canvas
+## size. This is the pass that shows whether a change to the UI scale pushed a
+## label off an edge or crowded the play lanes — scale_for() is one number read
+## by eight scripts, so the only honest check is to look at all of them.
+func _ui_shots() -> void:
+	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
+	print("screens: scale %.2f on a %s canvas" % [
+		UiStyle.scale_for(get_viewport().get_visible_rect().size),
+		str(get_viewport().get_visible_rect().size)])
+	for entry: Array in [
+		["ui_main", "res://scenes/Main.tscn"],
+		["ui_song_select", "res://scenes/SongSelect.tscn"],
+		["ui_how_to_play", "res://scenes/HowToPlay.tscn"],
+		["ui_warnings", "res://scenes/Warnings.tscn"],
+		["ui_map", MAP_SCENE],
+	]:
+		var scene: Node = (load(entry[1]) as PackedScene).instantiate()
+		add_child(scene)
+		await _frames(90)
+		await _shoot(entry[0])
+		_shut_down(scene)
+		await _frames(5)
+
+	# The HUD mid-song: the one screen whose readouts sit against the edges.
+	_story_context()
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	await _frames(420)
+	await _shoot("ui_hud")
+	_shut_down(level)
+	await _frames(5)
+
+	# Pause, death and results come with their own assertions attached.
+	await _verify_menus()
 	print("  written to %s" % ProjectSettings.globalize_path(SHOT_DIR))
 
 
