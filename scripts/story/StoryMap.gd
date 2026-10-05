@@ -1309,8 +1309,10 @@ func _warm_selected_level() -> void:
 	var song: String = String(ContentDB.get_beatmap(key).get("song_path", ""))
 	if song != "":
 		paths.append(song)
-	paths.append_array(TrackPieceLibrary.source_paths())
 	Preload.warm("level", paths)
+	# The authored track pieces go through the main-thread queue instead — see
+	# Preload.warm_main() for the crash that buys.
+	Preload.warm_main("level", TrackPieceLibrary.source_paths())
 
 
 # ── Travel ───────────────────────────────────────────────────────────────────

@@ -442,6 +442,31 @@ var _song_total_duration: float   = 0.0
 
 # ── SFX ──────────────────────────────────────────────────────────────────────
 var _sfx_miss: AudioStreamPlayer = null
+## What the loading screen spent its time on, as [{step, ms}] — filled in by
+## _loading_step and read by the dev harness (loadtime mode). A dozen appends
+## over a second and a half, and the alternative is re-instrumenting this file
+## by hand every time the question comes up again.
+var load_timings: Array[Dictionary] = []
+## Which gates have their geometry yet. See _build_gate_body.
+var _gate_vis_built: Array[bool] = []
+## The geometry builders — see GatePieces. Built once the track measurements and
+## the authored piece library are known.
+var _pieces: GatePieces = null
+## Metres of track built during the loading screen, and how far beyond the
+## visible window a gate is fleshed out once the song is running. The gap
+## between the two is slack: by the time a gate is shown it has been standing
+## there for a second or more.
+const GATE_PREPARE_AHEAD_M: float = 260.0
+const GATE_PREPARE_EXTRA_M: float = 180.0
+## Gates fleshed out per frame while running. Two is the measured sweet spot on
+## the densest chart: three put a millisecond more into the worst 1% of frames,
+## one made the last-resort path below fire often enough to cost the same. A
+## gate about to be SEEN ignores this budget and builds anyway, so it can never
+## leave a hole in the track.
+const GATE_BUILDS_PER_FRAME: int = 2
+## Merged multi-box meshes, by shape. See _pieces.merged_boxes().
+var _merged_mesh_cache: Dictionary = {}
+var _load_t0: int = 0
 
 # ── Rap / Grind-rail system ───────────────────────────────────────────────────
 # Rap segments + taps are parsed from the beatmap JSON. When the song reaches
@@ -624,6 +649,8 @@ func _pick_random_lyric_font() -> void:
 
 
 func _ready() -> void:
+	_load_t0 = Time.get_ticks_msec()
+	load_timings.clear()
 	# Disable input/physics immediately — level geometry now builds across
 	# several frames below (each _loading_step() yields one frame), so the
 	# player must not be able to move or fall through a half-built track
@@ -670,6 +697,8 @@ func _ready() -> void:
 	await _loading_step("Scanning track pieces…", 0.15)
 	_piece_lib = TrackPieceLibrary.new()
 	_piece_lib.scan()                 # authored Blender pieces (assets/track) — BEFORE gate visuals
+	_pieces = GatePieces.new(gate_depth, lane_blocker_width, _gate_detail,
+		player.lane_xs, _piece_lib)
 
 	await _loading_step("Placing gates…", 0.30)
 	_build_all_gate_visuals()         # places gates at initial Z positions (no geometry yet)
@@ -733,6 +762,7 @@ func _ready() -> void:
 	# ── Countdown — hold everything until the engine has had time to settle ──
 	# input/physics are already disabled from the top of _ready() and stay
 	# that way through the countdown too.
+	load_timings.append({"step": "ready", "ms": Time.get_ticks_msec() - _load_t0})
 	_countdown_timer = _COUNTDOWN_DURATION
 	_spawn_countdown_ui()
 	_warmup_shader_precompile()   # runs in the background — see _update_countdown()
@@ -808,6 +838,7 @@ func _build_loading_ui() -> void:
 ## Updates the loading overlay and yields one frame so the bar/label above
 ## actually gets drawn before the next (potentially heavy) build stage runs.
 func _loading_step(text: String, frac: float) -> void:
+	load_timings.append({"step": text, "ms": Time.get_ticks_msec() - _load_t0})
 	if _loading_label != null:
 		_loading_label.text = text
 	if _loading_bar_rect != null:
@@ -3293,26 +3324,48 @@ func _build_all_gate_visuals() -> void:
 	_gameplay_pulse_index = 0
 	_song_finish_pending = false
 
+	_gate_vis_built.clear()
+
 	for i in range(runner_plan.size()):
 		var entry: Dictionary = runner_plan[i]
-		var gate: Node3D = _build_gate_visual(entry, i)
+		var gate: Node3D = _build_gate_shell(entry, i)
 		gates_root.add_child(gate)
 		gate_nodes.append(gate)
 		gate_judged.append(false)
 		gate_success.append(false)
 		gate_world_zs.append(gate.global_position.z)
 		_gate_animated.append(false)
-		_gate_cycle_mats.append(_collect_cycle_mats(gate))
+		_gate_cycle_mats.append([] as Array[Material])
+		_gate_vis_built.append(false)
 		gate_actions.append(String(entry.get("action", "")))
 		gate_is_electric.append(_is_electric_at(float(entry.get("t", 0.0))))
+
+	# Only the opening stretch is fleshed out now; the rest arrives as the
+	# player does - see _build_gate_body.
+	for i in range(gate_nodes.size()):
+		if gate_world_zs[i] > GATE_PREPARE_AHEAD_M:
+			break
+		_build_gate_body(i)
+
+	# One of every KIND as well, wherever it sits in the song. The countdown
+	# shows the built gates for a few frames so the driver compiles their
+	# shaders before the music starts (_warmup_shader_precompile); if the first
+	# slide gate in the track is two minutes in, that warmup would miss it and
+	# the hitch would land mid-song instead.
+	var kinds_seen: Dictionary = {}
+	for i in range(gate_nodes.size()):
+		var kind: String = "%s|%s" % [gate_actions[i], str(gate_is_electric[i])]
+		if kinds_seen.has(kind):
+			continue
+		kinds_seen[kind] = true
+		_build_gate_body(i)
 
 	# WJ geometry is now spawned path-aware in _spawn_wj_geometry_on_path() after
 	# _build_track_path(), so _spawn_section_geometry() is no longer called here.
 
-func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
-	# Lets _make_elec_arc tag each arc spark light with its owning gate, so
-	# _update_electric_pulse can window them. Cleared again after the build.
-	_elec_build_gate_idx = gate_index
+## A gate with nothing in it yet: where it stands, what judges it, and an empty
+## VisRoot for the geometry to arrive in later. A few nodes, and cheap.
+func _build_gate_shell(entry: Dictionary, gate_index: int) -> Node3D:
 	var root: Node3D = Node3D.new()
 	var t_s: float     = float(entry.get("t", 0.0))
 	var action: String = String(entry.get("action", "jump"))
@@ -3320,9 +3373,6 @@ func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
 
 	root.position.z = t_s * player.forward_speed
 	root.visible = false   # hidden until _update_gate_visibility brings it into range
-
-	var tint: Color = _action_color(action)
-	var tw: float   = _track_full_width()
 
 	# All meshes go inside VisRoot so the spawn animation can scale them
 	# independently of the judge Area3D (which stays on root).
@@ -3333,6 +3383,39 @@ func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
 	if _is_electric_at(t_s):
 		vis_root.process_mode = Node.PROCESS_MODE_DISABLED
 	root.add_child(vis_root)
+
+	_add_gate_judge_area(root, gate_index, action, post_lane)
+	return root
+
+
+## Fills a gate in, the first time anything needs to see it.
+##
+## This is the expensive half: about three quarters of a millisecond and sixty
+## nodes per gate, four hundred gates to a song. Building them all during the
+## loading screen spent a third of it standing up scenery the player would not
+## reach for another two minutes. The loading screen now builds the opening
+## stretch, and _update_gate_visibility calls this as the track comes on, well
+## ahead of where each gate is actually wanted.
+func _build_gate_body(gate_index: int) -> void:
+	if gate_index < 0 or gate_index >= gate_nodes.size() or _gate_vis_built[gate_index]:
+		return
+	var gate: Node3D = gate_nodes[gate_index]
+	if gate == null:
+		return
+	var vis_root: Node3D = gate.get_node_or_null("VisRoot") as Node3D
+	if vis_root == null:
+		return
+
+	var entry: Dictionary = runner_plan[gate_index]
+	var t_s: float     = float(entry.get("t", 0.0))
+	var action: String = String(entry.get("action", "jump"))
+	var post_lane: int = int(entry.get("post_lane", 1))
+	var tint: Color = _action_color(action)
+	var tw: float   = _track_full_width()
+
+	# Lets _make_elec_arc tag each arc spark light with its owning gate, so
+	# _update_electric_pulse can window them. Cleared again after the build.
+	_elec_build_gate_idx = gate_index
 
 	# Authored Blender gate pieces take priority; procedural visuals are the fallback.
 	if not _spawn_authored_gate(vis_root, action, post_lane, tw):
@@ -3349,9 +3432,9 @@ func _build_gate_visual(entry: Dictionary, gate_index: int) -> Node3D:
 				"slide":                   _vis_slide_gate(vis_root, tint, tw)
 				"wall_left", "wall_right": _vis_wall_gate(vis_root, action, tint)
 
-	_add_gate_judge_area(root, gate_index, action, post_lane)
 	_elec_build_gate_idx = -1
-	return root
+	_gate_cycle_mats[gate_index] = _collect_cycle_mats(gate)
+	_gate_vis_built[gate_index] = true
 
 
 ## Build a gate's visuals from authored Blender pieces when they exist.
@@ -3393,10 +3476,10 @@ func _spawn_authored_gate(vis_root: Node3D, action: String, safe_lane: int,
 			# (both helpers fall back to nothing extra only if unauthored,
 			# keeping fully-authored gates free of procedural boxes).
 			if _piece_lib.has_type("strip"):
-				vis_root.add_child(_make_safe_strip(player.lane_xs[safe_lane],
+				vis_root.add_child(_pieces.safe_strip(player.lane_xs[safe_lane],
 					_action_color(action)))
 			if _piece_lib.has_type("marks"):
-				_make_approach_marks(vis_root, player.lane_xs[safe_lane],
+				_pieces.approach_marks(vis_root, player.lane_xs[safe_lane],
 					lane_blocker_width * 0.80, _action_color(action))
 			return true
 		"wall_left", "wall_right":
@@ -3560,7 +3643,7 @@ func _vis_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) -> vo
 		var wall_w:  float = (x_right - x_left) + lane_blocker_width
 
 		# Building facade — dark body + horizontal neon window strips + rooftop cap
-		var facade := _make_bldg_facade(
+		var facade := _pieces.facade(
 			Vector3(cx, lane_blocker_height * 0.5, 0.0),
 			Vector3(wall_w, lane_blocker_height, gate_depth),
 			tint, 0.12, 0.45)
@@ -3570,14 +3653,14 @@ func _vis_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) -> vo
 
 	# Neon arch frames the safe-lane opening — the portal the player runs through
 	var safe_x: float = player.lane_xs[safe_lane]
-	_make_gate_arch(root, safe_x, lane_blocker_width * 0.88,
+	_pieces.arch(root, safe_x, lane_blocker_width * 0.88,
 		0.0, lane_blocker_height, bright)
 
 	# Approach runway marks aimed at the safe lane
-	_make_approach_marks(root, safe_x, lane_blocker_width * 0.80, tint)
+	_pieces.approach_marks(root, safe_x, lane_blocker_width * 0.80, tint)
 
 	# Glowing floor strip in the safe lane — tells the player exactly where to go
-	root.add_child(_make_safe_strip(safe_x, bright))
+	root.add_child(_pieces.safe_strip(safe_x, bright))
 
 
 # ── Jump gate ───────────────────────────────────────────────────────────────
@@ -3588,7 +3671,7 @@ func _vis_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var bright: Color = tint.lightened(0.06)
 
 	# Low building barrier — the obstacle the player jumps over.
-	var barrier_facade := _make_bldg_facade(
+	var barrier_facade := _pieces.facade(
 		Vector3(0.0, jump_hurdle_height * 0.5, 0.0),
 		Vector3(tw, jump_hurdle_height, gate_depth),
 		tint, 0.11, 0.40)
@@ -3600,7 +3683,7 @@ func _vis_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var tower_w: float = 1.0
 	var tower_h: float = jump_hurdle_height * 3.2
 	for side in [-1, 1]:
-		var tower := _make_bldg_facade(
+		var tower := _pieces.facade(
 			Vector3(side * (tw * 0.5 + tower_w * 0.5 + 0.08), tower_h * 0.5, 0.0),
 			Vector3(tower_w, tower_h, gate_depth * 0.75),
 			tint.lightened(0.08), 0.10, 0.90)
@@ -3610,7 +3693,7 @@ func _vis_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 	# straight down to the floor reads as a wall; a ramped foot reads as
 	# something built to be cleared, and the tilt catches light the flat face
 	# cannot. Purely visual — it sits inside the existing footprint.
-	var kick := _make_box_mesh(
+	var kick := _pieces.box_mesh(
 		Vector3(tw * 0.98, jump_hurdle_height * 0.42, 0.07),
 		bright, NeonMat.PANEL, 2.4)
 	kick.position   = Vector3(0.0, jump_hurdle_height * 0.16,
@@ -3620,33 +3703,33 @@ func _vis_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 
 	# Neon arch framing the airspace the player clears on a good jump.
 	# Sits just above the barrier top — clear landmark that says "jump through here".
-	_make_gate_arch(root, 0.0, tw, jump_hurdle_height, jump_hurdle_height + 2.0, tint)
+	_pieces.arch(root, 0.0, tw, jump_hurdle_height, jump_hurdle_height + 2.0, tint)
 
 	# Floor approach marks — three hash lines leading up to the barrier
-	_make_approach_marks(root, 0.0, tw, tint)
+	_pieces.approach_marks(root, 0.0, tw, tint)
 
 	# Upward V-chevrons — neon arrow signs on the face of the barrier building
 	var chev_size: Vector3 = Vector3(tw * 0.42, 0.11, gate_depth * 0.5)
 	var chev_y: float      = jump_hurdle_height + 0.40
 	var chev_offset: float = tw * 0.17
 
-	var chev_l := _make_box_mesh(chev_size, bright)
+	var chev_l := _pieces.box_mesh(chev_size, bright)
 	chev_l.position   = Vector3(-chev_offset, chev_y, -gate_depth * 0.5 - 0.05)
 	chev_l.rotation.z = deg_to_rad(32.0)
 	root.add_child(chev_l)
 
-	var chev_r := _make_box_mesh(chev_size, bright)
+	var chev_r := _pieces.box_mesh(chev_size, bright)
 	chev_r.position   = Vector3(chev_offset, chev_y, -gate_depth * 0.5 - 0.05)
 	chev_r.rotation.z = deg_to_rad(-32.0)
 	root.add_child(chev_r)
 
 	# Second smaller chevron above — stacked arrow for readability at speed
-	var chev2_l := _make_box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
+	var chev2_l := _pieces.box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
 	chev2_l.position   = Vector3(-chev_offset * 0.7, chev_y + 0.32, -gate_depth * 0.5 - 0.05)
 	chev2_l.rotation.z = deg_to_rad(32.0)
 	root.add_child(chev2_l)
 
-	var chev2_r := _make_box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
+	var chev2_r := _pieces.box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
 	chev2_r.position   = Vector3(chev_offset * 0.7, chev_y + 0.32, -gate_depth * 0.5 - 0.05)
 	chev2_r.rotation.z = deg_to_rad(-32.0)
 	root.add_child(chev2_r)
@@ -3665,7 +3748,7 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	# Overhead building facade — the low-ceiling slab the player slides under.
 	var solid_h:  float = lane_blocker_height - clearance_y
 	var solid_cy: float = clearance_y + solid_h * 0.5
-	var overhead_facade := _make_bldg_facade(
+	var overhead_facade := _pieces.facade(
 		Vector3(0.0, solid_cy, 0.0),
 		Vector3(tw, solid_h, gate_depth),
 		tint, 0.10, 0.50)
@@ -3675,20 +3758,20 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var tower_w: float = 1.0
 	var tower_h: float = lane_blocker_height * 1.6
 	for side in [-1, 1]:
-		var tower := _make_bldg_facade(
+		var tower := _pieces.facade(
 			Vector3(side * (tw * 0.5 + tower_w * 0.5 + 0.08), tower_h * 0.5, 0.0),
 			Vector3(tower_w, tower_h, gate_depth * 0.75),
 			tint.lightened(0.08), 0.10, 0.90)
 		root.add_child(tower)
 
 	# Neon arch framing the crawl zone — shows the player exactly the safe gap
-	_make_gate_arch(root, 0.0, tw, 0.0, clearance_y, tint)
+	_pieces.arch(root, 0.0, tw, 0.0, clearance_y, tint)
 
 	# Floor approach marks leading to the slide zone
-	_make_approach_marks(root, 0.0, tw, tint)
+	_pieces.approach_marks(root, 0.0, tw, tint)
 
 	# Bright limbo bar — the dangerous bottom edge the player has to duck below
-	var bar := _make_box_mesh(
+	var bar := _pieces.box_mesh(
 		Vector3(tw + 0.06, 0.10, gate_depth + 0.06), bright)
 	bar.position = Vector3(0.0, clearance_y, 0.0)
 	root.add_child(bar)
@@ -3699,7 +3782,7 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var hang_mat: ShaderMaterial = NeonMat.tube(bright, 3.0)
 	var hang_size := Vector3(0.07, clearance_y * 0.30, 0.07)
 	hang_mat.set_shader_parameter("box_size", hang_size)
-	var hang_mesh: BoxMesh = _shared_box(hang_size)
+	var hang_mesh: BoxMesh = _pieces.shared_box(hang_size)
 	for hx: float in [-0.62, -0.21, 0.21, 0.62]:
 		var hang := MeshInstance3D.new()
 		hang.mesh = hang_mesh
@@ -3710,7 +3793,7 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	# Hazard teeth along the underside of the slab — the surface the player is
 	# ducking beneath, and previously the one blank face in the whole gate.
 	var tooth_mat: ShaderMaterial = NeonMat.panel(bright, 2.2)
-	var tooth_mesh: BoxMesh = _shared_box(Vector3(tw * 0.055, 0.05, gate_depth * 0.5))
+	var tooth_mesh: BoxMesh = _pieces.shared_box(Vector3(tw * 0.055, 0.05, gate_depth * 0.5))
 	for ti in range(-4, 5):
 		var tooth := MeshInstance3D.new()
 		tooth.mesh = tooth_mesh
@@ -3720,12 +3803,12 @@ func _vis_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 
 	# Downward-pointing indicator below the limbo bar — "duck here" signal
 	for side: float in [-1.0, 0.0, 1.0]:
-		var arr := _make_box_mesh(Vector3(0.08, clearance_y * 0.35, 0.06), bright)
+		var arr := _pieces.box_mesh(Vector3(0.08, clearance_y * 0.35, 0.06), bright)
 		arr.position = Vector3(side * tw * 0.28, clearance_y * 0.5, -gate_depth * 0.5 - 0.04)
 		root.add_child(arr)
 
 	# Ground floor strip — shows the safe crawl zone beneath the facade
-	var floor_strip := _make_box_mesh(
+	var floor_strip := _pieces.box_mesh(
 		Vector3(tw, 0.04, gate_depth * 0.6), bright)
 	floor_strip.position = Vector3(0.0, 0.02, 0.0)
 	root.add_child(floor_strip)
@@ -3745,7 +3828,7 @@ func _vis_wall_gate(root: Node3D, action: String, tint: Color) -> void:
 	var inward: float    = -wall_sign
 
 	# Large glowing plate — wide enough to read at a glance
-	var plate: MeshInstance3D = _make_box_mesh(
+	var plate: MeshInstance3D = _pieces.box_mesh(
 		Vector3(0.38, lane_blocker_height * 1.55, gate_depth * 2.0),
 		tint
 	)
@@ -3770,14 +3853,14 @@ func _vis_wall_gate(root: Node3D, action: String, tint: Color) -> void:
 	var chev_off: float     = lane_blocker_height * 0.17
 
 	var bright: Color = tint.lightened(0.04)
-	var chev_top: MeshInstance3D = _make_box_mesh(chev_size, bright)
+	var chev_top: MeshInstance3D = _pieces.box_mesh(chev_size, bright)
 	chev_top.position = Vector3(chev_cx, cy + chev_off, 0.0)
 	chev_top.rotation.z = deg_to_rad(-wall_sign * 30.0)
 	var ctmat: StandardMaterial3D = chev_top.material_override as StandardMaterial3D
 	if ctmat != null: ctmat.emission_energy_multiplier = 5.5
 	root.add_child(chev_top)
 
-	var chev_bot: MeshInstance3D = _make_box_mesh(chev_size, bright)
+	var chev_bot: MeshInstance3D = _pieces.box_mesh(chev_size, bright)
 	chev_bot.position = Vector3(chev_cx, cy - chev_off, 0.0)
 	chev_bot.rotation.z = deg_to_rad(wall_sign * 30.0)
 	var cbmat: StandardMaterial3D = chev_bot.material_override as StandardMaterial3D
@@ -3909,35 +3992,6 @@ func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 	# No static ambient fill light — the emissive material + traveling spark
 	# are sufficient; one fewer OmniLight3D per arc = significant GPU savings.
 	return mat
-
-
-# Slim dark-metal fence post at local origin; caller must set .position.x
-# Authored "fence_post" pieces replace the procedural box, stretched to `height`.
-func _make_fence_post(height: float) -> Node3D:
-	var entry: Dictionary = (_piece_lib.first_of("fence_post") if _piece_lib != null else {})
-	if not entry.is_empty():
-		var auth_h: float = maxf(0.1, float(entry.params.get("height", 2.5)))
-		@warning_ignore("shadowed_global_identifier")
-		var wrap := Node3D.new()
-		var inst: Node3D = _piece_lib.instance(entry)
-		inst.rotation_degrees.y = 180.0
-		inst.scale.y = height / auth_h
-		wrap.add_child(inst)
-		return wrap
-
-	var post := MeshInstance3D.new()
-	var bm   := BoxMesh.new()
-	bm.size  = Vector3(0.14, height, 0.14)
-	post.mesh = bm
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.12, 0.14, 0.18, 1.0)
-	mat.metallic     = 0.80
-	mat.roughness    = 0.30
-	post.material_override = mat
-	post.position.y = height * 0.5
-	return post
-
-
 # ── Electric lane gate (left / right) ────────────────────────────────────────
 # Fence posts on blocked lane edges; arcing electricity spans the blocked span.
 # Safe lane keeps approach marks + floor strip just like the city theme.
@@ -3959,7 +4013,7 @@ func _vis_elec_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) 
 
 		# Fence posts at group edges
 		for px: float in [x_left, x_right]:
-			var post := _make_fence_post(lane_blocker_height)
+			var post := _pieces.fence_post(lane_blocker_height)
 			post.position.x = px
 			root.add_child(post)
 
@@ -3972,9 +4026,9 @@ func _vis_elec_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) 
 
 	# Safe-lane cues (same as city theme)
 	var safe_x: float = player.lane_xs[safe_lane]
-	_make_gate_arch(root, safe_x, lane_blocker_width * 0.88, 0.0, lane_blocker_height, tint)
-	_make_approach_marks(root, safe_x, lane_blocker_width * 0.80, tint)
-	root.add_child(_make_safe_strip(safe_x, tint))
+	_pieces.arch(root, safe_x, lane_blocker_width * 0.88, 0.0, lane_blocker_height, tint)
+	_pieces.approach_marks(root, safe_x, lane_blocker_width * 0.80, tint)
+	root.add_child(_pieces.safe_strip(safe_x, tint))
 
 
 # ── Electric jump gate ────────────────────────────────────────────────────────
@@ -3986,7 +4040,7 @@ func _vis_elec_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 
 	# Outer frame posts
 	for px: float in [from_x - 0.1, to_x + 0.1]:
-		var post := _make_fence_post(lane_blocker_height)
+		var post := _pieces.fence_post(lane_blocker_height)
 		post.position.x = px
 		root.add_child(post)
 
@@ -4000,16 +4054,16 @@ func _vis_elec_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var chev_y: float      = jump_hurdle_height + 0.40
 	var chev_off: float    = tw * 0.17
 	for sign: float in [-1.0, 1.0]:
-		var chev := _make_box_mesh(chev_size, bright)
+		var chev := _pieces.box_mesh(chev_size, bright)
 		chev.position   = Vector3(sign * chev_off, chev_y, -gate_depth * 0.5 - 0.05)
 		chev.rotation.z = deg_to_rad(-sign * 32.0)
 		root.add_child(chev)
-		var chev2 := _make_box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
+		var chev2 := _pieces.box_mesh(chev_size * Vector3(0.7, 0.8, 1.0), bright)
 		chev2.position   = Vector3(sign * chev_off * 0.7, chev_y + 0.32, -gate_depth * 0.5 - 0.05)
 		chev2.rotation.z = deg_to_rad(-sign * 32.0)
 		root.add_child(chev2)
 
-	_make_approach_marks(root, 0.0, tw, tint)
+	_pieces.approach_marks(root, 0.0, tw, tint)
 
 
 # ── Electric slide gate ───────────────────────────────────────────────────────
@@ -4028,12 +4082,12 @@ func _vis_elec_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	# jump = tall posts + low wire at ground (go OVER)
 	# slide = short posts + ceiling wire at head height (go UNDER)
 	for px: float in [from_x - 0.1, to_x + 0.1]:
-		var post := _make_fence_post(clearance_y)
+		var post := _pieces.fence_post(clearance_y)
 		post.position.x = px
 		root.add_child(post)
 
 	# Solid limbo bar at clearance_y — the hard electric ceiling
-	var bar := _make_box_mesh(Vector3(tw + 0.10, 0.10, gate_depth + 0.10), bright)
+	var bar := _pieces.box_mesh(Vector3(tw + 0.10, 0.10, gate_depth + 0.10), bright)
 	bar.position = Vector3(0.0, clearance_y, 0.0)
 	var bmat := bar.material_override as StandardMaterial3D
 	if bmat != null: bmat.emission_energy_multiplier = 5.5
@@ -4047,18 +4101,18 @@ func _vis_elec_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var chev_h: float  = clearance_y * 0.40
 	var chev_offset: float = tw * 0.22
 	for sign: float in [-1.0, 0.0, 1.0]:
-		var chev := _make_box_mesh(Vector3(0.10, chev_h, 0.07), bright)
+		var chev := _pieces.box_mesh(Vector3(0.10, chev_h, 0.07), bright)
 		chev.position = Vector3(sign * chev_offset, clearance_y * 0.45, -gate_depth * 0.5 - 0.05)
 		root.add_child(chev)
 
 	# Floor strip — bright crawl zone marker
-	var floor_strip := _make_box_mesh(Vector3(tw, 0.05, gate_depth * 0.7), bright)
+	var floor_strip := _pieces.box_mesh(Vector3(tw, 0.05, gate_depth * 0.7), bright)
 	floor_strip.position = Vector3(0.0, 0.025, 0.0)
 	var fsmat := floor_strip.material_override as StandardMaterial3D
 	if fsmat != null: fsmat.emission_energy_multiplier = 2.5
 	root.add_child(floor_strip)
 
-	_make_approach_marks(root, 0.0, tw, tint)
+	_pieces.approach_marks(root, 0.0, tw, tint)
 
 
 # ── Electric wall gate ────────────────────────────────────────────────────────
@@ -4072,7 +4126,7 @@ func _vis_elec_wall_gate(root: Node3D, action: String, tint: Color) -> void:
 	var inward: float    = -wall_sign
 
 	# Wall post / anchor
-	var post := _make_fence_post(lane_blocker_height * 1.6)
+	var post := _pieces.fence_post(lane_blocker_height * 1.6)
 	post.position.x = face_x
 	root.add_child(post)
 
@@ -4600,7 +4654,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 			var sr: Node3D = Node3D.new()
 			sr.position = Vector3(side * wall_cx_abs, 0.0, seg_zc)
 			gates_root.add_child(sr)
-			var wm: MeshInstance3D = _make_box_mesh(
+			var wm: MeshInstance3D = _pieces.box_mesh(
 				Vector3(wall_thick, seg_h, seg_z_len * 0.97), purple)
 			wm.position = Vector3(0.0, seg_h * 0.5, 0.0)
 			sr.add_child(wm)
@@ -4613,7 +4667,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 	var pillar_w:   float = 0.55
 	for side in [-1, 1]:
 		var px: float = side * (tw * 0.5 + pillar_w * 0.5 + 0.08)
-		var pillar: MeshInstance3D = _make_box_mesh(
+		var pillar: MeshInstance3D = _pieces.box_mesh(
 			Vector3(pillar_w, pillar_h, pillar_w), arch_col)
 		pillar.position = Vector3(px, pillar_h * 0.5, arch_z)
 		var pm: StandardMaterial3D = pillar.material_override as StandardMaterial3D
@@ -4621,7 +4675,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 		gates_root.add_child(pillar)
 
 	# Horizontal crossbeam connecting the two pillars
-	var beam: MeshInstance3D = _make_box_mesh(
+	var beam: MeshInstance3D = _pieces.box_mesh(
 		Vector3(tw + pillar_w * 2.0 + 0.16, 0.45, pillar_w), arch_col.lightened(0.20))
 	beam.position = Vector3(0.0, pillar_h, arch_z)
 	var bm2: StandardMaterial3D = beam.material_override as StandardMaterial3D
@@ -4658,7 +4712,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 	ab.size = Vector3(approach_w, approach_thick, approach_len)
 	ac.shape = ab
 	approach_body.add_child(ac)
-	approach_body.add_child(_make_box_mesh(
+	approach_body.add_child(_pieces.box_mesh(
 		Vector3(approach_w, approach_thick, approach_len), Color(0.862, 0.427, 0.817, 1.0)))
 
 	# ── 4. Ledges — single-lane platforms at landing side, per-pair cumulative heights ──
@@ -4689,7 +4743,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 		lb.size = Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0)
 		lc.shape = lb
 		ledge.add_child(lc)
-		var lm: MeshInstance3D = _make_box_mesh(
+		var lm: MeshInstance3D = _pieces.box_mesh(
 			Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0),
 			ledge_color.lerp(Color(1, 1, 1, 1), float(i) / float(max(n_jumps, 1)) * 0.3))
 		var lmat: StandardMaterial3D = lm.material_override as StandardMaterial3D
@@ -4731,7 +4785,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 								elev_height + 0.45,
 								elev_start_z + elev_length * 0.5)
 		gates_root.add_child(rail)
-		rail.add_child(_make_box_mesh(
+		rail.add_child(_pieces.box_mesh(
 			Vector3(0.07, 0.07, elev_length),
 			Color(0.85, 0.45, 1.00, 1.0).lightened(0.20)))
 
@@ -4783,7 +4837,7 @@ func _spawn_wall_jump_section(phrase_entries: Array) -> void:
 		dc.shape = db
 		dp.add_child(dc)
 
-		var dm: MeshInstance3D = _make_box_mesh(
+		var dm: MeshInstance3D = _pieces.box_mesh(
 			Vector3(plat_w, plat_thick, plat_d), lane_colors[lane_idx])
 		var dmat: StandardMaterial3D = dm.material_override as StandardMaterial3D
 		if dmat != null:
@@ -5039,7 +5093,7 @@ func _spawn_wj_geometry_on_path() -> void:
 				sr.position           = _path_world_pos(seg_zc, float(side) * wall_cx_abs, 0.0)
 				sr.rotation_degrees.y = _path_y_rot_at(seg_zc)
 				gates_root.add_child(sr)
-				var wm: MeshInstance3D = _make_box_mesh(
+				var wm: MeshInstance3D = _pieces.box_mesh(
 					Vector3(wall_thick, seg_h, seg_z_len * 0.97), purple)
 				wm.position = Vector3(0.0, seg_h * 0.5, 0.0)
 				sr.add_child(wm)
@@ -5122,7 +5176,7 @@ func _spawn_wj_geometry_on_path() -> void:
 	if not first_entry.is_empty():
 		_register_track_emissives(_add_authored_piece(first_pivot, first_entry, Vector3(0.0, ledge_thick * 0.5, 0.0)))
 	else:
-		first_pivot.add_child(_make_box_mesh(
+		first_pivot.add_child(_pieces.box_mesh(
 			Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0), LEDGE_COLORS[0]))
 
 	for i in range(1, n_jumps):
@@ -5152,7 +5206,7 @@ func _spawn_wj_geometry_on_path() -> void:
 		if not ledge_entry.is_empty():
 			_register_track_emissives(_add_authored_piece(ledge, ledge_entry, Vector3(0.0, ledge_thick * 0.5, 0.0)))
 		else:
-			var lm: MeshInstance3D = _make_box_mesh(
+			var lm: MeshInstance3D = _pieces.box_mesh(
 				Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0), ledge_color)
 			var lmat: StandardMaterial3D = lm.material_override as StandardMaterial3D
 			if lmat != null:
@@ -5192,7 +5246,7 @@ func _spawn_wj_geometry_on_path() -> void:
 			rail.position           = _path_world_pos(rail_pd_mid, float(side) * tw * 0.5, elev_height + 0.45)
 			rail.rotation_degrees.y = _path_y_rot_at(rail_pd_mid)
 			gates_root.add_child(rail)
-			rail.add_child(_make_box_mesh(
+			rail.add_child(_pieces.box_mesh(
 				Vector3(0.07, 0.07, elev_length),
 				Color(0.85, 0.45, 1.00, 1.0).lightened(0.20)))
 
@@ -5299,7 +5353,7 @@ func _spawn_wj_geometry_on_path() -> void:
 	else:
 		# Deck surface — a dark panel, so the bright trim below reads against it
 		# instead of glowing into an already-glowing slab.
-		var deck := _make_box_mesh(Vector3(ramp_w, 0.10, slide_diag),
+		var deck := _pieces.box_mesh(Vector3(ramp_w, 0.10, slide_diag),
 			Color(0.10, 0.13, 0.20), NeonMat.PANEL, 0.35)
 		deck.position.y = 0.16
 		ramp_body.add_child(deck)
@@ -5307,20 +5361,20 @@ func _spawn_wj_geometry_on_path() -> void:
 		# Edge trim — two hot tubes running the full diagonal. This is the
 		# strongest read on where the ramp is from the top of the climb.
 		for side: float in [-1.0, 1.0]:
-			var trim := _make_box_mesh(Vector3(0.13, 0.13, slide_diag), ramp_color, NeonMat.TUBE, 6.5)
+			var trim := _pieces.box_mesh(Vector3(0.13, 0.13, slide_diag), ramp_color, NeonMat.TUBE, 6.5)
 			trim.position = Vector3(side * (ramp_w * 0.5), 0.22, 0.0)
 			ramp_body.add_child(trim)
 
 			# Hand rail on posts above the trim — gives the ramp thickness so it
 			# does not read as a flat decal painted on the void.
-			var hrail := _make_box_mesh(Vector3(0.08, 0.08, slide_diag),
+			var hrail := _pieces.box_mesh(Vector3(0.08, 0.08, slide_diag),
 				ramp_color.lightened(0.35), NeonMat.TUBE, 4.5)
 			hrail.position = Vector3(side * (ramp_w * 0.5), 0.86, 0.0)
 			ramp_body.add_child(hrail)
 			var post_n: int = maxi(3, int(slide_diag / 6.0))
 			for pi2 in range(post_n + 1):
 				var pz: float = -slide_diag * 0.5 + slide_diag * (float(pi2) / float(post_n))
-				var post := _make_box_mesh(Vector3(0.06, 0.70, 0.06),
+				var post := _pieces.box_mesh(Vector3(0.06, 0.70, 0.06),
 					ramp_color.darkened(0.15), NeonMat.TUBE, 3.0)
 				post.position = Vector3(side * (ramp_w * 0.5), 0.52, pz)
 				ramp_body.add_child(post)
@@ -5334,7 +5388,7 @@ func _spawn_wj_geometry_on_path() -> void:
 			# Brighter toward the bottom, so the eye is pulled down the ramp.
 			var ce: float = lerpf(2.2, 5.6, f)
 			for arm: float in [-1.0, 1.0]:
-				var chev := _make_box_mesh(Vector3(ramp_w * 0.52, 0.05, 0.16),
+				var chev := _pieces.box_mesh(Vector3(ramp_w * 0.52, 0.05, 0.16),
 					ramp_color.lightened(0.20), NeonMat.TUBE, ce)
 				chev.position = Vector3(arm * ramp_w * 0.24, 0.22, cz)
 				chev.rotation_degrees.y = 26.0 * arm
@@ -5348,8 +5402,8 @@ func _spawn_wj_geometry_on_path() -> void:
 	portal.position           = _path_world_pos(slide_start_z + 0.4, 0.0, elev_height)
 	portal.rotation_degrees.y = _path_y_rot_at(slide_start_z)
 	gates_root.add_child(portal)
-	_make_gate_arch(portal, ramp_x, ramp_w + 0.5, 0.0, 3.0, ramp_color)
-	_make_approach_marks(portal, ramp_x, ramp_w, ramp_color)
+	_pieces.arch(portal, ramp_x, ramp_w + 0.5, 0.0, 3.0, ramp_color)
+	_pieces.approach_marks(portal, ramp_x, ramp_w, ramp_color)
 
 	# ── 7c. Void edges ───────────────────────────────────────────────────────
 	# Where the elevated floor stops, a magenta lip marks the drop on either side
@@ -5360,7 +5414,7 @@ func _spawn_wj_geometry_on_path() -> void:
 		if absf(out_x - lip_x) < 0.6:
 			continue   # ramp is hard against the track edge — no room for a lip
 		var lip_w: float = absf(out_x - lip_x)
-		var lip := _make_box_mesh(Vector3(lip_w, 0.14, 0.45), edge_color, NeonMat.TUBE, 5.0)
+		var lip := _pieces.box_mesh(Vector3(lip_w, 0.14, 0.45), edge_color, NeonMat.TUBE, 5.0)
 		lip.position           = _path_world_pos(slide_start_z, (lip_x + out_x) * 0.5, elev_height + 0.07)
 		lip.rotation_degrees.y = _path_y_rot_at(slide_start_z)
 		gates_root.add_child(lip)
@@ -5368,7 +5422,7 @@ func _spawn_wj_geometry_on_path() -> void:
 	# ── 7d. Landing flare ────────────────────────────────────────────────────
 	# A lit pad where the ramp meets the ground, so the bottom of the drop has a
 	# target instead of just stopping.
-	var pad := _make_box_mesh(Vector3(ramp_w + 1.2, 0.08, 3.0), ramp_color, NeonMat.PANEL, 3.4)
+	var pad := _pieces.box_mesh(Vector3(ramp_w + 1.2, 0.08, 3.0), ramp_color, NeonMat.PANEL, 3.4)
 	pad.position           = _path_world_pos(slide_end_z + 1.4, ramp_x, 0.06)
 	pad.rotation_degrees.y = _path_y_rot_at(slide_end_z)
 	gates_root.add_child(pad)
@@ -5431,7 +5485,7 @@ func _spawn_floor_segment(z_start: float, length: float, height: float, color: C
 		col_shape.shape = box
 		body.add_child(col_shape)
 		if with_mesh:
-			body.add_child(_make_box_mesh(Vector3(tw, thick, length), color))
+			body.add_child(_pieces.box_mesh(Vector3(tw, thick, length), color))
 		return
 
 	# Walk path segments and spawn one box per intersecting segment
@@ -5457,7 +5511,7 @@ func _spawn_floor_segment(z_start: float, length: float, height: float, color: C
 		col_shape.shape = box
 		body.add_child(col_shape)
 		if with_mesh:
-			body.add_child(_make_box_mesh(Vector3(tw, thick, seg_len), color))
+			body.add_child(_pieces.box_mesh(Vector3(tw, thick, seg_len), color))
 
 
 func _add_gate_judge_area(root: Node3D, gate_index: int, action: String, safe_lane: int) -> void:
@@ -7415,272 +7469,6 @@ func _unhandled_input(event: InputEvent) -> void:
 	elif event.is_action("ui_accept"):
 		get_viewport().set_input_as_handled()
 		_death_confirm()
-
-
-# ── Gate arch helper ─────────────────────────────────────────────────────────
-# Draws a bright neon rectangular frame (two posts + top beam) around the zone
-# the player must pass through.  Makes gates feel like designed track landmarks
-# rather than background props.
-func _make_gate_arch(root: Node3D, cx: float, width: float,
-		bot_y: float, top_y: float, tint: Color) -> void:
-	var bright := tint.lightened(0.04)
-	var pw     := 0.10            # post / beam cross-section
-	var h      := top_y - bot_y
-	var cy     := bot_y + h * 0.5
-
-	# Posts and beam are tubes: hot core, falling off to the edges, so the
-	# portal reads as lit neon rather than three glowing bricks.
-	const ARCH_E: float = 5.5
-
-	# Left post
-	var lp := _make_box_mesh(Vector3(pw, h, pw), bright, NeonMat.TUBE, ARCH_E)
-	lp.position = Vector3(cx - width * 0.5 - pw * 0.5, cy, 0.0)
-	root.add_child(lp)
-	# Right post
-	var rp := _make_box_mesh(Vector3(pw, h, pw), bright, NeonMat.TUBE, ARCH_E)
-	rp.position = Vector3(cx + width * 0.5 + pw * 0.5, cy, 0.0)
-	root.add_child(rp)
-	# Top beam
-	var tb := _make_box_mesh(Vector3(width + pw * 2.0 + 0.08, pw, pw), bright, NeonMat.TUBE, ARCH_E)
-	tb.position = Vector3(cx, top_y + pw * 0.5, 0.0)
-	root.add_child(tb)
-	# Corner caps — brighter and slightly proud of the join, so the frame reads
-	# as assembled hardware rather than three bars that happen to touch.
-	for sx: float in [-1.0, 1.0]:
-		var corner := _make_box_mesh(
-			Vector3(pw * 1.9, pw * 1.9, pw * 1.9), bright.lightened(0.25), NeonMat.TUBE, ARCH_E * 1.4)
-		corner.position = Vector3(cx + sx * (width * 0.5 + pw * 0.5), top_y + pw * 0.5, 0.0)
-		root.add_child(corner)
-
-
-# ── Approach runway helper ────────────────────────────────────────────────────
-# Three neon hash marks on the floor extending toward the player, clearly
-# marking "gate ahead" on the track surface.
-func _make_approach_marks(root: Node3D, cx: float, width: float, tint: Color) -> void:
-	# Authored Blender "ApproachMarks" replace the procedural hash lines —
-	# stretched sideways so they fit lane-width AND full-track gates alike.
-	var entry: Dictionary = (_piece_lib.first_of("marks") if _piece_lib != null else {})
-	if not entry.is_empty():
-		var auth_w: float = maxf(0.1, float(entry.params.get("width", 5.2)))
-		var inst: Node3D = _piece_lib.instance(entry)
-		inst.position           = Vector3(cx, 0.0, 0.0)
-		inst.rotation_degrees.y = 180.0
-		inst.scale.x            = width / auth_w
-		root.add_child(inst)
-		return
-	# Flat floor pieces are the ideal panel case — the scrolling scanline gives
-	# the "gate ahead" cue actual motion for one extra instruction, no texture.
-	#
-	# One MultiMeshInstance3D rather than three MeshInstance3Ds: the three hash
-	# marks are the same mesh and the same material, and there are three of them
-	# on every gate in the song. Same pattern as _spawn_floor_grid.
-	var bright := tint.darkened(0.05)
-	var mm := MultiMesh.new()
-	mm.transform_format = MultiMesh.TRANSFORM_3D
-	mm.mesh = _shared_box(Vector3(width * 0.80, 0.03, 0.14))
-	mm.instance_count = 3
-	for i: int in 3:
-		mm.set_instance_transform(i,
-			Transform3D(Basis(), Vector3(cx, 0.015, -(1.2 + float(i) * 1.3))))
-
-	var mmi := MultiMeshInstance3D.new()
-	mmi.multimesh = mm
-	var mark_mat: ShaderMaterial = NeonMat.panel(bright, 3.4)
-	mark_mat.set_shader_parameter("scan_speed", 1.6)
-	mark_mat.set_shader_parameter("scan_scale", 6.0)
-	mmi.material_override = mark_mat
-	root.add_child(mmi)
-
-
-# Glowing safe-lane floor strip — authored Blender "SafeStrip" when present
-# (author it centred at lane x = 0; the game positions it per gate).
-func _make_safe_strip(safe_x: float, tint: Color) -> Node3D:
-	var entry: Dictionary = (_piece_lib.first_of("strip") if _piece_lib != null else {})
-	if not entry.is_empty():
-		var wrap := Node3D.new()
-		wrap.position = Vector3(safe_x, 0.01, 0.0)
-		var inst: Node3D = _piece_lib.instance(entry)
-		inst.rotation_degrees.y = 180.0
-		wrap.add_child(inst)
-		return wrap
-	var strip := _make_box_mesh(
-		Vector3(lane_blocker_width * 0.7, 0.04, gate_depth * 1.2), tint, NeonMat.PANEL, 3.0)
-	NeonMat.set_param(strip.material_override, "scan_speed", 1.2)
-	strip.position = Vector3(safe_x, 0.02, 0.0)
-	return strip
-
-
-# ── Building-facade helper ────────────────────────────────────────────────────
-# The shared body of every lane blocker, jump barrier, slide overhang and
-# flanking tower. Improving this one function reaches all of them at once, which
-# is why the geometry work concentrates here.
-#
-# It used to be a dark box with horizontal strips on the front face and a bright
-# cap — literally a black cube with coloured stripes, and worse, one that only
-# read as anything from dead ahead: the sides were bare, so a facade flattened
-# out the moment it entered peripheral vision.
-#
-# What actually breaks the cube read, in order of how much each contributes:
-#   • CORNER PILLARS. Four lit vertical edges describe the volume from every
-#     angle, so the shape survives being passed at speed. Biggest single win.
-#   • A SETBACK CROWN. An inset upper block under the cap gives a stepped
-#     silhouette instead of one flat top line.
-#   • A PLINTH. A short base block grounds it rather than letting it float.
-#   • A CENTRE SPINE and SIDE STRIPS, which break the horizontal banding and
-#     stop the sides being dead.
-#
-# The outer bound never exceeds `size` on X — the pillars sit flush with the
-# body's own corners and the crown insets inward — so nothing here implies a
-# bigger obstacle than the gameplay footprint the player is judging.
-func _make_bldg_facade(pos: Vector3, size: Vector3, win_col: Color,
-		strip_h: float = 0.12, strip_gap: float = 0.45) -> Node3D:
-	var node     := Node3D.new()
-	node.position = pos
-
-	var detail: int = _gate_detail
-	var half_y: float = size.y * 0.5
-	var front_z: float = -size.z * 0.5
-
-	# Dark silhouette body — gives the obstacle mass without bleeding emission
-	var body     := MeshInstance3D.new()
-	body.mesh     = _shared_box(size)
-	var body_mat  := StandardMaterial3D.new()
-	body_mat.albedo_color     = Color(0.045, 0.025, 0.09, 1.0)
-	body_mat.emission_enabled = false
-	body.material_override    = body_mat
-	body.set_meta("no_cycle", true)   # never recolored by the color cycle system
-	node.add_child(body)
-
-	# One shared material for every strip on this facade (no per-strip overhead)
-	var win_mat: ShaderMaterial = NeonMat.panel(win_col, 2.0)
-
-	# Front-face strips — one mesh per row, facing the approaching player. Inset
-	# from the full width so the corner pillars below frame them rather than
-	# colliding with them.
-	var strip_w: float = size.x - (0.16 if detail > 0 else -0.02)
-	var y_local: float = -half_y + strip_gap
-	while y_local < half_y - strip_h:
-		var sf  := MeshInstance3D.new()
-		sf.mesh  = _shared_box(Vector3(strip_w, strip_h, 0.06))
-		sf.material_override = win_mat
-		sf.position = Vector3(0.0, y_local, front_z - 0.03)
-		node.add_child(sf)
-
-		# Matching stubs on the left/right faces, so the facade still reads as a
-		# solid object once it is beside the player instead of in front of them.
-		if detail > 1:
-			for sx: float in [-1.0, 1.0]:
-				var ss := MeshInstance3D.new()
-				ss.mesh = _shared_box(Vector3(0.05, strip_h, size.z * 0.55))
-				ss.material_override = win_mat
-				ss.position = Vector3(sx * (size.x * 0.5 + 0.02), y_local, 0.0)
-				node.add_child(ss)
-
-		y_local += strip_gap
-
-	if detail > 0:
-		# ── Corner pillars ──────────────────────────────────────────────────
-		# One material and one mesh shared by all four: neon_tube needs box_size
-		# to find its core axis, and identical dimensions mean identical
-		# uniforms, so this stays a single draw setup.
-		var pillar_size := Vector3(0.075, size.y * 0.99, 0.075)
-		var pillar_mat: ShaderMaterial = NeonMat.tube(win_col.lightened(0.18), 3.2)
-		pillar_mat.set_shader_parameter("box_size", pillar_size)
-		var pillar_mesh: BoxMesh = _shared_box(pillar_size)
-		for px: float in [-1.0, 1.0]:
-			for pz: float in [-1.0, 1.0]:
-				var pil := MeshInstance3D.new()
-				pil.mesh = pillar_mesh
-				pil.material_override = pillar_mat
-				pil.position = Vector3(px * (size.x * 0.5 - 0.03), 0.0,
-					pz * (size.z * 0.5 - 0.03))
-				node.add_child(pil)
-
-		# ── Base plinth ─────────────────────────────────────────────────────
-		var plinth := MeshInstance3D.new()
-		plinth.mesh = _shared_box(Vector3(size.x * 0.99, 0.14, size.z * 1.05))
-		plinth.material_override = body_mat
-		plinth.position = Vector3(0.0, -half_y + 0.07, 0.0)
-		plinth.set_meta("no_cycle", true)
-		node.add_child(plinth)
-
-	# ── Vertical spine ──────────────────────────────────────────────────────
-	# Only on facades tall enough to have a middle worth breaking up.
-	if detail > 1 and size.y > 0.9:
-		var spine := MeshInstance3D.new()
-		spine.mesh = _shared_box(Vector3(0.10, size.y * 0.72, 0.05))
-		spine.material_override = win_mat
-		spine.position = Vector3(0.0, 0.0, front_z - 0.05)
-		node.add_child(spine)
-
-	# ── Setback crown + cap ─────────────────────────────────────────────────
-	# Short facades (jump hurdles, slide overhangs) skip the setback: on those
-	# the cap IS the readable edge and insetting it would soften the very line
-	# the player is judging their clearance against.
-	var cap_w: float = size.x + 0.06
-	var cap_d: float = size.z + 0.06
-	var cap_y: float = half_y + 0.04
-	if detail > 0 and size.y > 1.6:
-		var crown_h: float = size.y * 0.09
-		var crown := MeshInstance3D.new()
-		crown.mesh = _shared_box(Vector3(size.x * 0.76, crown_h, size.z * 0.80))
-		crown.material_override = body_mat
-		crown.position = Vector3(0.0, half_y + crown_h * 0.5, 0.0)
-		crown.set_meta("no_cycle", true)
-		node.add_child(crown)
-		cap_w = size.x * 0.76 + 0.06
-		cap_d = size.z * 0.80 + 0.06
-		cap_y = half_y + crown_h + 0.04
-
-	# Bright rooftop cap — same cap style as city buildings
-	var cap := _make_box_mesh(Vector3(cap_w, 0.08, cap_d),
-		win_col.lightened(0.30), NeonMat.TUBE, 4.5)
-	cap.position = Vector3(0.0, cap_y, 0.0)
-	node.add_child(cap)
-
-	return node
-
-
-## Shared BoxMesh cache, keyed on size to the millimetre.
-##
-## Every part of every gate used to allocate its own BoxMesh, so a level built
-## thousands of byte-identical meshes that the renderer had no way to batch.
-## Nothing mutates a mesh after _make_box_mesh returns (callers only touch
-## transform and material_override), so one instance per distinct size is safe.
-## The dictionary lives on the section node, which is rebuilt per level.
-var _box_mesh_cache: Dictionary = {}
-
-func _shared_box(size: Vector3) -> BoxMesh:
-	var key: String = "%d,%d,%d" % [
-		int(round(size.x * 1000.0)), int(round(size.y * 1000.0)), int(round(size.z * 1000.0))]
-	if _box_mesh_cache.has(key):
-		return _box_mesh_cache[key]
-	var bm := BoxMesh.new()
-	bm.size = size
-	_box_mesh_cache[key] = bm
-	return bm
-
-
-## `role` picks the shader: NeonMat.TUBE for bars, posts and beams (hot core,
-## falls off to the edges) or NeonMat.PANEL for flat faces (border, scanlines).
-## Defaults to TUBE because most callers are bars.
-func _make_box_mesh(size: Vector3, color: Color,
-		role: String = NeonMat.TUBE, energy: float = 3.0) -> MeshInstance3D:
-	var mi: MeshInstance3D = MeshInstance3D.new()
-	mi.mesh = _shared_box(size)
-	var mat: ShaderMaterial = NeonMat.make(role, color, energy)
-	# neon_tube derives its core from the bar's long axis in object space, which
-	# it can only know from the box's own dimensions — a BoxMesh's per-face UVs
-	# carry no consistent orientation.
-	mat.set_shader_parameter("box_size", size)
-	mi.material_override = mat
-
-	# store original color so color cycling can preserve shape identity
-	mi.set_meta("base_color", color)
-
-	return mi
-
-
 # ── Camera FX ────────────────────────────────────────────────────────────────
 func _update_camera_fx(delta: float) -> void:
 	if _camera == null or not _level_started or _paused:
@@ -9145,6 +8933,9 @@ func _update_gate_visibility() -> void:
 	var beat_s: float   = max(0.20, _runner_avg_beat_s)
 	var ahead_z: float  = max(min_gate_preview_distance, gate_preview_beats * beat_s * player.forward_speed)
 	var behind_z: float = max(6.0, gate_keep_behind_beats * beat_s * player.forward_speed)
+	# Gates get their geometry before they get shown, a few per frame.
+	var prepare_z: float = ahead_z + GATE_PREPARE_EXTRA_M
+	var builds_left: int = GATE_BUILDS_PER_FRAME
 
 	var player_z: float = _player_path_dist   # path distance, not world Z
 
@@ -9163,8 +8954,14 @@ func _update_gate_visibility() -> void:
 
 		var dz: float = gate_world_zs[i] - player_z
 
+		# Build it before it is wanted. Z-sorted, so this walks the track in
+		# order and the budget simply moves on to the next one next frame.
+		if not _gate_vis_built[i] and dz <= prepare_z and builds_left > 0:
+			_build_gate_body(i)
+			builds_left -= 1
+
 		# Gates are Z-sorted — once we're too far ahead, stop
-		if dz > ahead_z + 10.0:
+		if dz > prepare_z + 10.0:
 			break
 
 		# Culled gates are permanently hidden — never re-show them.
@@ -9175,6 +8972,12 @@ func _update_gate_visibility() -> void:
 
 		# First-time appearance: direction tied to gate type
 		# jump → always from below, slide → always from above, others → cycle left/right
+		# Last resort: something is about to be on screen that the per-frame
+		# budget has not reached yet. Better a frame that costs a millisecond
+		# than a gate that is not there.
+		if should_show and not _gate_vis_built[i]:
+			_build_gate_body(i)
+
 		if should_show and not gate.visible and not _gate_animated[i]:
 			_gate_animated[i] = true
 			var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
@@ -9549,7 +9352,7 @@ func _spawn_finish_lasers() -> void:
 			var delay: float = float(idx % beam_pd_offsets.size()) * 0.055 + float(idx) / float(beam_pd_offsets.size()) * 0.15
 
 			# Tall glowing column — shoots up from the ground
-			var beam: MeshInstance3D = _make_box_mesh(
+			var beam: MeshInstance3D = _pieces.box_mesh(
 				Vector3(beam_w, beam_height, beam_w), col)
 			var bw: Vector3 = _path_world_pos(_player_path_dist + bpd_off, blat, beam_height * 0.5)
 			beam.position = bw
@@ -9606,7 +9409,7 @@ func _spawn_finish_lasers() -> void:
 			sweep_pivot.rotation_degrees.y = _path_y_rot_at(sweep_pd)
 			world_fx_root.add_child(sweep_pivot)
 
-			var sweep: MeshInstance3D = _make_box_mesh(Vector3(0.12, 45.0, 0.12),
+			var sweep: MeshInstance3D = _pieces.box_mesh(Vector3(0.12, 45.0, 0.12),
 				beam_colors[(wave * 2 + (side + 1) / 2) % beam_colors.size()])
 			sweep.position = Vector3(0.0, 22.5, 0.0)
 			var smat: StandardMaterial3D = sweep.material_override as StandardMaterial3D
@@ -9773,7 +9576,7 @@ func _spawn_finish_orb_burst() -> void:
 			var col: Color = orb_colors[i % orb_colors.size()]
 
 			var orb_sz: float = randf_range(0.12, 0.32)
-			var orb: MeshInstance3D = _make_box_mesh(Vector3(orb_sz, orb_sz, orb_sz), col)
+			var orb: MeshInstance3D = _pieces.box_mesh(Vector3(orb_sz, orb_sz, orb_sz), col)
 			orb.position = origin
 			orb.rotation = Vector3(randf_range(0, TAU),
 								   randf_range(0, TAU),
@@ -10314,7 +10117,7 @@ func _spawn_track_decorations() -> void:
 				g_inst.rotation_degrees.y = 180.0
 				gem_root.add_child(g_inst)
 			else:
-				var gem: MeshInstance3D = _make_box_mesh(Vector3(0.40, 0.40, 0.40), col)
+				var gem: MeshInstance3D = _pieces.box_mesh(Vector3(0.40, 0.40, 0.40), col)
 				gem.rotation_degrees = Vector3(35.0, 0.0, 35.0)
 				gem_root.add_child(gem)
 
@@ -10378,12 +10181,12 @@ func _spawn_track_decorations() -> void:
 						_deco_spin_on.append(false)
 			else:
 				for side in [-1, 1]:
-					var post: MeshInstance3D = _make_box_mesh(Vector3(0.10, 4.2, 0.10), arch_col)
+					var post: MeshInstance3D = _pieces.box_mesh(Vector3(0.10, 4.2, 0.10), arch_col)
 					post.position = _path_world_pos(z, float(side) * tw * 0.5, 2.1)
 					world_fx_root.add_child(post)
 
 					# Small diagonal accent strut
-					var strut: MeshInstance3D = _make_box_mesh(Vector3(0.06, 0.06, 0.70),
+					var strut: MeshInstance3D = _pieces.box_mesh(Vector3(0.06, 0.06, 0.70),
 						arch_col.lightened(0.30))
 					strut.position = _path_world_pos(z, float(side) * (tw * 0.5 - 0.4), 3.8)
 					strut.rotation_degrees.z = float(side) * 25.0
@@ -10391,7 +10194,7 @@ func _spawn_track_decorations() -> void:
 					world_fx_root.add_child(strut)
 
 				# Horizontal beam across the top — oriented along track right direction
-				var beam: MeshInstance3D = _make_box_mesh(
+				var beam: MeshInstance3D = _pieces.box_mesh(
 					Vector3(tw + 0.10, 0.10, 0.10), arch_col.lightened(0.30))
 				beam.position = _path_world_pos(z, 0.0, 4.2)
 				beam.rotation_degrees.y = z_y_rot
@@ -10401,7 +10204,7 @@ func _spawn_track_decorations() -> void:
 				var crystal_root := Node3D.new()
 				crystal_root.position = _path_world_pos(z, 0.0, 3.5)
 				world_fx_root.add_child(crystal_root)
-				var crystal: MeshInstance3D = _make_box_mesh(Vector3(0.22, 0.44, 0.22),
+				var crystal: MeshInstance3D = _pieces.box_mesh(Vector3(0.22, 0.44, 0.22),
 					col.lightened(0.30))
 				crystal.rotation_degrees = Vector3(0.0, 0.0, 45.0)
 				crystal_root.add_child(crystal)
@@ -10437,7 +10240,7 @@ func _spawn_track_decorations() -> void:
 				pad_anchor.add_child(pad_inst)
 				_register_piece_emissives(pad_inst, _world_pad_mats)   # beat pulse
 			else:
-				var pad: MeshInstance3D = _make_box_mesh(
+				var pad: MeshInstance3D = _pieces.box_mesh(
 					Vector3(0.80, 0.04, 1.4),
 					gem_colors[(gem_i >> 2) % gem_colors.size()])
 				pad.position = _path_world_pos(z, pad_side * (tw * 0.5 - 0.55), 0.03)
@@ -10468,7 +10271,7 @@ func _spawn_track_decorations() -> void:
 					world_fx_root.add_child(hp_anchor)
 					hp_anchor.add_child(_piece_lib.instance(hpillar_entry))
 				else:
-					var pillar: MeshInstance3D = _make_box_mesh(
+					var pillar: MeshInstance3D = _pieces.box_mesh(
 						Vector3(0.22, ph, 0.22),
 						gem_colors[pi % gem_colors.size()].darkened(0.50))
 					pillar.position = _path_world_pos(pillar_pd, float(side) * dist, ph * 0.5)
@@ -11260,7 +11063,7 @@ func _spawn_path_floors() -> void:
 				visual_done = true
 
 			if not visual_done:
-				var mesh_inst: MeshInstance3D = _make_box_mesh(Vector3(tw, thick, r_len), _floor_base_albedo)
+				var mesh_inst: MeshInstance3D = _pieces.box_mesh(Vector3(tw, thick, r_len), _floor_base_albedo)
 				if _floor_material != null:
 					mesh_inst.set_surface_override_material(0, _floor_material)
 
@@ -11503,7 +11306,7 @@ func _spawn_arc_decorations() -> void:
 					bc_anchor.add_child(bc_inst)
 					_register_piece_emissives(bc_inst, _world_rail_mats)   # beat pulse
 					continue
-				var beacon: MeshInstance3D = _make_box_mesh(
+				var beacon: MeshInstance3D = _pieces.box_mesh(
 					Vector3(0.14, 3.2, 0.14), beacon_col)
 				beacon.position = j_pos \
 					+ j_seg.right * (side * (half_tw + 0.55)) \
@@ -11513,7 +11316,7 @@ func _spawn_arc_decorations() -> void:
 					bmat.emission_energy_multiplier = 1.8
 					_world_rail_mats.append(bmat)
 				world_fx_root.add_child(beacon)
-			var bar: MeshInstance3D = _make_box_mesh(
+			var bar: MeshInstance3D = _pieces.box_mesh(
 				Vector3(tw + 1.2, 0.08, 0.08), beacon_col)
 			bar.position           = j_pos + Vector3(0.0, 3.2, 0.0)
 			bar.rotation_degrees.y = j_rot
@@ -11574,7 +11377,7 @@ func _spawn_corner_pieces() -> void:
 		col_shape.shape = box
 		body.add_child(col_shape)
 
-		var mesh_inst: MeshInstance3D = _make_box_mesh(Vector3(tw * 0.5, thick, tw * 0.5), _floor_base_albedo)
+		var mesh_inst: MeshInstance3D = _pieces.box_mesh(Vector3(tw * 0.5, thick, tw * 0.5), _floor_base_albedo)
 		if _floor_material != null:
 			mesh_inst.set_surface_override_material(0, _floor_material)
 		body.add_child(mesh_inst)

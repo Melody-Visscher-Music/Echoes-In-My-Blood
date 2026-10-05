@@ -33,7 +33,7 @@ var _confirm_panel: Control = null
 
 
 func _ready() -> void:
-	Save.load_from_disk(0)
+	Save.sync_to_run()
 	GameConfig.load_from_disk()
 	# Reaching the main menu ends any story run that was in progress. Without
 	# this, quitting a story level to the menu and then starting a Freeplay song
@@ -1136,7 +1136,7 @@ func _on_open_story_map() -> void:
 	get_tree().change_scene_to_file("res://scenes/story/StoryMap.tscn")
 
 func _on_save_back() -> void:
-	Save.save_to_disk(0)
+	Save.sync_from_run()
 	GameConfig.save()
 	_settings_dirty = false
 	_close_options()

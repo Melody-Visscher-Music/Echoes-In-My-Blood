@@ -20,8 +20,9 @@ var run_seed = 0
 var level_index = 0
 var section_index = 0
 
-# Reserved for the not-yet-built upgrade/shop layer. Save.save_to_disk() already
-# persists these, so they stay even though nothing writes them during play yet.
+# The upgrade/shop layer's working copy for this session. Save owns the record:
+# Save.sync_to_run() fills these in at the main menu and Save.sync_from_run()
+# writes them back, so nothing here has to be careful about reaching disk.
 var player_class = ""
 var temp_upgrades = []
 var core_upgrades = []

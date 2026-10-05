@@ -30,6 +30,8 @@ extends Node
 var _held: Dictionary = {}
 ## Paths requested and not yet collected, by path -> set name it belongs to.
 var _pending: Dictionary = {}
+## Paths waiting to be read on the main thread, one per frame. See warm_main().
+var _slow: PackedStringArray = PackedStringArray()
 var _set: String = ""
 
 
@@ -51,9 +53,12 @@ func warm(set_name: String, paths: PackedStringArray) -> void:
 			continue
 		if not ResourceLoader.exists(path):
 			continue
-		# Sub-threads as well: a scene like the city is one file pointing at
-		# a hundred, and they can be read alongside each other.
-		if ResourceLoader.load_threaded_request(path, "", true) == OK:
+		# NO sub-threads. Reading the authored .glb track pieces with them on
+		# crashes the engine later, when the level duplicates templates out of
+		# those scenes and they are freed again — plain threaded reads of the
+		# same files are fine, and so is holding them. Not worth the
+		# milliseconds it would save on the city.
+		if ResourceLoader.load_threaded_request(path) == OK:
 			_pending[path] = set_name
 	set_process(not _pending.is_empty())
 
@@ -66,11 +71,32 @@ func drop(set_name: String) -> void:
 		return
 	_set = ""
 	_held.clear()
+	_slow.clear()
+
+
+## Reads these on the MAIN thread instead, one file per frame.
+##
+## Godot's threaded loader and the authored .glb track pieces do not get on.
+## Warmed on a worker thread and then left for a level to duplicate templates
+## out of, they crash the engine when those are freed — sometimes immediately,
+## sometimes only at shutdown, and not every run. Plain reads of the same files,
+## held the same way, are fine. They are small and the map is sitting still, so
+## one per frame costs nothing and buys the same head start.
+func warm_main(set_name: String, paths: PackedStringArray) -> void:
+	if set_name != _set:
+		_set = set_name
+		_held.clear()
+	for path: String in paths:
+		if path == "" or _held.has(path) or _slow.has(path):
+			continue
+		if ResourceLoader.exists(path):
+			_slow.append(path)
+	set_process(not _pending.is_empty() or not _slow.is_empty())
 
 
 ## True once nothing is still being read — only for the dev readout and tests.
 func is_idle() -> bool:
-	return _pending.is_empty()
+	return _pending.is_empty() and _slow.is_empty()
 
 
 func held_count() -> int:
@@ -93,4 +119,13 @@ func _process(_delta: float) -> void:
 			_:
 				push_warning("[Preload] could not read %s" % path)
 				_pending.erase(path)
-	set_process(not _pending.is_empty())
+
+	# One main-thread read per frame, so a long list cannot cost a frame.
+	if not _slow.is_empty():
+		var path: String = _slow[0]
+		_slow.remove_at(0)
+		var res: Resource = load(path)
+		if res != null:
+			_held[path] = res
+
+	set_process(not _pending.is_empty() or not _slow.is_empty())
