@@ -1076,22 +1076,31 @@ func _electric_zones(song: String) -> void:
 
 	var first: float = float((zones[0] as Dictionary).get("start_t", 0.0))
 	var shot_before: bool = false
+	var probed_after: bool = false
 	var shot_marks: Dictionary = {}
 	var shot_inside: bool = false
 	for i in 60000:
 		await get_tree().process_frame
 		var t: float = float(s.call("_song_time"))
-		if not shot_before and t >= first - 2.2 and t < first - 0.4:
+		if not shot_before and t >= first - 0.6 and t < first - 0.1:
 			shot_before = true
 			await _shoot("elec_before")
+			_cue_probe_before = _probe_cues(s)
 			_check(float(s.get("_elec_dark")) < 0.2, "the lights were already down before the zone")
-		for mark: float in [3.0, 6.5, 10.0]:
+		# Close to the edge, where the same gates are still in front of the
+		# player: "it breaks right when it dims" is a two-second window, and
+		# ten seconds later every gate from the first sample is long gone.
+		if shot_before and not probed_after and t >= first + 1.5:
+			probed_after = true
+			_report_cue_changes(s)
+		for mark: float in [-0.3, 0.4, 1.2, 3.0, 6.5, 10.0]:
 			if not shot_marks.has(mark) and t >= first + mark:
 				shot_marks[mark] = true
-				await _shoot("elec_inside_%d" % int(mark))
+				await _shoot("elec_edge_%+.1f" % mark)
 		if not shot_inside and t >= first + 10.0:
 			shot_inside = true
 			await _check_electric_detail(s)
+			_gate_cue_census(s, "inside the zone")
 			_check(float(s.get("_elec_dark")) > 0.8,
 				"inside the zone the dark only reached %.2f" % float(s.get("_elec_dark")))
 			break
@@ -1100,6 +1109,128 @@ func _electric_zones(song: String) -> void:
 	_check(shot_before and shot_inside, "never reached the first electric zone")
 	_shut_down(level)
 	await _frames(10)
+
+
+## Snapshot of every floor cue on the gates in view, by gate index, so the same
+## gates can be looked at again after the lights go down. "It breaks right when
+## it dims" is a claim about a transition, and a transition needs two samples.
+var _cue_probe_before: Dictionary = {}
+
+
+func _probe_cues(s: Node) -> Dictionary:
+	var out: Dictionary = {}
+	var gates: Array = s.get("gate_nodes") as Array
+	var zs: PackedFloat32Array = s.get("gate_world_zs")
+	var pd: float = float(s.get("_player_path_dist"))
+	for gi in gates.size():
+		var g: Node3D = gates[gi]
+		if g == null or not is_instance_valid(g):
+			continue
+		if gi >= zs.size() or zs[gi] < pd - 20.0 or zs[gi] > pd + 200.0:
+			continue
+		var v: Node3D = g.get_node_or_null("VisRoot") as Node3D
+		if v == null:
+			continue
+		var cues: Array = []
+		for c: Node in v.get_children():
+			var ci := c as GeometryInstance3D
+			if ci == null:
+				continue
+			if not (c is MultiMeshInstance3D or (c is MeshInstance3D
+					and (c as Node3D).position.y < 0.25)):
+				continue
+			var e: float = -1.0
+			var sm := ci.material_override as ShaderMaterial
+			if sm != null:
+				var ev: Variant = sm.get_shader_parameter("energy")
+				if ev != null:
+					e = float(ev)
+			cues.append({"name": c.name, "vis": ci.visible, "energy": e,
+				"layers": ci.layers, "cast": ci.cast_shadow})
+		if cues.is_empty():
+			continue
+		out[gi] = {"gate_vis": g.visible, "pos": v.position, "cues": cues,
+			"electric": bool((s.get("gate_is_electric") as Array)[gi])}
+	return out
+
+
+## What actually changed on those same gates once the lights went down.
+func _report_cue_changes(s: Node) -> void:
+	var after: Dictionary = _probe_cues(s)
+	var same: int = 0
+	var gone: int = 0
+	var dimmed: int = 0
+	var lines: Array = []
+	for gi: int in _cue_probe_before:
+		if not after.has(gi):
+			continue
+		var b: Dictionary = _cue_probe_before[gi]
+		var a: Dictionary = after[gi]
+		var bc: Array = b["cues"]
+		var ac: Array = a["cues"]
+		if bc.size() != ac.size():
+			gone += 1
+			lines.append("    gate %d: %d cues -> %d" % [gi, bc.size(), ac.size()])
+			continue
+		var changed: bool = false
+		for ci in bc.size():
+			var bb: Dictionary = bc[ci]
+			var aa: Dictionary = ac[ci]
+			if bool(bb["vis"]) != bool(aa["vis"]):
+				changed = true
+				lines.append("    gate %d cue '%s': visible %s -> %s (electric=%s)" % [
+					gi, bb["name"], str(bb["vis"]), str(aa["vis"]), str(a["electric"])])
+			elif absf(float(bb["energy"]) - float(aa["energy"])) > 0.01:
+				dimmed += 1
+				lines.append("    gate %d cue '%s': energy %.2f -> %.2f" % [
+					gi, bb["name"], float(bb["energy"]), float(aa["energy"])])
+				changed = true
+		if not changed:
+			same += 1
+	print("  cues across the dim: %d unchanged, %d lost a cue node, %d changed energy" % [
+		same, gone, dimmed])
+	for l: String in lines:
+		print(l)
+
+
+## Where each settled gate's visual actually sits, and how many of them still
+## carry their floor cues — the three approach marks and the safe-lane strip.
+## Run either side of a zone edge, because "it broke in electric zones" is only
+## meaningful against what the same count does outside one.
+func _gate_cue_census(s: Node, where: String) -> void:
+	var gates2: Array = s.get("gate_nodes") as Array
+	var zs2: PackedFloat32Array = s.get("gate_world_zs")
+	var done: Array = s.get("_gate_spawn_done") as Array
+	var pd2: float = float(s.get("_player_path_dist"))
+	var shown: int = 0
+	var stray: int = 0
+	var cues: int = 0
+	var worst: float = 0.0
+	for gi2 in gates2.size():
+		var g2: Node3D = gates2[gi2]
+		if g2 == null or not g2.visible:
+			continue
+		if gi2 >= zs2.size() or zs2[gi2] < pd2 - 10.0 or zs2[gi2] > pd2 + 160.0:
+			continue
+		# A gate still sliding in is SUPPOSED to be away from its gate.
+		if gi2 >= done.size() or not bool(done[gi2]):
+			continue
+		shown += 1
+		var v2: Node3D = g2.get_node_or_null("VisRoot") as Node3D
+		if v2 == null:
+			continue
+		var off: float = v2.position.length()
+		worst = maxf(worst, off)
+		if off > 0.6:
+			stray += 1
+		for c2: Node in v2.get_children():
+			if c2 is MultiMeshInstance3D or (c2 is MeshInstance3D
+					and (c2 as Node3D).position.y < 0.2):
+				cues += 1
+				break
+	print("  %-16s settled gates %d, displaced %d (worst %.2f m), with floor cues %d" % [
+		where, shown, stray, worst, cues])
+	_check(stray == 0, "%s: %d settled gate visuals are away from their gate" % [where, stray])
 
 
 ## The two things a screenshot cannot show: that the gate lights actually

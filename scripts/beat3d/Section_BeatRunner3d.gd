@@ -196,6 +196,11 @@ var _pause_canvas: CanvasLayer  = null
 
 # ── Gate spawn animation ──────────────────────────────────────────────────────
 var _gate_animated: Array[bool] = []      # true once the gate's intro tween has fired
+## True once that tween has FINISHED. The intro animates VisRoot.position —
+## gates slide in from the side or drop from above — so anything else that
+## writes that position has to wait its turn or it fights the tween and leaves
+## the visual stranded metres from the gate it belongs to.
+var _gate_spawn_done: Array[bool] = []
 
 # ── Gate color-cycle material cache ────────────────────────────────────────────
 # Flat per-gate material lists collected once at build time (see _collect_cycle_mats),
@@ -262,6 +267,12 @@ const _ELEC_WORLD_GLOW: float = 0.05
 ## this is what decides whether the zone reads as a dark room or as a lit one
 ## with the lamps off.
 const _ELEC_SKY_GLOW: float = 0.06
+## The scene's normal distance fog, held as a constant so the blackout can scale
+## it and put it back exactly.
+const _FOG_DENSITY: float = 0.008
+## How much of that fog is left in the dark. Darkness should come from nothing
+## being lit, not from a black fog that hides what little is.
+const _ELEC_FOG_THIN: float = 0.22
 ## How much harder a gate burns when it is the only light in the room.
 const _ELEC_GATE_GAIN: float = 5.0
 ## ...and how far it throws, in metres.
@@ -3364,6 +3375,7 @@ func _build_all_gate_visuals() -> void:
 	gate_actions.clear()
 	gate_is_electric.clear()
 	_gate_animated.clear()
+	_gate_spawn_done.clear()
 	_gate_cycle_mats.clear()
 
 	_judge_index = 0
@@ -3383,6 +3395,7 @@ func _build_all_gate_visuals() -> void:
 		gate_success.append(false)
 		gate_world_zs.append(gate.global_position.z)
 		_gate_animated.append(false)
+		_gate_spawn_done.append(false)
 		_gate_cycle_mats.append([] as Array[Material])
 		_gate_vis_built.append(false)
 		gate_actions.append(String(entry.get("action", "")))
@@ -3838,6 +3851,17 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 		# background is not an object. These two are.
 		_world_env.background_energy_multiplier = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
 		_world_env.fog_light_energy = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
+		# ...and the fog gets THINNER as it gets darker, which is the whole
+		# reason the floor cues were vanishing. Fog blends what is behind it
+		# toward its own colour, so dark fog swallows distant surfaces: the
+		# three approach marks and the safe strip sit 20-100 m ahead when they
+		# matter, and at density 0.008 that is a third to a half of the way to
+		# black. The gates survived it because their arcs burn five times
+		# brighter; the cues, which are lit panels with modest emission, did
+		# not. Thinning the fog keeps the room dark without putting a black
+		# curtain between the player and the thing telling them where to go.
+		_world_env.fog_density = lerpf(_FOG_DENSITY, _FOG_DENSITY * _ELEC_FOG_THIN,
+			_elec_dark)
 
 	# The lights switch on their OWN path distance, not the player's, so the
 	# dark stretch is something you can see coming rather than something that
@@ -3947,6 +3971,13 @@ func _sway_electric_gate(gate_index: int, t_s: float, seed_i: int) -> void:
 		return
 	var gate: Node3D = gate_nodes[gate_index]
 	if gate == null or not is_instance_valid(gate):
+		return
+	# The intro tween owns VisRoot.position until it has finished. Writing to it
+	# before then fought the tween and left gates — and the floor marks and safe
+	# strip under them — sitting a metre or more off to one side, or stranded
+	# mid-slide. Some arrived correctly, some never appeared where they should:
+	# it came down to whether this ran during that gate's 0.22 s of animation.
+	if gate_index >= _gate_spawn_done.size() or not _gate_spawn_done[gate_index]:
 		return
 	var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
 	if vis == null:
@@ -6590,7 +6621,7 @@ func _setup_world_environment() -> void:
 	env.fog_enabled        = true
 	env.fog_light_color    = Color(0.12, 0.04, 0.25, 1.0)
 	env.fog_light_energy   = 1.0
-	env.fog_density        = 0.008
+	env.fog_density        = _FOG_DENSITY
 	# Hold fog off the sky itself — at full strength it washes the stars out and
 	# the background goes back to being one flat colour.
 	env.fog_sky_affect     = 0.20
@@ -7626,6 +7657,10 @@ func _update_gate_visibility() -> void:
 						else:
 							vis.position.x = 4.0
 						atw.tween_property(vis, "position:x", 0.0, 0.22)
+				# Only now does anything else get to touch this position.
+				atw.tween_callback(func() -> void:
+					if i < _gate_spawn_done.size():
+						_gate_spawn_done[i] = true)
 
 		# Electric zones: pause/resume arc tweens with gate visibility so they
 		# don't burn CPU on gates hundreds of metres from the player.
