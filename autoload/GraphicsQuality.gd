@@ -174,22 +174,38 @@ const PRESETS: Dictionary = {
 		"ssr": true, "ssr_steps": 128,
 		"ssao": true, "ssil": true, "sdfgi": true, "sdfgi_bounce": 1.5,
 		"volumetric_fog": true,
+		# The fog lights itself from the GI and scatters forward, so the neon
+		# colours the air instead of hanging a grey veil over it. Measured at
+		# +0.25 ms together — see apply_environment_overrides().
+		"fog_gi_inject": 0.4,
+		"fog_anisotropy": 0.7,
 		"directional_shadow_size": 8192, "positional_shadow_atlas_size": 4096,
 		"shadow_soft_quality": RenderingServer.SHADOW_QUALITY_SOFT_ULTRA,
 		# 1.0 switched the LOD system off in practice: the same ~855 draw calls
 		# carried 3.06M primitives a frame instead of 356k, for detail that is
 		# sub-pixel at this distance, and every shadow split re-rasterised it.
 		"mesh_lod_threshold": 4.0,
-		"fur_scale": 1.3,
+		# 64 shells on Meeko rather than 52, for +0.59 ms. 1.9 (76 shells) was
+		# measured too and costs +1.25 ms, for a difference that needs a 3x
+		# zoom on a still frame to see — the shells are thin and he is small on
+		# screen, so this is the point where more of them stops showing.
+		"fur_scale": 1.6,
 		# ── CPU-side cost (see Section_BeatRunner3d) ──────────────────────
 		"deco_window_ahead_m": 300.0,
 		"deco_update_hz": 60,
 		"world_fx_wisps": 5,
 		"world_fx_spires": true,
 		"city_buildings_per_side": 18,
-		"laser_fixtures": 22,
+		# 879 lights in frame rather than 615, measured at +0.08 ms against a
+		# run-to-run drift of 0.10 — free, within the noise. Spot lights are
+		# the priciest kind in the clustered renderer, but these fade out at
+		# 150 m, so the ones that would cost are the ones already dropped.
+		# Neither this nor the fur changed a still frame by more than the
+		# baseline differs from a repeat of itself, so expect a track that is
+		# more evenly lit in motion, not a transformation.
+		"laser_fixtures": 50,
 		"fur_physics": true,
-		"ambient_light_spacing_m": 20.0,
+		"ambient_light_spacing_m": 10.0,
 		"gem_spacing_m": 32.0,
 		"fx_step_lights": true,
 		"initial_max_fps": 120,
@@ -199,8 +215,29 @@ const PRESETS: Dictionary = {
 ## Convenience accessor for a preset key, with a fallback for older saved
 ## configs / tiers that predate a newly added key.
 func get_setting(key: String, fallback: Variant) -> Variant:
+	if _dev_overrides.has(key):
+		return _dev_overrides[key]
 	var p: Dictionary = PRESETS.get(tier, {})
 	return p.get(key, fallback)
+
+
+## Test seam, for the dev harness only. Several of these knobs are read once
+## while the level builds itself, so sweeping one otherwise means editing the
+## preset and restarting between every reading. Nothing in the game sets these.
+var _dev_overrides: Dictionary = {}
+
+
+func dev_override(key: String, value: Variant) -> void:
+	_dev_overrides[key] = value
+
+
+func dev_clear_overrides() -> void:
+	_dev_overrides.clear()
+
+
+## scale_fur_shells() reads the preset directly, so it needs the seam too.
+func _fur_scale() -> float:
+	return float(_dev_overrides.get("fur_scale", PRESETS[tier].fur_scale))
 
 
 var tier: String = "medium"
@@ -314,14 +351,25 @@ func apply_environment_overrides(env: Environment) -> void:
 		# and depth, not haze that would obscure gameplay-critical gates.
 		env.volumetric_fog_density = 0.02
 		env.volumetric_fog_albedo = Color(0.12, 0.04, 0.25, 1.0)
-		env.volumetric_fog_gi_inject = 0.0   # was 0.4 — stacked with SDFGI, likely a factor in the device-lost crash
+		# GI inject went to 0.0 as part of backing away from the device-lost
+		# crash, when max was also running 2.0x supersampling with 8x MSAA.
+		# That stacking is gone — max renders at 1.0 now, a quarter of the GPU
+		# load — and with it back on the fog takes colour from the neon rather
+		# than greying the scene out. Measured on a frozen frame: 13.5/255 of
+		# change for +0.25 ms, where pushing the fog volume, SDFGI ray count
+		# and light update rate as well bought 0.8/255 more for +2.6 ms.
+		#
+		# Anisotropy is most of that: 0.7 scatters light forward, toward the
+		# camera, so lights ahead bloom through the air instead of lighting it
+		# evenly from all sides.
+		env.volumetric_fog_gi_inject = float(p.get("fog_gi_inject", 0.0))
+		env.volumetric_fog_anisotropy = float(p.get("fog_anisotropy", 0.2))
 
 
 ## Called by BeatRunnerPlayer when it sizes the fur. Never below 8 shells —
 ## so_fluffy's own documented floor for the effect to still read as fur.
 func scale_fur_shells(base_count: int) -> int:
-	var p: Dictionary = PRESETS[tier]
-	return maxi(8, int(round(base_count * float(p.fur_scale))))
+	return maxi(8, int(round(base_count * _fur_scale())))
 
 
 func _save() -> void:

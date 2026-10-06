@@ -39,6 +39,12 @@ func _ready() -> void:
 	var mode: String = args[0] if args.size() > 0 else "verify"
 	var arg: String = args[1] if args.size() > 1 else ""
 	print("-- dev harness: %s --" % mode)
+	# Every frame-time number here is worthless with V-Sync on: the display
+	# caps at 60 Hz, so a frame that really costs 9 ms and one that really
+	# costs 16 ms both measure 16.67, and a change looks free right up until
+	# it pushes past the cap and halves the rate. Engine.max_fps = 0 does not
+	# cover this — that is the engine's own limiter, not the presentation one.
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	_sandbox_save()
 	match mode:
 		"verify":
@@ -59,6 +65,10 @@ func _ready() -> void:
 			await _candidates()
 		"compare":
 			await _compare_looks()
+		"upgrades":
+			await _upgrades()
+		"world":
+			await _world_density()
 		"bake":
 			await _bake()
 		"play":
@@ -611,17 +621,85 @@ func _ablate() -> void:
 const ABLATE_SEED: int = 20251005
 
 
+## Every candidate states ALL of its extra settings, defaults included: these
+## are global RenderingServer state, so a value left unset would simply be
+## whatever the candidate before it happened to leave behind.
+func _gfx_extras(env: Environment, gi: float, aniso: float, fog_vol: int,
+		rays: int, light_frames: int, ss_quality: int, ssr_rough: int) -> void:
+	env.volumetric_fog_gi_inject = gi
+	env.volumetric_fog_anisotropy = aniso
+	RenderingServer.environment_set_volumetric_fog_volume_size(fog_vol, fog_vol)
+	RenderingServer.environment_set_sdfgi_ray_count(rays)
+	RenderingServer.environment_set_sdfgi_frames_to_update_light(light_frames)
+	# half_size off once the quality is raised: that is most of what "high" buys.
+	var half: bool = ss_quality <= RenderingServer.ENV_SSAO_QUALITY_MEDIUM
+	RenderingServer.environment_set_ssao_quality(ss_quality, half, 0.5, 2, 50.0, 300.0)
+	RenderingServer.environment_set_ssil_quality(ss_quality, half, 0.5, 4, 50.0, 300.0)
+	RenderingServer.environment_set_ssr_roughness_quality(ssr_rough)
+
+
+## The shipped values, read from the project rather than remembered. These are
+## global RenderingServer state: a candidate that applies nothing does not run
+## "as shipped", it runs on whatever the candidate before it left behind, which
+## is how a baseline silently becomes a copy of the thing it is measuring.
+func _gfx_defaults(env: Environment) -> void:
+	var ssao_q: int = int(ProjectSettings.get_setting(
+		"rendering/environment/ssao/quality", RenderingServer.ENV_SSAO_QUALITY_MEDIUM))
+	var ssil_q: int = int(ProjectSettings.get_setting(
+		"rendering/environment/ssil/quality", RenderingServer.ENV_SSIL_QUALITY_MEDIUM))
+	env.volumetric_fog_gi_inject = 0.0      # what GraphicsQuality sets up
+	env.volumetric_fog_anisotropy = 0.2     # Godot's own default
+	RenderingServer.environment_set_volumetric_fog_volume_size(
+		int(ProjectSettings.get_setting("rendering/environment/volumetric_fog/volume_size", 64)),
+		int(ProjectSettings.get_setting("rendering/environment/volumetric_fog/volume_depth", 64)))
+	RenderingServer.environment_set_sdfgi_ray_count(int(ProjectSettings.get_setting(
+		"rendering/global_illumination/sdfgi/probe_ray_count",
+		RenderingServer.ENV_SDFGI_RAY_COUNT_32)))
+	RenderingServer.environment_set_sdfgi_frames_to_update_light(
+		int(ProjectSettings.get_setting(
+			"rendering/global_illumination/sdfgi/frames_to_update_lights",
+			RenderingServer.ENV_SDFGI_UPDATE_LIGHT_IN_4_FRAMES)))
+	RenderingServer.environment_set_ssao_quality(ssao_q, bool(ProjectSettings.get_setting(
+		"rendering/environment/ssao/half_size", true)), 0.5, 2, 50.0, 300.0)
+	RenderingServer.environment_set_ssil_quality(ssil_q, bool(ProjectSettings.get_setting(
+		"rendering/environment/ssil/half_size", true)), 0.5, 4, 50.0, 300.0)
+	RenderingServer.environment_set_ssr_roughness_quality(int(ProjectSettings.get_setting(
+		"rendering/environment/screen_space_reflection/roughness_quality",
+		RenderingServer.ENV_SSR_ROUGHNESS_QUALITY_MEDIUM)))
+
+
+## name, preset overrides, extras
+func _gfx_candidates() -> Array:
+	return [
+		["max_now", {}, _gfx_defaults],
+		["fog_gi", {}, func(env: Environment) -> void:
+			_gfx_defaults(env)
+			env.volumetric_fog_gi_inject = 0.4],
+		["fog_gi_aniso", {}, func(env: Environment) -> void:
+			_gfx_defaults(env)
+			env.volumetric_fog_gi_inject = 0.4
+			env.volumetric_fog_anisotropy = 0.7],
+		["fog_all", {}, func(env: Environment) -> void:
+			_gfx_defaults(env)
+			env.volumetric_fog_gi_inject = 0.4
+			env.volumetric_fog_anisotropy = 0.7
+			RenderingServer.environment_set_volumetric_fog_volume_size(128, 128)
+			RenderingServer.environment_set_sdfgi_ray_count(
+				RenderingServer.ENV_SDFGI_RAY_COUNT_96)
+			RenderingServer.environment_set_sdfgi_frames_to_update_light(
+				RenderingServer.ENV_SDFGI_UPDATE_LIGHT_IN_1_FRAME)],
+		# The same thing twice, last: anything this differs from the first run
+		# by is drift — thermal, background load, the track itself — and no
+		# delta smaller than that gap means anything.
+		["max_now_again", {}, _gfx_defaults],
+	]
+
+
 func _candidates() -> void:
 	Engine.max_fps = 0
 	var maxp: Dictionary = GraphicsQuality.PRESETS["max"]
 	print("  level built under tier '%s' (fur and CPU knobs come from there)" % GraphicsQuality.tier)
-	for cand: Array in [
-		["max_stock", {}],
-		["max_tuned", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0, "ssr_steps": 128}],
-		["max_tuned_plus", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0,
-			"ssr_steps": 128, "msaa_3d": Viewport.MSAA_2X,
-			"directional_shadow_size": 4096, "positional_shadow_atlas_size": 2048}],
-	]:
+	for cand: Array in _gfx_candidates():
 		var over: Dictionary = cand[1]
 		_story_context()
 		Run.run_seed = ABLATE_SEED   # same track every candidate, and never recorded
@@ -658,6 +736,7 @@ func _candidates() -> void:
 		env.sdfgi_enabled = bool(g.call("sdfgi"))
 		env.sdfgi_bounce_feedback = float(g.call("sdfgi_bounce"))
 		env.volumetric_fog_enabled = bool(g.call("volumetric_fog"))
+		(cand[2] as Callable).call(env)
 
 		# Same point in the same song for every candidate, so the shots line up.
 		var elapsed: float = 0.0
@@ -704,14 +783,7 @@ func _compare_looks() -> void:
 	for node: Node in _find_section(level).get_children():
 		if node is WorldEnvironment:
 			env = (node as WorldEnvironment).environment
-	for cand: Array in [
-		["max_stock", {}],
-		["max_tuned", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0, "ssr_steps": 128}],
-		["max_tuned_plus", {"scaling_3d_scale": 1.0, "mesh_lod_threshold": 4.0,
-			"ssr_steps": 128, "msaa_3d": Viewport.MSAA_2X,
-			"directional_shadow_size": 4096, "positional_shadow_atlas_size": 2048}],
-		["ultra_for_reference", GraphicsQuality.PRESETS["ultra"]],
-	]:
+	for cand: Array in _gfx_candidates():
 		var over: Dictionary = cand[1]
 		var g := func(key: String) -> Variant: return over.get(key, maxp[key])
 		vp.scaling_3d_scale = float(g.call("scaling_3d_scale"))
@@ -730,6 +802,7 @@ func _compare_looks() -> void:
 		env.sdfgi_enabled = bool(g.call("sdfgi"))
 		env.sdfgi_bounce_feedback = float(g.call("sdfgi_bounce"))
 		env.volumetric_fog_enabled = bool(g.call("volumetric_fog"))
+		(cand[2] as Callable).call(env)
 		# GI and fog need frames to re-converge after a settings change.
 		await _frames(240)
 		get_viewport().get_texture().get_image().save_png(
@@ -738,6 +811,150 @@ func _compare_looks() -> void:
 	get_tree().paused = false
 	_shut_down(level)
 	await _frames(10)
+
+
+## What an improvement to max would COST. The inverse of _ablate(): start from
+## max as it ships and turn ONE thing up, on a frozen scene so the track cannot
+## drift between readings. The numbers are GPU-side only — nothing here changes
+## what the CPU does per frame — and a stopped scene is cheaper in absolute
+## terms than a moving one, so read the deltas, not the totals.
+func _upgrades() -> void:
+	Engine.max_fps = 0
+	_story_context()
+	Run.run_seed = ABLATE_SEED
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	var elapsed: float = 0.0
+	while elapsed < 9.0:
+		await get_tree().process_frame
+		elapsed += get_process_delta_time()
+	get_tree().paused = true
+
+	var env: Environment = null
+	for node: Node in _find_section(level).get_children():
+		if node is WorldEnvironment:
+			env = (node as WorldEnvironment).environment
+	await _frames(120)
+	var base: float = await _measure()
+	print("  max as it ships now      %6.2f ms  (frozen scene)" % base)
+	print("  -- turning one thing up --")
+	for step: Array in [
+		["fog takes GI colour", func() -> void: env.volumetric_fog_gi_inject = 0.4,
+			func() -> void: env.volumetric_fog_gi_inject = 0.0],
+		["fog anisotropy .2 -> .7", func() -> void: env.volumetric_fog_anisotropy = 0.7,
+			func() -> void: env.volumetric_fog_anisotropy = 0.2],
+		["fog volume 64 -> 128", func() -> void:
+			RenderingServer.environment_set_volumetric_fog_volume_size(128, 128),
+			func() -> void:
+				RenderingServer.environment_set_volumetric_fog_volume_size(64, 64)],
+		["SDFGI rays 16 -> 96", func() -> void:
+			RenderingServer.environment_set_sdfgi_ray_count(
+				RenderingServer.ENV_SDFGI_RAY_COUNT_96),
+			func() -> void:
+				RenderingServer.environment_set_sdfgi_ray_count(
+					RenderingServer.ENV_SDFGI_RAY_COUNT_16)],
+		["SDFGI light update 2 -> 1", func() -> void:
+			RenderingServer.environment_set_sdfgi_frames_to_update_light(
+				RenderingServer.ENV_SDFGI_UPDATE_LIGHT_IN_1_FRAME),
+			func() -> void:
+				RenderingServer.environment_set_sdfgi_frames_to_update_light(
+					RenderingServer.ENV_SDFGI_UPDATE_LIGHT_IN_2_FRAMES)],
+		["SSAO quality -> ultra", func() -> void:
+			RenderingServer.environment_set_ssao_quality(
+				RenderingServer.ENV_SSAO_QUALITY_ULTRA, false, 0.5, 2, 50.0, 300.0),
+			func() -> void:
+				RenderingServer.environment_set_ssao_quality(
+					RenderingServer.ENV_SSAO_QUALITY_MEDIUM, true, 0.5, 2, 50.0, 300.0)],
+		["SSIL quality -> ultra", func() -> void:
+			RenderingServer.environment_set_ssil_quality(
+				RenderingServer.ENV_SSIL_QUALITY_ULTRA, false, 0.5, 4, 50.0, 300.0),
+			func() -> void:
+				RenderingServer.environment_set_ssil_quality(
+					RenderingServer.ENV_SSIL_QUALITY_MEDIUM, true, 0.5, 4, 50.0, 300.0)],
+		["SSR roughness -> high", func() -> void:
+			RenderingServer.environment_set_ssr_roughness_quality(
+				RenderingServer.ENV_SSR_ROUGHNESS_QUALITY_HIGH),
+			func() -> void:
+				RenderingServer.environment_set_ssr_roughness_quality(
+					RenderingServer.ENV_SSR_ROUGHNESS_QUALITY_MEDIUM)],
+		["SSR steps 128 -> 256", func() -> void: env.ssr_max_steps = 256,
+			func() -> void: env.ssr_max_steps = 128],
+		["3D scale 1.0 -> 1.25", func() -> void: get_viewport().scaling_3d_scale = 1.25,
+			func() -> void: get_viewport().scaling_3d_scale = 1.0],
+		["mesh LOD 4.0 -> 2.0", func() -> void: get_viewport().mesh_lod_threshold = 2.0,
+			func() -> void: get_viewport().mesh_lod_threshold = 4.0],
+	]:
+		(step[1] as Callable).call()
+		await _frames(150)
+		var ms: float = await _measure()
+		print("  %-26s %6.2f ms   %+6.2f ms" % [step[0], ms, ms - base])
+		(step[2] as Callable).call()
+		await _frames(90)
+	get_tree().paused = false
+	_shut_down(level)
+	await _frames(10)
+
+
+## How much more neon the frame can carry. These knobs are read once while the
+## level builds itself, so each candidate needs its own boot — and each boot is
+## driven to the same PATH DISTANCE before the shot, not the same elapsed time,
+## because a slower candidate covers less ground per second and would otherwise
+## be photographed somewhere else entirely.
+func _world_density() -> void:
+	Engine.max_fps = 0
+	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
+	for cand: Array in [
+		["world_now", {}],
+		["world_lights", {"ambient_light_spacing_m": 14.0, "laser_fixtures": 34}],
+		["world_lights_more", {"ambient_light_spacing_m": 10.0, "laser_fixtures": 50}],
+		["world_fur_mid", {"fur_scale": 1.6}],
+		["world_fur", {"fur_scale": 1.9}],
+		["world_now_again", {}],
+	]:
+		GraphicsQuality.dev_clear_overrides()
+		for key: String in (cand[1] as Dictionary):
+			GraphicsQuality.dev_override(key, (cand[1] as Dictionary)[key])
+		_story_context()
+		Run.run_seed = ABLATE_SEED
+		var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+		add_child(level)
+		await _until_level_ready(level)
+		var section: Node = _find_section(level)
+
+		# The shot comes from the one state every boot genuinely shares: the
+		# moment loading finishes, before anything has moved. Driving to a
+		# fixed distance first does NOT work — the auto-runner takes different
+		# hits in each build, so the same path distance lands at a different
+		# place in the song, and the "difference" being measured is the
+		# scenery, not the setting.
+		await _frames(90)
+		get_tree().paused = true
+		await _frames(30)
+		get_viewport().get_texture().get_image().save_png(
+			"%s/%s.png" % [SHOT_DIR, cand[0]])
+		get_tree().paused = false
+		await _frames(10)
+
+		# Cost, though, wants the track moving under it.
+		while float(section.get("_player_path_dist")) < 300.0:
+			await get_tree().process_frame
+		var ms: float = await _measure()
+		var lights: int = 0
+		var shells: int = 0
+		for node: Node in section.find_children("*", "Light3D", true, false):
+			lights += 1
+		var player: Node = section.get("player")
+		if player != null:
+			shells = GraphicsQuality.scale_fur_shells(int(player.get("fur_shells")))
+		print("  %-16s %6.2f ms (%5.1f fps)   %4d lights   %3d fur shells   %5d draw calls" % [
+			cand[0], ms, 1000.0 / ms, lights, shells,
+			RenderingServer.get_rendering_info(
+				RenderingServer.RENDERING_INFO_TOTAL_DRAW_CALLS_IN_FRAME)])
+		_shut_down(level)
+		await _frames(20)
+	GraphicsQuality.dev_clear_overrides()
+	print("  written to %s" % ProjectSettings.globalize_path(SHOT_DIR))
 
 
 ## Mean frame time over 300 frames, in milliseconds.
