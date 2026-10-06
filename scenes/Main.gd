@@ -355,6 +355,19 @@ func _build_options_panel() -> Control:
 			GameConfig.apply_display_and_audio()
 			_mark_dirty(), s)
 
+	# The setting the epilepsy warning implies. Nothing it changes is load
+	# bearing: gates are read by lane and by shape, never by how hard the world
+	# flashes on the beat.
+	_opt_toggle(vbox, "Reduced Flashing", GameConfig.reduced_flashing,
+		func(on: bool) -> void:
+			GameConfig.reduced_flashing = on
+			_mark_dirty(), s)
+
+	_opt_toggle(vbox, "Show FPS", GameConfig.show_fps,
+		func(on: bool) -> void:
+			GameConfig.show_fps = on
+			_mark_dirty(), s)
+
 	var fps_row := _opt_row(vbox, "Max FPS", s)
 	var fps_opt := OptionButton.new()
 	UiStyle.style_option(fps_opt, s)

@@ -123,7 +123,12 @@ const PRESETS: Dictionary = {
 		# headroom on a strong GPU, not a safe default, which is why it's
 		# opt-in via the Options dropdown rather than something auto-detection
 		# would ever pick on its own.
-		"scaling_3d_scale": 1.2,
+		# 1.0, for the same reason max is: the base viewport is 3840 wide, so the
+		# canvas already carries four times the pixels of a 1080p panel before
+		# any supersampling. At 1.2 this tier rendered 11.9 MP against max's
+		# 8.3 and used MORE video memory than the tier above it — measured
+		# 10.63 ms versus max's 11.50, a ladder only 8% apart at the top.
+		"scaling_3d_scale": 1.0,
 		"msaa_3d": Viewport.MSAA_4X,
 		"screen_space_aa": Viewport.SCREEN_SPACE_AA_FXAA,
 		"ssr": true, "ssr_steps": 64,

@@ -65,6 +65,10 @@ var _s:  float   = 1.0
 var _root: Control = null
 
 # Score / combo
+var _fps_label:    Label     = null
+var _fps_accum:    float     = 0.0
+var _fps_frames:   int       = 0
+
 var _score_group:  Control   = null
 var _score_plate:  ColorRect = null
 var _score_cap:    Label     = null
@@ -172,6 +176,7 @@ func _on_viewport_resized() -> void:
 func _process(delta: float) -> void:
 	_update_score_rainbow(delta)
 	_update_callout(delta)
+	_update_fps(delta)
 
 
 func _refresh_vp() -> void:
@@ -287,6 +292,39 @@ func _build() -> void:
 	_build_flow()
 	_build_wall_jump()
 	_build_lyrics()
+	_build_fps()
+
+
+## A frame-rate readout, off by default. The quality tiers go from 593 fps to
+## 87 on the same machine, and without this the only way to find out whether the
+## tier you picked is one your machine can hold is to feel the judder — which in
+## a rhythm game reads as the game being wrong rather than the setting.
+func _build_fps() -> void:
+	_fps_label = UiStyle.label("", UiStyle.caption(2.0), int(12 * _s), Color.WHITE)
+	_fps_label.self_modulate = Color(0.70, 0.80, 1.00, 0.70)
+	_fps_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	_fps_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_fps_label.visible = false
+	_root.add_child(_fps_label)
+
+
+## Averaged over half a second. An instantaneous readout flickers too much to
+## read, and the number people actually want is "is this holding up".
+func _update_fps(delta: float) -> void:
+	if _fps_label == null:
+		return
+	if not GameConfig.show_fps:
+		if _fps_label.visible:
+			_fps_label.visible = false
+		return
+	_fps_label.visible = true
+	_fps_accum += delta
+	_fps_frames += 1
+	if _fps_accum >= 0.5:
+		var fps: float = float(_fps_frames) / _fps_accum
+		_fps_label.text = "%d FPS   %.1f ms" % [int(round(fps)), _fps_accum / float(_fps_frames) * 1000.0]
+		_fps_accum = 0.0
+		_fps_frames = 0
 
 
 func _build_score() -> void:
@@ -541,6 +579,11 @@ func _layout() -> void:
 		return
 	var s: float = _s
 	var m: float = 20.0 * s
+
+	# Bottom right, clear of the health bar (top left), the score plate (top
+	# right) and the lyrics (bottom centre).
+	if _fps_label != null:
+		_set_rect(_fps_label, _vp.x - m - 170.0 * s, _vp.y - m - 22.0 * s, 170.0 * s, 22.0 * s)
 
 	# ── Score plate, top right ───────────────────────────────────────────────
 	var pw: float = 272.0 * s

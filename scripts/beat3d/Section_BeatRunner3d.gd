@@ -202,18 +202,10 @@ var _gate_animated: Array[bool] = []      # true once the gate's intro tween has
 # so _update_color_cycle can pulse gates without a per-frame recursive tree walk.
 var _gate_cycle_mats: Array[Array] = []
 
-# ── City buildings ────────────────────────────────────────────────────────────
-# One material per BUILDING (all window strips on a building share it) — much
-# cheaper than one material per strip.  One roof light per building.
-var _city_bldg_mats:   Array[StandardMaterial3D] = []
-var _city_bldg_lights: Array[OmniLight3D]         = []
-# Path distance of each roof light, sorted, so the beat pulse can walk only the
-# slice near the player instead of writing light_energy on all of them every
-# tick. (The window materials are shared per palette colour, so those stay a
-# handful of writes and need no window.)
-var _city_bldg_light_pds: PackedFloat32Array = PackedFloat32Array()
-var _city_light_cursor:   int                = 0
-var _city_pulse_t:     float = 0.0   # 0-1, set to 1 on each beat, decays in _process
+## The skyline behind the track — see CityScape. This file owns the beat and
+## tells it when to strike; what the city is made of, and how it answers, is
+## the city's own business.
+var _city: CityScape = null
 var _electric_zones:   Array[Dictionary] = []  # [{start_t, end_t}] seconds; empty = all city
 
 # ── Electric theme ────────────────────────────────────────────────────────────
@@ -227,7 +219,6 @@ var _elec_env_mats:   Array[Material] = []   # pylon tip glows — pulse subtly
 # recording the owning gate index gives a non-decreasing key that can be windowed
 # against gate_world_zs with the same monotonic cursor _update_gate_visibility
 # already uses — no extra path-distance bookkeeping needed.
-var _elec_arc_cursor:   int                = 0
 # Pylon ambient lights are spawned separately, in increasing path order, so they
 # get their own array + path distances rather than being mixed into the above.
 var _elec_pylon_lights: Array[OmniLight3D]  = []
@@ -235,6 +226,50 @@ var _elec_pylon_pds:    PackedFloat32Array  = PackedFloat32Array()
 var _elec_pylon_cursor: int                 = 0
 var _elec_pulse_t:    float = 0.0   # 0-1, set to 1 on each beat, decays in _process
 var _elec_flicker_t:  float = 0.0   # cooldown between ambient flickers in electric zones
+
+## An electric zone is a blackout. The overhead lights in it are switched off,
+## the world's ambient term falls away, and the only thing lighting the track is
+## the gates — which burn brighter, throw further, flicker, and drift on their
+## mounts. The zone already paid double; this is what it pays double FOR.
+##
+## 0 = lit, 1 = dark. Ramped from the player's own position so walking in and
+## out is a fade, while the lights themselves switch on their own path distance
+## so the dark stretch is visible from outside it.
+var _elec_dark: float = 0.0
+## The overhead lights, with their path distances, so only the slice near the
+## player is ever written to — same monotonic cursor as every other light list.
+var _ambient_lights: Array[SpotLight3D]   = []
+var _ambient_pds:    PackedFloat32Array   = PackedFloat32Array()
+var _ambient_cursor: int                  = 0
+## Held so the ambient term can be faded; _setup_world_environment() builds it.
+var _world_env: Environment = null
+
+## How fast the lights go out, per second. A snap reads as a bug.
+const _ELEC_DARK_RATE: float = 2.2
+## What is left of an overhead light inside the dark. Not zero: the floor still
+## has to be legible enough to aim at, and the lane dashes are self-lit anyway.
+const _ELEC_AMBIENT_FLOOR: float = 0.10
+## Ambient term inside the dark, against 0.18 outside it.
+const _ELEC_AMBIENT_ENV: float = 0.03
+## How much of the world's own emission survives in the dark. Everything that
+## is not a gate reads from this: the floor, the track kit, the lightposts, the
+## rails, the gems, the arches, the pads, the airborne sparks, the skyline and
+## the zone's own pylons. Not quite zero — at exactly zero the floor stops
+## existing and the gates hang in a void with nothing to judge their distance
+## against, which reads as broken rather than dark.
+const _ELEC_WORLD_GLOW: float = 0.05
+## The sky and the fog behind everything. Separate from the world glow because
+## this is what decides whether the zone reads as a dark room or as a lit one
+## with the lamps off.
+const _ELEC_SKY_GLOW: float = 0.06
+## How much harder a gate burns when it is the only light in the room.
+const _ELEC_GATE_GAIN: float = 5.0
+## ...and how far it throws, in metres.
+const _ELEC_GATE_RANGE: float = 16.0
+## Visual drift, in metres. On VisRoot, never on the gate root: the judge Area3D
+## stays exactly where the chart put it, so a drifting gate is a thing to look
+## at and not a thing that moves the hit out from under the player.
+const _ELEC_SWAY_M: float = 0.16
 # Shared mesh resources — all arc segments + pylon parts reuse these so the
 # renderer can GPU-instance them instead of issuing one draw call per node.
 var _pylon_pole_mesh:  BoxMesh    = null
@@ -340,7 +375,7 @@ var _fx_pool: WorldFxPool = null
 var _wj_zone_start_z:    float = -INF
 var _wj_zone_end_z:      float = -INF
 # Path distance where the ground floor resumes after the WJ descent platforms.
-# Set by _spawn_wall_jump_section; used by _spawn_path_floors to skip only the
+# Set by _spawn_wj_geometry_on_path; used by _spawn_path_floors to skip only the
 # void rather than all segments past _floor_cutoff_dist.  -1 = no WJ section.
 var _wj_ground_resume_z: float = -1.0
 # The single descent ramp back down to track level after a wall-jump climb.
@@ -514,6 +549,12 @@ var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
 var _grind_rail_mats:    Array[Material] = []   # colored by GameConfig.level_color_rail, cycle-overridable
+## Authored emission of each rail, so the blackout can scale it down and the
+## normal case can put it back exactly rather than guessing at a default.
+var _grind_rail_base_e:  Array[float]    = []
+## The floor grid's one shared material. It is a big emissive surface that
+## nothing wrote to after it was built, so in the dark it stayed lit.
+var _floor_grid_mat: StandardMaterial3D = null
 
 # Spark nodes for the active segment (rebuilt on each segment entry)
 var _spark_nodes:       Array[Node3D] = []
@@ -725,7 +766,9 @@ func _ready() -> void:
 	_spawn_floor_grid()
 
 	await _loading_step("Building the city…", 0.90)
-	_spawn_city_buildings()
+	_city = CityScape.new()
+	_city.build(world_fx_root, _piece_lib, _song_end_z(), _track_full_width(),
+		_path_world_pos, _path_y_rot_at, _z_is_electric)
 	if not _electric_zones.is_empty():
 		_spawn_electric_environment()
 
@@ -887,7 +930,11 @@ func _process(delta: float) -> void:
 	# City / electric pulse decay runs even when paused so lights don't freeze mid-flash
 	var dt_pulse: float = _visual_tick(_TICK_PULSE, delta)
 	if dt_pulse > 0.0:
-		_update_city_pulse(dt_pulse)
+		if _city != null:
+			_city.pulse(dt_pulse, _world_vitality, _runner_avg_beat_s,
+				_player_path_dist, _DECO_WINDOW_BEHIND_M, _deco_window_ahead_m,
+				lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark))
+		_update_electric_dark(dt_pulse, t_s)
 		_update_electric_pulse(dt_pulse, t_s)
 
 	# Beat phase decays quickly (full fade in ~0.28 s) — drives beat-sync brightness spikes
@@ -926,7 +973,7 @@ func _process(delta: float) -> void:
 	# the music even if the frame rate moves.
 	if _laser_rig != null:
 		_laser_rig.advance(_player_path_dist)
-		_laser_rig.tick(t_s, _beat_phase)
+		_laser_rig.tick(t_s, _beat_phase * GameConfig.flash_scale())
 
 	# slow palette drift. (Was guarded by has_method("_update_color_cycle") — a
 	# String-to-StringName conversion plus a method-table lookup every frame, for a
@@ -3361,8 +3408,8 @@ func _build_all_gate_visuals() -> void:
 		kinds_seen[kind] = true
 		_build_gate_body(i)
 
-	# WJ geometry is now spawned path-aware in _spawn_wj_geometry_on_path() after
-	# _build_track_path(), so _spawn_section_geometry() is no longer called here.
+	# Wall-jump geometry is spawned path-aware by _spawn_wj_geometry_on_path(),
+	# after _build_track_path() — not from here.
 
 ## A gate with nothing in it yet: where it stands, what judges it, and an empty
 ## VisRoot for the geometry to arrive in later. A few nodes, and cheap.
@@ -3521,7 +3568,7 @@ func _register_track_emissives(node: Node) -> void:
 
 
 ## Like _register_track_emissives, but the unique material duplicates go into a
-## caller-chosen pulse list (_world_pad_mats, _city_bldg_mats, _world_rail_mats, …)
+## caller-chosen pulse list (_world_pad_mats, _world_rail_mats, …)
 ## so authored deco pieces pulse with the same beat driver as their procedural
 ## counterparts. Only emission ENERGY is driven — colours stay yours.
 func _register_piece_emissives(node: Node, into: Array) -> void:
@@ -3774,6 +3821,39 @@ func _spawn_electric_environment() -> void:
 
 # ── Electric pulse decay ──────────────────────────────────────────────────────
 # Mirrors _update_city_pulse; drives obstacle arcs hard and env tips subtly.
+## The blackout itself: how dark it is around the player, which overhead lights
+## are switched off, and how much ambient the world still has. Separate from
+## _update_electric_pulse because that one returns early when there is no beat
+## left to decay, and the dark has to hold between beats — that is the point.
+func _update_electric_dark(delta: float, t_s: float) -> void:
+	var want: float = 1.0 if _is_electric_at(t_s) else 0.0
+	_elec_dark = move_toward(_elec_dark, want, delta * _ELEC_DARK_RATE)
+
+	if _world_env != null:
+		_world_env.ambient_light_energy = lerpf(0.18, _ELEC_AMBIENT_ENV, _elec_dark)
+		# The sky and the fog are most of what is left once the lamps are out.
+		# A sweep of the zone with each group of the level hidden in turn put
+		# the frame at 140/255 average with everything visible, and hiding
+		# every object in it still left the background glowing — because the
+		# background is not an object. These two are.
+		_world_env.background_energy_multiplier = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
+		_world_env.fog_light_energy = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
+
+	# The lights switch on their OWN path distance, not the player's, so the
+	# dark stretch is something you can see coming rather than something that
+	# falls on you once you are already in it.
+	var pd: float = _player_path_dist
+	var lo: float = pd - _DECO_WINDOW_BEHIND_M
+	var hi: float = pd + _deco_window_ahead_m
+	while _ambient_cursor < _ambient_pds.size() and _ambient_pds[_ambient_cursor] < lo:
+		_ambient_cursor += 1
+	for i in range(_ambient_cursor, _ambient_lights.size()):
+		if i >= _ambient_pds.size() or _ambient_pds[i] > hi:
+			break
+		_ambient_lights[i].light_energy = 2.2 * (
+			_ELEC_AMBIENT_FLOOR if _z_is_electric(_ambient_pds[i]) else 1.0)
+
+
 func _update_electric_pulse(delta: float, t_s: float) -> void:
 	# Ambient danger flicker — small random spikes between beats in electric zones
 	_elec_flicker_t = maxf(0.0, _elec_flicker_t - delta)
@@ -3781,7 +3861,10 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 		_elec_flicker_t = randf_range(0.15, 0.55)
 		_elec_pulse_t   = randf_range(0.06, 0.20)
 
-	if _elec_pulse_t <= 0.0:
+	# In the dark this has to keep running between beats: the gates are the only
+	# light source left, and a flicker that only updates while a beat is still
+	# decaying is a light that freezes solid for most of the zone.
+	if _elec_pulse_t <= 0.0 and _elec_dark <= 0.001:
 		return
 	var beat_s: float = max(0.18, _runner_avg_beat_s)
 	_elec_pulse_t = maxf(0.0, _elec_pulse_t - delta / (beat_s * 0.55))
@@ -3793,7 +3876,10 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 	# Environment tip glows: subtle pulse
 	var env_peak: float = lerpf(1.5, 3.0, vit)
 	var env_base: float = lerpf(0.6, 1.2, vit)
-	var env_e:    float = lerpf(env_base, env_peak, _elec_pulse_t)
+	# Scenery, not gates: the pylons go dark with the rest of the room. Only the
+	# thing the player has to navigate is allowed to stay lit.
+	var world_mul: float = lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark)
+	var env_e:    float = lerpf(env_base, env_peak, _elec_pulse_t) * world_mul
 	for mat in _elec_env_mats:
 		NeonMat.set_energy(mat, env_e)
 
@@ -3810,22 +3896,37 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 	var hi:  float = pd + _deco_window_ahead_m
 
 	# Gate arc sparks — keyed by the owning gate's path distance.
-	while _elec_arc_cursor < _looks.arc_gate_idx.size():
-		var gi0: int = _looks.arc_gate_idx[_elec_arc_cursor]
-		if gi0 >= 0 and gi0 < gate_world_zs.size() and gate_world_zs[gi0] < lo:
-			_elec_arc_cursor += 1
-		else:
-			break
-	for i in range(_elec_arc_cursor, _looks.arc_lights.size()):
+	#
+	# Walked in full rather than from a monotonic cursor. The cursor-and-break
+	# that used to be here assumed arc_gate_idx rose with gate distance, and it
+	# does not: gates build lazily as the player approaches them, plus a few
+	# built up front to warm the shaders, so the arcs land in the list in
+	# whatever order they happened to be made. The break then stopped at the
+	# first entry past the window — in practice within the first handful — and
+	# every arc light after it kept whatever energy it was created with. The
+	# list is a few hundred entries at most; walking all of it costs nothing
+	# next to being wrong.
+	for i in _looks.arc_lights.size():
 		if i >= _looks.arc_gate_idx.size():
 			break
 		var gi: int = _looks.arc_gate_idx[i]
 		if gi >= 0 and gi < gate_world_zs.size():
-			if gate_world_zs[gi] > hi:
-				break
+			if gate_world_zs[gi] < lo or gate_world_zs[gi] > hi:
+				continue
 		var lt: OmniLight3D = _looks.arc_lights[i]
 		if lt != null and is_instance_valid(lt):
-			lt.light_energy = lt_e
+			if _elec_dark <= 0.001:
+				lt.light_energy = lt_e
+			else:
+				# Two sines at odds with each other: a fast rattle and a slower
+				# swell, offset per light so neighbouring gates never flicker
+				# in unison. Damped by the photosensitivity setting, because a
+				# strobing light source is exactly what that setting is for.
+				var fl: float = 0.70 					+ 0.30 * sin(t_s * (13.0 + float(i % 5) * 2.7) + float(i) * 1.9) 					* (0.55 + 0.45 * sin(t_s * 1.7 + float(i) * 0.6))
+				fl = lerpf(1.0, fl, GameConfig.flash_scale())
+				lt.light_energy = lerpf(lt_e, lt_e + _ELEC_GATE_GAIN * fl, _elec_dark)
+				lt.omni_range = lerpf(lt.omni_range, _ELEC_GATE_RANGE, 0.15)
+			_sway_electric_gate(gi, t_s, i)
 
 	# Pylon ambient lights — already in increasing path order.
 	while _elec_pylon_cursor < _elec_pylon_pds.size() \
@@ -3834,7 +3935,31 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 	for i in range(_elec_pylon_cursor, _elec_pylon_lights.size()):
 		if i >= _elec_pylon_pds.size() or _elec_pylon_pds[i] > hi:
 			break
-		_elec_pylon_lights[i].light_energy = lt_e
+		_elec_pylon_lights[i].light_energy = lt_e * world_mul
+
+
+## A loose mounting, not a moving target. This rides VisRoot, which exists so
+## the spawn animation can scale the meshes without touching the judge Area3D —
+## so the gate the player has to hit stays exactly where the chart put it while
+## the thing they are looking at drifts on its own.
+func _sway_electric_gate(gate_index: int, t_s: float, seed_i: int) -> void:
+	if gate_index < 0 or gate_index >= gate_nodes.size():
+		return
+	var gate: Node3D = gate_nodes[gate_index]
+	if gate == null or not is_instance_valid(gate):
+		return
+	var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
+	if vis == null:
+		return
+	if _elec_dark <= 0.001:
+		if vis.position != Vector3.ZERO:
+			vis.position = Vector3.ZERO
+		return
+	var a: float = _ELEC_SWAY_M * _elec_dark
+	vis.position = Vector3(
+		sin(t_s * 2.3 + float(seed_i) * 1.3) * a,
+		sin(t_s * 3.1 + float(seed_i) * 2.1) * a * 0.55,
+		0.0)
 
 
 # ── Electric zone helpers ──────────────────────────────────────────────────────
@@ -3870,38 +3995,6 @@ func _last_event_t() -> float:
 ## player cannot reach the end of the geometry; it is not part of the song.
 func _song_end_z() -> float:
 	return max(_last_event_t(), 1.0) * player.forward_speed + 500.0
-
-
-func _spawn_section_geometry() -> void:
-	if runner_plan.is_empty():
-		return
-
-	# Group runner_plan entries by phrase_index
-	var phrases: Dictionary = {}
-	for entry in runner_plan:
-		var pi: int = int(entry.get("phrase_index", -1))
-		if pi < 0:
-			continue
-		if not phrases.has(pi):
-			phrases[pi] = []
-		(phrases[pi] as Array).append(entry)
-
-	var wj_sections_spawned: int = 0
-	var max_wj_sections:     int = 1   # one wall-jump section per song
-
-	for pi in phrases.keys():
-		if wj_sections_spawned >= max_wj_sections:
-			break
-		var phrase_entries: Array = phrases[pi]
-		if phrase_entries.is_empty():
-			continue
-		var stag: String = String(phrase_entries[0].get("section_tag", ""))
-		if stag != "wall_jump":
-			continue
-		_spawn_wall_jump_section(phrase_entries)
-		wj_sections_spawned += 1
-
-
 # ── Wall jump physics validation ───────────────────────────────────────────────
 # Returns {"feasible", "beats_per_jump", "gap_t", "gap_z", "step_height",
 #          "step_heights", "active_times"}.
@@ -3976,383 +4069,6 @@ func _validate_wall_jump_feasibility(wj_gate_times: Array[float]) -> Dictionary:
 		}
 
 	return {"feasible": false}
-
-
-# ── Wall jump section spawner ───────────────────────────────────────────────────
-# Spawns the full wall-jump sub-level:
-#   • Corridor side walls (visual only, rising height)
-#   • Ledge platforms at each gate Z, at i × step_height (no floor between them → void)
-#   • Gate visuals repositioned to sit on their ledge
-#   • Elevated floor from the final landing point onward
-#   • Descent ramp + new ground floor after the elevated section
-
-func _spawn_wall_jump_section(phrase_entries: Array) -> void:
-	# ── 1. Collect actual wall_left / wall_right gates ─────────────────────────
-	var wj_times: Array[float]  = []
-	var wj_zs:    Array[float]  = []
-	var wj_acts:  Array[String] = []
-	for e in phrase_entries:
-		var act: String = String(e.get("action", ""))
-		if act == "wall_left" or act == "wall_right":
-			var t: float = float(e.get("t", 0.0))
-			wj_times.append(t)
-			wj_zs.append(t * player.forward_speed)
-			wj_acts.append(act)
-	if wj_zs.is_empty():
-		return
-
-	# Keep parallel time + Z + action arrays sorted together
-	var order: Array[int] = []
-	for i in range(wj_times.size()): order.append(i)
-	order.sort_custom(func(a: int, b: int) -> bool: return wj_times[a] < wj_times[b])
-	var sorted_times: Array[float]  = []
-	var sorted_zs:    Array[float]  = []
-	var sorted_acts:  Array[String] = []
-	for idx in order:
-		sorted_times.append(wj_times[idx])
-		sorted_zs.append(wj_zs[idx])
-		sorted_acts.append(wj_acts[idx])
-
-	# ── 2. Physics feasibility check ───────────────────────────────────────────
-	var phys: Dictionary = _validate_wall_jump_feasibility(sorted_times)
-	if not bool(phys.get("feasible", false)):
-		push_warning("[BeatRunner] Wall jump section not feasible — hiding bare gates to avoid visual mess.")
-		# Hide and pre-judge all WJ gates in this phrase so they don't appear or score as misses.
-		for gi in range(gate_nodes.size()):
-			if gate_world_zs[gi] >= sorted_zs[0] - 1.0 and gate_world_zs[gi] <= sorted_zs[sorted_zs.size() - 1] + 1.0:
-				gate_nodes[gi].visible = false
-				gate_nodes[gi].process_mode = Node.PROCESS_MODE_DISABLED
-				if gi < gate_judged.size():
-					gate_judged[gi] = true
-					gate_success[gi] = true
-		return
-
-	var beats_per_jump: int     = int(phys.get("beats_per_jump", 1))
-	var gap_z: float            = float(phys.get("gap_z", 10.0))
-	var raw_step_heights: Array = phys.get("step_heights", [])
-
-	# Active gate Z positions + actions — thin by beats_per_jump
-	var active_zs:   Array[float]  = []
-	var active_acts: Array[String] = []
-	for i in range(0, sorted_zs.size(), beats_per_jump):
-		active_zs.append(sorted_zs[i])
-		active_acts.append(sorted_acts[i])
-
-	# Enforce strict alternation: thinning by an even beats_per_jump can produce
-	# runs of the same action (e.g. wall_left, wall_left, …).  Flip any duplicate
-	# so platforms always alternate sides.
-	for i in range(1, active_acts.size()):
-		if active_acts[i] == active_acts[i - 1]:
-			active_acts[i] = "wall_right" if active_acts[i] == "wall_left" else "wall_left"
-
-	if active_zs.size() < 2:
-		push_warning("[BeatRunner] Too few active gates after thinning — hiding bare gates.")
-		for gi in range(gate_nodes.size()):
-			if gate_world_zs[gi] >= sorted_zs[0] - 1.0 and gate_world_zs[gi] <= sorted_zs[sorted_zs.size() - 1] + 1.0:
-				gate_nodes[gi].visible = false
-				gate_nodes[gi].process_mode = Node.PROCESS_MODE_DISABLED
-				if gi < gate_judged.size():
-					gate_judged[gi] = true
-					gate_success[gi] = true
-		return
-
-	var n_jumps: int = active_zs.size()
-
-	# Build cumulative ledge heights from the per-pair step_heights.
-	# cum_heights[i] = height of ledge i after i jumps from the ground.
-	# step_heights has (n_jumps - 1) entries (one per consecutive pair of active gates).
-	# The final jump (from the last active gate to the elevated floor) reuses the last
-	# known step height as a safe estimate.
-	var cum_heights: Array[float] = []
-	cum_heights.append(0.0)   # ledge 0 = ground level
-	var fallback_step: float = float(phys.get("step_height", 1.0))
-	for i in range(n_jumps - 1):
-		var sh: float = float(raw_step_heights[i]) if i < raw_step_heights.size() else fallback_step
-		cum_heights.append(cum_heights[cum_heights.size() - 1] + sh)
-	# total_height = height of the elevated floor = height of ledge (n_jumps-1) + one more jump
-	var last_step: float = float(raw_step_heights[raw_step_heights.size() - 1]) \
-		if not raw_step_heights.is_empty() else fallback_step
-	var total_height: float = cum_heights[cum_heights.size() - 1] + last_step
-
-	# Ledge depth = 85 % of the Z-gap so adjacent ledges never overlap,
-	# and always at least 3 m so landings feel generous.
-	var ledge_half_z: float  = clamp(gap_z * 0.425, 3.0, 6.5)
-	var ledge_thick: float   = 0.30
-	var tw: float            = _track_full_width()
-
-	# ── 3. Corridor walls — visual only, thin emissive slabs rising with the climb ──
-	var z_section_start: float = active_zs[0] - 8.0
-
-	# Cut the main floor just before the first wall jump gate — not at the
-	# corridor entrance.  This gives the player full-width solid ground during
-	# the approach so setup lane-move gates can be executed safely.
-	_resize_floor_to(max(10.0, active_zs[0] - 1.0))
-	var z_section_end:   float = active_zs[active_zs.size() - 1] + gap_z + ledge_half_z + 4.0
-	var corridor_len:    float = z_section_end - z_section_start
-	var wall_thick:      float = 0.18
-	var wall_cx_abs:     float = tw * 0.5 + wall_thick * 0.5
-	var purple:          Color = Color(0.0, 0.672, 0.79, 1.0).darkened(0.22)
-	var num_segs:        int   = 14
-	var seg_z_len:       float = corridor_len / float(num_segs)
-
-	for seg in range(num_segs):
-		var t: float      = float(seg) / float(max(num_segs - 1, 1))
-		var seg_h: float  = lerpf(lane_blocker_height * 1.1, total_height + 4.0, t)
-		var seg_zc: float = z_section_start + (float(seg) + 0.5) * seg_z_len
-		for side in [-1, 1]:
-			var sr: Node3D = Node3D.new()
-			sr.position = Vector3(side * wall_cx_abs, 0.0, seg_zc)
-			gates_root.add_child(sr)
-			var wm: MeshInstance3D = _pieces.box_mesh(
-				Vector3(wall_thick, seg_h, seg_z_len * 0.97), purple)
-			wm.position = Vector3(0.0, seg_h * 0.5, 0.0)
-			sr.add_child(wm)
-
-	# ── 3c. Entrance arch — two tall glowing pillars + crossbeam at corridor mouth ──
-	# Visible from several beats away, this is the player's first "wall jump incoming" cue.
-	var arch_z:     float = z_section_start - 1.5
-	var arch_col:   Color = Color(1.00, 0.60, 0.05, 1.0)   # vivid orange — unmissable
-	var pillar_h:   float = total_height + 5.5
-	var pillar_w:   float = 0.55
-	for side in [-1, 1]:
-		var px: float = side * (tw * 0.5 + pillar_w * 0.5 + 0.08)
-		var pillar: MeshInstance3D = _pieces.box_mesh(
-			Vector3(pillar_w, pillar_h, pillar_w), arch_col)
-		pillar.position = Vector3(px, pillar_h * 0.5, arch_z)
-		var pm: StandardMaterial3D = pillar.material_override as StandardMaterial3D
-		if pm != null: pm.emission_energy_multiplier = 5.0
-		gates_root.add_child(pillar)
-
-	# Horizontal crossbeam connecting the two pillars
-	var beam: MeshInstance3D = _pieces.box_mesh(
-		Vector3(tw + pillar_w * 2.0 + 0.16, 0.45, pillar_w), arch_col.lightened(0.20))
-	beam.position = Vector3(0.0, pillar_h, arch_z)
-	var bm2: StandardMaterial3D = beam.material_override as StandardMaterial3D
-	if bm2 != null: bm2.emission_energy_multiplier = 5.5
-	gates_root.add_child(beam)
-
-	# Bright OmniLight inside the arch so it casts colour on approach
-	var arch_light := OmniLight3D.new()
-	arch_light.light_color  = arch_col.lightened(0.30)
-	arch_light.light_energy = 5.0
-	arch_light.omni_range   = 22.0
-	arch_light.position     = Vector3(0.0, pillar_h * 0.5, arch_z)
-	gates_root.add_child(arch_light)
-
-	# ── 3b. Approach floor — narrow single-lane platform from corridor entrance to just
-	# past the first WJ gate. Placed at the starting side so the player has a clear
-	# lane to stand on when executing the first wall jump.
-	# first action == wall_left  → player starts at left  (lane 0)
-	# first action == wall_right → player starts at right (lane max)
-	var approach_len:   float = active_zs[0] + 1.0 - z_section_start
-	var approach_thick: float = 0.30
-	var approach_w:     float = 2.8    # one lane wide
-	var first_act:      String = active_acts[0]
-	var max_lane_app:   int    = player.lane_xs.size() - 1
-	var approach_lane:  int    = 0 if first_act == "wall_left" else max_lane_app
-	var approach_x:     float  = player.lane_xs[approach_lane]
-
-	var approach_body: StaticBody3D = StaticBody3D.new()
-	approach_body.position = Vector3(approach_x, -approach_thick * 0.5,
-									 z_section_start + approach_len * 0.5)
-	gates_root.add_child(approach_body)
-	var ac: CollisionShape3D = CollisionShape3D.new()
-	var ab: BoxShape3D = BoxShape3D.new()
-	ab.size = Vector3(approach_w, approach_thick, approach_len)
-	ac.shape = ab
-	approach_body.add_child(ac)
-	approach_body.add_child(_pieces.box_mesh(
-		Vector3(approach_w, approach_thick, approach_len), Color(0.862, 0.427, 0.817, 1.0)))
-
-	# ── 4. Ledges — single-lane platforms at landing side, per-pair cumulative heights ──
-	# cum_heights[i] = height player reaches after i jumps (ledge 0 = ground, no spawn).
-	# Each ledge sits at the lane the player snaps to after the preceding jump:
-	#   wall_left  (gate i-1) → player snaps right → ledge at lane_xs[max_lane]
-	#   wall_right (gate i-1) → player snaps left  → ledge at lane_xs[0]
-	var ledge_color:   Color = Color(0.65, 0.15, 1.00, 1.0)
-	var ledge_w:       float = 2.8          # one lane wide (slightly generous)
-	var max_lane_idx:  int   = player.lane_xs.size() - 1
-
-	for i in range(1, n_jumps):
-		var lz: float  = active_zs[i]
-		var lh: float  = cum_heights[i]
-		var lcy: float = lh - ledge_thick * 0.5   # box centre just below top surface
-
-		# Determine landing lane from the PREVIOUS jump's action
-		var prev_act: String  = active_acts[i - 1]
-		var land_idx:  int    = max_lane_idx if prev_act == "wall_left" else 0
-		var lx:        float  = player.lane_xs[land_idx]
-
-		var ledge: StaticBody3D = StaticBody3D.new()
-		ledge.position = Vector3(lx, lcy, lz)
-		gates_root.add_child(ledge)
-
-		var lc: CollisionShape3D = CollisionShape3D.new()
-		var lb: BoxShape3D = BoxShape3D.new()
-		lb.size = Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0)
-		lc.shape = lb
-		ledge.add_child(lc)
-		var lm: MeshInstance3D = _pieces.box_mesh(
-			Vector3(ledge_w, ledge_thick, ledge_half_z * 2.0),
-			ledge_color.lerp(Color(1, 1, 1, 1), float(i) / float(max(n_jumps, 1)) * 0.3))
-		var lmat: StandardMaterial3D = lm.material_override as StandardMaterial3D
-		if lmat != null:
-			lmat.emission_energy_multiplier = 2.5 + float(i) * 0.4
-		ledge.add_child(lm)
-
-		# Small light above each ledge so the platform glows from below
-		var ledge_light := OmniLight3D.new()
-		ledge_light.light_color  = ledge_color.lightened(0.30)
-		ledge_light.light_energy = 1.8
-		ledge_light.omni_range   = 8.0
-		ledge_light.position     = Vector3(lx, lh + 0.5, lz)
-		gates_root.add_child(ledge_light)
-
-	# ── 5. Lift gate visuals to match their exact cumulative ledge height ────────
-	for j in range(active_zs.size()):
-		var target_z: float = active_zs[j]
-		var lift_y:   float = cum_heights[j]
-		for gi in range(gate_nodes.size()):
-			if abs(gate_world_zs[gi] - target_z) < 1.5:
-				gate_nodes[gi].position.y += lift_y
-				break
-
-	# ── 6. Elevated floor — flush in Z and height with the last ledge ───────────
-	# Z: start exactly at the trailing edge of the last ledge (no horizontal gap).
-	# Height: match the last ledge top exactly — total_height was one step_height
-	# (0.55 m) above the last ledge, which created a visible step the player caught.
-	var elev_start_z: float = active_zs[active_zs.size() - 1] + ledge_half_z
-	var elev_height:  float = cum_heights[active_zs.size() - 1]
-	var elev_length:  float = 18.0
-	_spawn_floor_segment(elev_start_z, elev_length, elev_height,
-						 Color(0.70, 0.22, 0.95, 1.0).darkened(0.15))
-
-	# Side rails along the elevated path (visual only)
-	for side in [-1, 1]:
-		var rail: Node3D = Node3D.new()
-		rail.position = Vector3(side * tw * 0.5,
-								elev_height + 0.45,
-								elev_start_z + elev_length * 0.5)
-		gates_root.add_child(rail)
-		rail.add_child(_pieces.box_mesh(
-			Vector3(0.07, 0.07, elev_length),
-			Color(0.85, 0.45, 1.00, 1.0).lightened(0.20)))
-
-	# ── 7. Descent platforms — single-lane stepping stones back to ground ────────
-	var descent_step_h: float = 1.5
-	# One platform per beat, so the descent feels rhythmic at any BPM.
-	# clamp keeps it playable from very slow (~60 BPM) to very fast (~200 BPM).
-	var beat_z:         float = _runner_avg_beat_s * player.forward_speed
-	var descent_step_z: float = clamp(beat_z, 5.0, 12.0)
-	var plat_w:         float = 2.4
-	var plat_d:         float = clamp(descent_step_z * 0.60, 3.5, 7.0)
-	var plat_thick:     float = 0.28
-	var lane_colors:    Array[Color] = [
-		Color(1.0, 0.35, 0.65, 1.0),   # left  = pink
-		Color(0.95, 0.95, 0.95, 1.0),  # mid   = white
-		Color(0.30, 0.65, 1.00, 1.0),  # right = blue
-	]
-	var n_descent: int = int(ceil(elev_height / descent_step_h)) + 1
-	var desc_z_start: float = elev_start_z + elev_length + 4.0
-	var last_descent_z: float = desc_z_start  # tracks actual last platform Z
-
-	# Landing lane: the last wall-jump action determines which side the player
-	# snaps to.  wall_left bounces to the right edge; wall_right to the left.
-	var last_wj_act: String = active_acts[active_acts.size() - 1]
-	var cur_desc_lane: int  = max_lane_idx if last_wj_act == "wall_left" else 0
-
-	for di in range(n_descent):
-		var dh: float = max(0.0, elev_height - float(di + 1) * descent_step_h)
-		var lane_idx: int = cur_desc_lane
-		var dx:   float = player.lane_xs[lane_idx]
-		var dz:   float = desc_z_start + float(di) * descent_step_z
-		var dcy:  float = dh - plat_thick * 0.5
-
-		# Randomise next platform lane: step ±1 or stay, clamped to valid range.
-		# Done before the platform is placed so the last platform doesn't advance.
-		if di < n_descent - 1:
-			var step: int = _runner_rng.randi_range(-1, 1)
-			cur_desc_lane = clamp(cur_desc_lane + step, 0, max_lane_idx)
-
-		last_descent_z = dz
-
-		var dp: StaticBody3D = StaticBody3D.new()
-		dp.position = Vector3(dx, dcy, dz)
-		gates_root.add_child(dp)
-
-		var dc: CollisionShape3D = CollisionShape3D.new()
-		var db: BoxShape3D = BoxShape3D.new()
-		db.size = Vector3(plat_w, plat_thick, plat_d)
-		dc.shape = db
-		dp.add_child(dc)
-
-		var dm: MeshInstance3D = _pieces.box_mesh(
-			Vector3(plat_w, plat_thick, plat_d), lane_colors[lane_idx])
-		var dmat: StandardMaterial3D = dm.material_override as StandardMaterial3D
-		if dmat != null:
-			dmat.emission_enabled = true
-			dmat.emission = lane_colors[lane_idx]
-			dmat.emission_energy_multiplier = 1.6
-		dp.add_child(dm)
-
-		# Small light under each descent platform
-		var dlight := OmniLight3D.new()
-		dlight.light_color  = lane_colors[lane_idx].lightened(0.25)
-		dlight.light_energy = 1.2
-		dlight.omni_range   = 5.0
-		dlight.position     = Vector3(dx, dh + 0.4, dz)
-		gates_root.add_child(dlight)
-
-		if dh <= 0.0:
-			break
-
-	# ── Gate culling for the entire WJ section ────────────────────────────────
-	# Approach zone (z_section_start → first WJ gate):
-	#   Keep ALL gates — setup lane-move gates here guide the player to the
-	#   approach lane.  The floor is still solid here so they're safe to hit.
-	# Climbing void (first WJ gate → elev_start_z):
-	#   Only wall-jump gates stay visible; everything else floats in void.
-	# Elevated floor + descent (elev_start_z → desc_zone_end):
-	#   All gates hidden — platforms carry the rhythm there.
-	var first_wj_z:    float = active_zs[0]
-	var desc_zone_end: float = last_descent_z + plat_d * 0.5
-	for gi in range(gate_nodes.size()):
-		var gz:    float  = gate_world_zs[gi]
-		var act:   String = String(runner_plan[gi].get("action", ""))
-		var is_wj: bool   = act == "wall_left" or act == "wall_right"
-
-		var should_cull: bool = false
-		if gz >= z_section_start and gz < first_wj_z:
-			should_cull = false           # approach zone — keep setup gates visible
-		elif gz >= first_wj_z and gz < elev_start_z:
-			should_cull = not is_wj       # climbing void — only WJ gates visible
-		elif gz >= elev_start_z and gz < desc_zone_end:
-			should_cull = true            # elevated floor + descent — hide all
-
-		if should_cull:
-			gate_nodes[gi].visible = false
-			gate_nodes[gi].process_mode = Node.PROCESS_MODE_DISABLED
-			# Mark as judged so the miss-detector never fires on these gates.
-			if gi < gate_judged.size():
-				gate_judged[gi] = true
-				gate_success[gi] = true   # count as success — player can't hit what isn't there
-
-	# Store wall-jump zone so halos are suppressed while the player is inside it
-	_wj_zone_start_z = z_section_start
-	_wj_zone_end_z   = desc_zone_end + 8.0
-
-	# ── 8. Record where ground-level floor resumes after the WJ descent ───────────
-	# _spawn_path_floors() runs after _build_track_path() and will lay path-aware
-	# floor slabs for every segment, skipping the void [_floor_cutoff_dist,
-	# _wj_ground_resume_z].  We no longer spawn a straight fallback slab here,
-	# because turns after the WJ zone need the floor to follow the path direction.
-	_wj_ground_resume_z = last_descent_z + plat_d * 0.5
-
-
-## Path-aware wall-jump section geometry spawner.
-## Must be called AFTER _build_track_path() and _reposition_gates_on_path() so that
-## all platforms, ledges, and corridor walls follow snaking turns correctly.
-## Also handles WJ gate lifts, zone culling, and refining _wj_zone_start/end_z.
 func _spawn_wj_geometry_on_path() -> void:
 	# ── 0. Collect WJ phrase entries ─────────────────────────────────────────
 	var phrase_entries: Array = []
@@ -6010,6 +5726,7 @@ func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 	if _grind_rail_root == null:
 		return
 	_grind_rail_mats.clear()
+	_grind_rail_base_e.clear()
 
 	# Authored Blender rail pieces — tile them along the path. The piece bakes
 	# its own lateral offset (author rails as side LEFT → lands at +3.35, the
@@ -6122,6 +5839,7 @@ func _build_grind_rail_mesh(start_pd: float, end_pd: float) -> void:
 	rail_mi.material_override = rail_mat
 	_grind_rail_root.add_child(rail_mi)
 	_grind_rail_mats.append(rail_mat)
+	_grind_rail_base_e.append(NeonMat.get_energy(rail_mat))
 
 
 func _build_spark_node(pd: float) -> Node3D:
@@ -6222,6 +5940,7 @@ func _despawn_grind_rail() -> void:
 	if is_instance_valid(_grind_rail_root): _grind_rail_root.queue_free()
 	_grind_rail_root = null
 	_grind_rail_mats.clear()
+	_grind_rail_base_e.clear()
 
 	if _hud != null:
 		_hud.set_flow(0, 0, 1, false)
@@ -6509,8 +6228,13 @@ func _sync_hud_lives() -> void:
 
 
 func _hud_flash_color(col: Color, duration: float) -> void:
-	if _hud != null:
-		_hud.flash(col, duration)
+	if _hud == null:
+		return
+	# Full-screen colour washes are the hardest thing in the game on a
+	# photosensitive player, so these fade rather than disappear — a death
+	# still has to read as a death.
+	var scale: float = GameConfig.flash_scale()
+	_hud.flash(Color(col.r, col.g, col.b, col.a * scale), duration)
 
 
 ## Brief dev toast — a small label that fades in/out over the HUD canvas.
@@ -6900,6 +6624,7 @@ func _setup_world_environment() -> void:
 		we = WorldEnvironment.new()
 		add_child(we)
 	we.environment = env
+	_world_env = env
 	_melody_env = env
 
 
@@ -6952,6 +6677,7 @@ func _spawn_floor_grid() -> void:
 	grid_mat.emission_enabled           = true
 	grid_mat.emission                   = grid_col
 	grid_mat.emission_energy_multiplier = 1.4
+	_floor_grid_mat = grid_mat
 
 	var grid_mm := MultiMesh.new()
 	grid_mm.transform_format = MultiMesh.TRANSFORM_3D
@@ -6966,238 +6692,8 @@ func _spawn_floor_grid() -> void:
 	world_fx_root.add_child(grid_mmi)
 
 
-# ── Neon city buildings ───────────────────────────────────────────────────────
-# Hard-capped at MAX_BLDGS total so draw-call count stays fixed regardless of
-# song length.  All window strips on a building share one material — pulsing
-# costs O(building_count) per beat, not O(strip_count).
-func _spawn_city_buildings() -> void:
-	# Skyline density is a quality-tier knob (was a hard-coded 18). Each building
-	# costs a body mesh, an occluder, a window MultiMesh and a roof light.
-	var max_bldgs_per_side: int = maxi(2,
-		int(GraphicsQuality.get_setting("city_buildings_per_side", 18)))
-	var end_z: float = _song_end_z()
-	var tw:    float = _track_full_width()
-
-	var body_col: Color = Color(0.04, 0.02, 0.08, 1.0)
-	# Two distance rows — closer row is bigger buildings, far row is taller/thinner
-	var dist_rows: Array[float] = [tw * 0.5 + 16.0, tw * 0.5 + 30.0]
-
-	var building_templates: Array = [
-		[4.0, 5.0, 14.0], [3.0, 4.0, 10.0], [5.5, 6.0, 20.0],
-		[2.5, 3.5,  8.0], [4.5, 5.0, 24.0], [3.5, 4.0, 12.0],
-		[6.0, 6.5, 28.0], [2.8, 3.5,  9.0], [4.0, 5.0, 16.0],
-	]
-
-	var win_palette: Array[Color] = [
-		Color(1.00, 0.25, 0.60, 1.0),
-		Color(0.20, 0.80, 1.00, 1.0),
-		Color(0.65, 0.10, 1.00, 1.0),
-		Color(1.00, 0.85, 0.10, 1.0),
-		Color(0.30, 1.00, 0.55, 1.0),
-		Color(0.90, 0.25, 1.00, 1.0),
-	]
-
-	# Authored Blender buildings ("building") — the game cycles through ALL
-	# authored ones; the far row is stretched taller/thinner exactly like the
-	# procedural templates. "Windows" emissives pulse with the city beat.
-	var bldg_entries: Array = (_piece_lib.of_type("building") if _piece_lib != null else [])
-
-	# One window material PER PALETTE COLOUR, not per building. Every building
-	# picks its colour out of win_palette, and the beat pulse writes the exact same
-	# emission energy to all of them, so ~56 identical-behaving materials collapse
-	# to 6 with pixel-identical output — and _update_city_pulse's material loop
-	# collapses with them.
-	var win_mats: Array[StandardMaterial3D] = []
-	for pc: Color in win_palette:
-		var wm := StandardMaterial3D.new()
-		wm.albedo_color               = pc.darkened(0.30)
-		wm.emission_enabled           = true
-		wm.emission                   = pc
-		wm.emission_energy_multiplier = 0.8
-		win_mats.append(wm)
-		_city_bldg_mats.append(wm)
-
-	# (path distance, light) pairs, sorted at the end — the loops below run
-	# side-major then row-major, so bz is not globally increasing as it goes.
-	var city_light_pairs: Array = []
-
-	var bldg_i: int = 0
-
-	for side in [-1, 1]:
-		for ri in dist_rows.size():
-			var dist: float = dist_rows[ri]
-			# Spread max_bldgs_per_side buildings evenly across the track length
-			var step: float = end_z / float(max_bldgs_per_side)
-			for bi in max_bldgs_per_side:
-				var bz:   float = step * 0.4 + float(bi) * step + float(ri) * step * 0.5
-				if _z_is_electric(bz):
-					bldg_i += 1
-					continue
-
-				if not bldg_entries.is_empty():
-					var b_entry: Dictionary = bldg_entries[bldg_i % bldg_entries.size()]
-					var b_anchor := Node3D.new()
-					b_anchor.position           = _path_world_pos(bz, float(side) * dist, 0.0)
-					b_anchor.rotation_degrees.y = _path_y_rot_at(bz)
-					if ri == 1:
-						b_anchor.scale = Vector3(0.65, 1.4, 1.0)   # far row: taller + thinner
-					world_fx_root.add_child(b_anchor)
-					var b_inst: Node3D = _piece_lib.instance(b_entry)
-					b_inst.rotation_degrees.y = 180.0
-					b_anchor.add_child(b_inst)
-					_register_piece_emissives(b_inst, _city_bldg_mats)
-
-					var b_h: float = float(b_entry.params.get("height", 14.0)) * b_anchor.scale.y
-					var b_rlight := OmniLight3D.new()
-					b_rlight.light_color  = win_palette[(bldg_i + ri * 3) % win_palette.size()]
-					b_rlight.light_energy = 0.5
-					b_rlight.omni_range   = 10.0
-					b_rlight.position     = _path_world_pos(bz, float(side) * dist, b_h + 0.8)
-					# Range 10 m and well past the fog wall for most of the song — let
-					# the renderer drop it, like the gem / arch / ambient lights already do.
-					b_rlight.distance_fade_enabled = true
-					b_rlight.distance_fade_begin   = 140.0
-					b_rlight.distance_fade_length  = 40.0
-					world_fx_root.add_child(b_rlight)
-					city_light_pairs.append([bz, b_rlight])
-
-					bldg_i += 1
-					continue
-
-				var tmpl: Array = building_templates[bldg_i % building_templates.size()]
-				var bw: float   = tmpl[0] as float
-				var bd: float   = tmpl[1] as float
-				var bh: float   = tmpl[2] as float
-				# Far row: taller and thinner
-				if ri == 1:
-					bw *= 0.65; bh *= 1.4
-				var blat: float = float(side) * dist
-
-				# ── Dark silhouette ──────────────────────────────────────────
-				var body := MeshInstance3D.new()
-				var bm   := BoxMesh.new()
-				bm.size = Vector3(bw, bh, bd)
-				body.mesh = bm
-				var body_mat := StandardMaterial3D.new()
-				body_mat.albedo_color               = body_col
-				body_mat.emission_enabled           = false
-				body.material_override = body_mat
-				body.position = _path_world_pos(bz, blat, bh * 0.5)
-				body.rotation_degrees.y = _path_y_rot_at(bz)
-				world_fx_root.add_child(body)
-
-				# Occluder matched exactly to the opaque body's own bounds —
-				# lets Godot's occlusion culling skip rendering anything fully
-				# hidden behind a building (from another building, decorations,
-				# etc.) without touching frustum culling, which already runs
-				# regardless. Only added for procedural bodies, where the exact
-				# box dimensions are known; authored buildings are skipped here
-				# rather than guessing at bounds and risking something visible
-				# getting incorrectly culled.
-				var occ := OccluderInstance3D.new()
-				var box_occ := BoxOccluder3D.new()
-				box_occ.size = Vector3(bw, bh, bd)
-				occ.occluder = box_occ
-				occ.position = body.position
-				occ.rotation_degrees.y = body.rotation_degrees.y
-				world_fx_root.add_child(occ)
-
-				# ── Window strips — one MultiMesh per building instead of one
-				# MeshInstance3D per strip. Every strip in a building already
-				# shares the same box size and Y-rotation (only its height
-				# differs), so batching them is a pure draw-call win — the
-				# shared win_mat / _city_bldg_mats pulse system below is
-				# completely untouched, it just now recolors a
-				# MultiMeshInstance3D's material_override instead of N
-				# individual MeshInstance3Ds.
-				var win_idx: int   = (bldg_i + ri * 3) % win_palette.size()
-				var win_col: Color = win_palette[win_idx]
-				var win_mat: StandardMaterial3D = win_mats[win_idx]
-
-				var strip_h:  float = 0.14
-				var strip_gap: float = 2.2
-				var strip_rot: float = _path_y_rot_at(bz)
-				var strip_positions: Array[Vector3] = []
-				var win_y:    float = strip_gap
-				while win_y < bh - 0.5:
-					strip_positions.append(_path_world_pos(bz, blat, win_y + strip_h * 0.5))
-					win_y += strip_gap
-
-				if not strip_positions.is_empty():
-					var strip_mesh := BoxMesh.new()
-					strip_mesh.size = Vector3(bw + 0.04, strip_h, 0.10)
-
-					var strip_mm := MultiMesh.new()
-					strip_mm.transform_format = MultiMesh.TRANSFORM_3D
-					strip_mm.mesh = strip_mesh
-					strip_mm.instance_count = strip_positions.size()
-					var strip_basis := Basis.IDENTITY.rotated(Vector3.UP, deg_to_rad(strip_rot))
-					for si in range(strip_positions.size()):
-						strip_mm.set_instance_transform(si, Transform3D(strip_basis, strip_positions[si]))
-
-					var strip_mmi := MultiMeshInstance3D.new()
-					strip_mmi.multimesh = strip_mm
-					strip_mmi.material_override = win_mat
-					world_fx_root.add_child(strip_mmi)
-
-				# ── One roof light per building ───────────────────────────────
-				var rlight := OmniLight3D.new()
-				rlight.light_color  = win_col
-				rlight.light_energy = 0.5
-				rlight.omni_range   = 10.0
-				rlight.position     = _path_world_pos(bz, blat, bh + 0.8)
-				# Range 10 m and well past the fog wall for most of the song — let the
-				# renderer drop it, like the gem / arch / ambient lights already do.
-				rlight.distance_fade_enabled = true
-				rlight.distance_fade_begin   = 140.0
-				rlight.distance_fade_length  = 40.0
-				world_fx_root.add_child(rlight)
-				city_light_pairs.append([bz, rlight])
-
-				bldg_i += 1
-
-	# Sort the roof lights by path distance so _update_city_pulse can window them.
-	city_light_pairs.sort_custom(func(a: Array, b: Array) -> bool: return a[0] < b[0])
-	_city_bldg_lights.clear()
-	_city_bldg_light_pds = PackedFloat32Array()
-	for pair: Array in city_light_pairs:
-		_city_bldg_light_pds.append(pair[0])
-		_city_bldg_lights.append(pair[1])
 
 
-# ── City pulse decay (called every frame, O(building_count)) ─────────────────
-func _update_city_pulse(delta: float) -> void:
-	if _city_pulse_t <= 0.0:
-		return
-	var beat_s: float = max(0.18, _runner_avg_beat_s)
-	_city_pulse_t = maxf(0.0, _city_pulse_t - delta / (beat_s * 0.55))
-
-	var vit: float = _world_vitality
-	# Vitality scales the peak burst: at low vitality buildings barely flicker;
-	# at high vitality they strobe hard on every beat.
-	var peak_e:  float = lerpf(0.5, 2.5, vit)
-	var peak_l:  float = lerpf(0.15, 1.8, vit)
-	var energy:  float = lerpf(lerpf(0.1, 0.6, vit), peak_e, _city_pulse_t)
-	var light_e: float = lerpf(lerpf(0.0, 0.3, vit), peak_l, _city_pulse_t)
-
-	# Six shared palette materials rather than one per building (see
-	# _spawn_city_buildings), so this loop is a handful of writes.
-	for mat in _city_bldg_mats:
-		mat.emission_energy_multiplier = energy
-
-	# Roof lights are per building and every one gets the SAME energy, so walk
-	# only the slice near the player — same monotonic cursor + early break as
-	# _world_gem_lights in _update_color_cycle.
-	var pd: float = _player_path_dist
-	var lo: float = pd - _DECO_WINDOW_BEHIND_M
-	var hi: float = pd + _deco_window_ahead_m
-	while _city_light_cursor < _city_bldg_light_pds.size() \
-			and _city_bldg_light_pds[_city_light_cursor] < lo:
-		_city_light_cursor += 1
-	for i in range(_city_light_cursor, _city_bldg_lights.size()):
-		if i >= _city_bldg_light_pds.size() or _city_bldg_light_pds[i] > hi:
-			break
-		_city_bldg_lights[i].light_energy = light_e
 
 
 # ── Song progress bar update ──────────────────────────────────────────────────
@@ -7760,7 +7256,8 @@ func _pulse_floor_beat(t_s: float) -> void:
 	if _is_electric_at(t_s):
 		_elec_pulse_t = 1.0
 	else:
-		_city_pulse_t = 1.0
+		if _city != null:
+			_city.strike()
 
 	# Spark burst around player
 	_burst_sparks(vit, pulse_color)
@@ -8937,12 +8434,7 @@ func _spawn_track_decorations() -> void:
 		Color(1.00, 0.55, 0.22, 1.0),   # orange
 	]
 
-	# ── 1. Continuous side-wall glow strips (per path segment) ──────────────────
-	var strip_thick: float = 0.06
-	var strip_h:     float = 1.0
-	var strip_cx:    float = tw * 0.5 + strip_thick * 0.5 + 0.02
-
-	# ── 2. Floor-edge glow rails (per path segment) ───────────────────────────
+	# ── 1. Floor-edge glow rails (per path segment) ───────────────────────────
 	var rail_y:  float = 0.02
 	var rail_cx: float = tw * 0.5 - 0.10
 
@@ -8950,35 +8442,17 @@ func _spawn_track_decorations() -> void:
 	# perpendicular to the player at 90° corners.
 	const CORNER_MARGIN: float = 10.0
 
-	# ── Shared strip/rail resources ──────────────────────────────────────────
-	# Every strip in a given row is the SAME colour and gets the SAME
-	# emission energy every frame, and every rail likewise — so there is no
-	# reason for each one to own a private BoxMesh + StandardMaterial3D.
-	# Arc corners are subdivided into 32 sub-segments of ~1 m each, so the
-	# old per-segment allocation produced thousands of unique meshes and
-	# materials, and _update_color_cycle then had to walk every single one of
-	# them twice a frame. Sharing collapses those loops to three writes and
-	# lets the renderer batch the instances.
+	# ── Shared rail resources ────────────────────────────────────────────────
+	# Every rail is the SAME colour and gets the SAME emission energy every
+	# frame, so there is no reason for each one to own a private BoxMesh +
+	# StandardMaterial3D. Arc corners are subdivided into 32 sub-segments of
+	# ~1 m each, so the old per-segment allocation produced thousands of unique
+	# meshes and materials, and _update_color_cycle then had to walk every
+	# single one of them twice a frame. Sharing collapses those loops to one
+	# write and lets the renderer batch the instances.
 	#
 	# Length is folded into scale.z against a unit-length (1 m) mesh — the
 	# same trick _spawn_floor_grid already uses — so geometry is identical.
-	var strip_row_mats: Array[StandardMaterial3D] = []
-	var strip_row_meshes: Array[BoxMesh] = []
-	for row in [0, 1]:
-		var row_col: Color = gem_colors[(row * 2) % gem_colors.size()]
-		var s_mesh := BoxMesh.new()
-		s_mesh.size = Vector3(strip_thick, strip_h, 1.0)
-		strip_row_meshes.append(s_mesh)
-		var s_mat := StandardMaterial3D.new()
-		s_mat.albedo_color                = row_col
-		s_mat.metallic                    = 0.05
-		s_mat.roughness                   = 0.68
-		s_mat.emission_enabled            = true
-		s_mat.emission                    = row_col
-		s_mat.emission_energy_multiplier  = 0.22
-		strip_row_mats.append(s_mat)
-		_world_strip_mats.append(s_mat)
-
 	var rail_col: Color = Color(0.96, 0.0, 0.016, 1.0)
 	var rail_mesh := BoxMesh.new()
 	rail_mesh.size = Vector3(0.06, 0.06, 1.0)
@@ -9000,23 +8474,12 @@ func _spawn_track_decorations() -> void:
 		var clip_start: float = seg.path_start + eff_margin
 		var clip_end:   float = seg_clip_end   - eff_margin
 		if clip_end <= clip_start:
-			continue   # segment too short to show strips
+			continue   # segment too short to show rails
 		var clip_len: float   = clip_end - clip_start
 		var clip_mid: float   = (clip_start + clip_end) * 0.5
 		var seg_y_rot: float  = rad_to_deg(atan2(seg.direction.x, seg.direction.z))
 		# Centre-point of the clipped strip along the path centre-line
 		var strip_ctr: Vector3 = seg.origin + seg.direction * (clip_mid - seg.path_start)
-
-		for side in [-1, 1]:
-			for row in [0, 1]:   # low strip (~0.3 m) and high strip (~2.5 m)
-				var sy: float = 0.30 + float(row) * 2.2
-				var strip := MeshInstance3D.new()
-				strip.mesh              = strip_row_meshes[row]
-				strip.material_override = strip_row_mats[row]
-				strip.position = strip_ctr + seg.right * (float(side) * strip_cx) + Vector3(0.0, sy, 0.0)
-				strip.rotation_degrees.y = seg_y_rot
-				strip.scale.z = clip_len
-				world_fx_root.add_child(strip)
 
 		for side in [-1, 1]:
 			var rail := MeshInstance3D.new()
@@ -9247,6 +8710,8 @@ func _spawn_track_decorations() -> void:
 		al.distance_fade_begin   = 150.0
 		al.distance_fade_length  = 40.0
 		world_fx_root.add_child(al)
+		_ambient_lights.append(al)
+		_ambient_pds.append(al_pd)
 		al_pd += ambient_spacing
 
 	# ── 7. Authored lightposts — lining the track from assets/track/*.glb ─────
@@ -9373,8 +8838,24 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	var beat: float      = _beat_phase
 	# Dead tint: dark desaturated purple toward which everything fades on misses
 	var dead_tint: Color = Color(0.15, 0.12, 0.25, 1.0)
-	# Squared beat for a snappier flash that fades fast
-	var beat_boost: float = beat * beat
+	# How much of the world's own glow survives inside an electric zone. Every
+	# surface out here is emissive, and emission does not care how much ambient
+	# light there is — so switching the lamps off does nothing on its own. This
+	# is the factor that actually makes the dark dark. The gates are not in it:
+	# their arcs and their lights are what the player navigates by.
+	var dark_mul: float = lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark)
+
+	if _floor_grid_mat != null:
+		_floor_grid_mat.emission_energy_multiplier = 1.4 * dark_mul
+	for gi in range(mini(_grind_rail_mats.size(), _grind_rail_base_e.size())):
+		if _grind_rail_mats[gi] != null:
+			NeonMat.set_energy(_grind_rail_mats[gi], _grind_rail_base_e[gi] * dark_mul)
+
+	# Squared beat for a snappier flash that fades fast. Scaled by the
+	# photosensitivity setting: this single value is what every pulsing thing
+	# in the level reads, so damping it here keeps them all in step rather than
+	# having each effect decide for itself how much to calm down.
+	var beat_boost: float = beat * beat * GameConfig.flash_scale()
 
 	# Rate-corrected smoothing factors, resolved once per tick instead of at every
 	# call site. Names carry the original per-step constant.
@@ -9392,7 +8873,9 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	# ── Ambient sky sparks ────────────────────────────────────────────────────
 	if _spark_ambient != null and _spark_ambient_mat != null:
 		# Density: scales with vitality, beat_boost gives a density spike each beat
-		_spark_ambient.amount_ratio = clampf(lerpf(0.18, 0.85, vit) + beat_boost * 0.15, 0.0, 1.0)
+		_spark_ambient.amount_ratio = clampf(
+			(lerpf(0.18, 0.85, vit) + beat_boost * 0.15) * lerpf(1.0, 0.25, _elec_dark),
+			0.0, 1.0)
 		# Color follows live palette
 		_spark_ambient_mat.color = live_col.lightened(0.15)
 		# Velocity eases back toward gentle baseline between beats
@@ -9456,7 +8939,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 		else:
 			floor_target = _floor_base_albedo
 		_floor_material.albedo_color = _floor_material.albedo_color.lerp(floor_target, k06)
-		var floor_e: float = lerpf(0.0, 0.65, vit) + beat_boost * 0.30
+		var floor_e: float = (lerpf(0.0, 0.65, vit) + beat_boost * 0.30) * dark_mul
 		_floor_material.emission_energy_multiplier = lerpf(
 			_floor_material.emission_energy_multiplier, floor_e, k18)
 
@@ -9470,7 +8953,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	for ti in range(_world_track_mats.size()):
 		var tmat: StandardMaterial3D = _world_track_mats[ti]
 		if tmat != null:
-			tmat.emission_energy_multiplier = _world_track_base_e[ti] * track_pulse
+			tmat.emission_energy_multiplier = _world_track_base_e[ti] * track_pulse * dark_mul
 
 	# The old "update world dressing every Nth FRAME" gate lived here. The whole
 	# function is now behind the wall-clock scheduler in _process, so a second
@@ -9479,8 +8962,10 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	if not GameConfig.color_cycle_affects_world:
 		return   # world deco colour-cycle disabled — keep existing tints
 
-	# ── Side-wall strips ─────────────────────────────────────────────────────
-	var strip_e: float = lerpf(0.05, 0.30, vit) + beat_boost * 0.50
+	# ── Corner-arc accents ───────────────────────────────────────────────────
+	# Named for the side-wall strips this list used to hold as well; the strips
+	# are gone and the arc accents still ride the same colour cycle.
+	var strip_e: float = (lerpf(0.05, 0.30, vit) + beat_boost * 0.50) * dark_mul
 	for smat: StandardMaterial3D in _world_strip_mats:
 		if smat == null:
 			continue
@@ -9488,7 +8973,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 		smat.emission_energy_multiplier = lerpf(smat.emission_energy_multiplier, strip_e, k15)
 
 	# ── Floor-edge rails ─────────────────────────────────────────────────────
-	var rail_e: float = lerpf(0.30, 1.4, vit) + beat_boost * 1.0
+	var rail_e: float = (lerpf(0.30, 1.4, vit) + beat_boost * 1.0) * dark_mul
 	for rmat: StandardMaterial3D in _world_rail_mats:
 		if rmat == null:
 			continue
@@ -9503,7 +8988,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 	var deco_hi:   float = deco_pd + _deco_window_ahead_m
 
 	# ── Gem lights ───────────────────────────────────────────────────────────
-	var gem_e: float = lerpf(0.08, 0.45, vit) + beat_boost * 0.60
+	var gem_e: float = (lerpf(0.08, 0.45, vit) + beat_boost * 0.60) * dark_mul
 	var gem_r: float = lerpf(3.0, 7.0, vit) + beat_boost * 3.0
 	while _gem_light_cursor < _world_gem_light_pds.size() \
 			and _world_gem_light_pds[_gem_light_cursor] < deco_lo:
@@ -9543,7 +9028,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 			break
 
 	# ── Arch lights ──────────────────────────────────────────────────────────
-	var arch_e: float = lerpf(0.12, 0.80, vit) + beat_boost * 0.80
+	var arch_e: float = (lerpf(0.12, 0.80, vit) + beat_boost * 0.80) * dark_mul
 	while _arch_light_cursor < _world_arch_light_pds.size() \
 			and _world_arch_light_pds[_arch_light_cursor] < deco_lo:
 		_arch_light_cursor += 1
@@ -9559,7 +9044,7 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 		alight.light_energy = lerpf(alight.light_energy, arch_e, k15)
 
 	# ── Floor pulse pads ─────────────────────────────────────────────────────────────────────────
-	var pad_e: float = lerpf(0.0, 0.50, vit) + beat_boost * 0.40
+	var pad_e: float = (lerpf(0.0, 0.50, vit) + beat_boost * 0.40) * dark_mul
 	for pmat: StandardMaterial3D in _world_pad_mats:
 		if pmat == null:
 			continue

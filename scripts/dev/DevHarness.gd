@@ -69,6 +69,10 @@ func _ready() -> void:
 			await _upgrades()
 		"world":
 			await _world_density()
+		"elec":
+			await _electric_zones(arg)
+		"bigmesh":
+			await _big_meshes()
 		"bake":
 			await _bake()
 		"play":
@@ -116,6 +120,7 @@ func _verify() -> void:
 	await _verify_baked_city()
 	await _verify_boots()
 	_verify_save()
+	await _verify_rules()
 	await _verify_menus()
 	await _verify_lazy_gates()
 
@@ -376,6 +381,122 @@ func _verify_save() -> void:
 			DirAccess.remove_absolute(ProjectSettings.globalize_path("user://" + name))
 
 
+## The rules of the game, asserted against a real level rather than read off
+## the source. Everything else here checks that the game BUILDS; this checks
+## that it SCORES — the half that a refactor can quietly break while every
+## structural check still passes.
+func _verify_rules() -> void:
+	print("rules:")
+	_story_context()
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	var s: Node = _find_section(level)
+
+	# ── The multiplier ladder: +1 every 10 combo, capped at x20 ──────────────
+	for pair: Array in [[0, 1], [9, 1], [10, 2], [19, 2], [20, 3], [189, 19], [190, 20], [500, 20]]:
+		s.set("_combo", int(pair[0]))
+		_check(int(s.call("_score_multiplier")) == int(pair[1]),
+			"combo %d should multiply x%d, got x%d" % [
+				pair[0], pair[1], int(s.call("_score_multiplier"))])
+
+	# A wall-jump climb doubles whatever the ladder says.
+	s.set("_combo", 10)
+	s.set("_wj_mult_active", true)
+	_check(int(s.call("_score_multiplier")) == 4, "wall-jump bonus should double the multiplier")
+	s.set("_wj_mult_active", false)
+
+	# OVERDRIVE overrides the ladder outright.
+	s.set("_charge_mult_timer", 1.0)
+	_check(int(s.call("_score_multiplier")) == 100, "overdrive should lock the multiplier to x100")
+
+	# ...and inside it a miss costs nothing but the points: combo and health hold.
+	s.set("_combo", 7)
+	s.set("_health_pct", 0.5)
+	s.call("_on_gate_scored", false)
+	_check(int(s.get("_combo")) == 7, "a miss inside overdrive must not break the combo")
+	_check(absf(float(s.get("_health_pct")) - 0.5) < 0.001,
+		"a miss inside overdrive must not cost health")
+	s.set("_charge_mult_timer", 0.0)
+
+	# ── A hit: 500 points x the multiplier, +1 combo, +5% health ────────────
+	s.set("_combo", 0)
+	s.set("_score", 0)
+	s.set("_gates_hit", 0)
+	s.set("_health_pct", 0.5)
+	s.call("_on_gate_scored", true)
+	_check(int(s.get("_score")) == 500, "first hit should score 500, got %d" % int(s.get("_score")))
+	_check(int(s.get("_combo")) == 1, "a hit should raise the combo")
+	_check(int(s.get("_gates_hit")) == 1, "a hit should count as a hit")
+	_check(absf(float(s.get("_health_pct")) - 0.55) < 0.001, "a hit should heal 5%")
+
+	# At combo 10 the same hit is worth double, because the 11th hit multiplies x2.
+	s.set("_combo", 9)
+	s.set("_score", 0)
+	s.call("_on_gate_scored", true)
+	_check(int(s.get("_score")) == 1000, "a hit at combo 10 should score 1000, got %d" % int(s.get("_score")))
+
+	# ── A miss: combo gone, 10% health gone ─────────────────────────────────
+	s.set("_combo", 25)
+	s.set("_health_pct", 0.5)
+	s.set("_gates_missed", 0)
+	s.call("_on_gate_scored", false)
+	_check(int(s.get("_combo")) == 0, "a miss should reset the combo")
+	_check(int(s.get("_gates_missed")) == 1, "a miss should count as a miss")
+	_check(absf(float(s.get("_health_pct")) - 0.4) < 0.001, "a miss should cost 10%")
+
+	# Health hitting zero ends the run.
+	s.set("_health_pct", 0.05)
+	s.call("_on_gate_scored", false)
+	_check(bool(s.get("_song_finish_pending")), "a miss at 5% health should end the run")
+
+	# ── The grade ───────────────────────────────────────────────────────────
+	for case: Array in [[100, 0, "S"], [95, 5, "A"], [80, 20, "B"], [65, 35, "C"],
+			[45, 55, "D"], [20, 80, "F"]]:
+		s.set("_score_final", {})
+		s.set("_gates_hit", int(case[0]))
+		s.set("_gates_missed", int(case[1]))
+		s.set("_score", 1000)
+		var got: String = String((s.call("_finalise_score") as Dictionary).get("grade", "?"))
+		_check(got == String(case[2]), "%d hit / %d missed should grade %s, got %s" % [
+			case[0], case[1], case[2], got])
+
+	# A clean run is worth half again as much.
+	s.set("_score_final", {})
+	s.set("_gates_hit", 10)
+	s.set("_gates_missed", 0)
+	s.set("_score", 1000)
+	_check(int((s.call("_finalise_score") as Dictionary).get("score", 0)) == 1500,
+		"a perfect run should pay x1.5")
+
+	# ── Reduced flashing ────────────────────────────────────────────────────
+	var was: bool = GameConfig.reduced_flashing
+	GameConfig.reduced_flashing = false
+	_check(absf(GameConfig.flash_scale() - 1.0) < 0.001, "flash scale should be 1.0 when off")
+	GameConfig.reduced_flashing = true
+	_check(GameConfig.flash_scale() < 0.5, "reduced flashing should actually reduce the flash")
+	GameConfig.reduced_flashing = was
+
+	# ── The FPS readout, end to end rather than by inspection ───────────────
+	var hud: Node = s.get("_hud")
+	var was_fps: bool = GameConfig.show_fps
+	GameConfig.show_fps = true
+	await _frames(60)   # it averages over half a second before it says anything
+	var label: Label = hud.get("_fps_label") as Label if hud != null else null
+	_check(label != null, "the HUD built no FPS label")
+	if label != null:
+		_check(label.visible, "the FPS readout stayed hidden with the setting on")
+		_check(label.text.contains("FPS"), "the FPS readout said '%s'" % label.text)
+	GameConfig.show_fps = false
+	await _frames(5)
+	if label != null:
+		_check(not label.visible, "the FPS readout stayed up with the setting off")
+	GameConfig.show_fps = was_fps
+
+	_shut_down(level)
+	await _frames(5)
+
+
 ## The three overlays a level puts up. Each one is opened for real, navigated,
 ## and photographed — none of them is confirmed, because every entry on them
 ## changes scene. Both the death and the results panel write as they open, which
@@ -477,19 +598,49 @@ func _perf() -> void:
 ## stutter is usually memory being evicted rather than maths being slow.
 func _tiers(arg: String) -> void:
 	Engine.max_fps = 0   # the project caps at 120, which hides the whole story
-	var want: PackedStringArray = (arg if arg != "" else "ultra,max").split(",")
-	var was: String = GraphicsQuality.tier
+	var want: PackedStringArray = (arg if arg != "" else "low,medium,high,ultra,max").split(",")
 	for t: String in want:
 		if not GraphicsQuality.PRESETS.has(t):
 			print("  no such tier: %s" % t)
 			continue
-		# Before the level builds: the environment reads the tier as it is made.
-		GraphicsQuality.set_tier(t)
+		# Every key of the tier, through the dev seam rather than set_tier():
+		# set_tier() writes the player's own quality setting to disk, and a run
+		# that dies halfway then leaves them on whatever it was measuring.
+		GraphicsQuality.dev_clear_overrides()
+		for key: String in (GraphicsQuality.PRESETS[t] as Dictionary):
+			GraphicsQuality.dev_override(key, GraphicsQuality.PRESETS[t][key])
 		await _frames(10)
 		_story_context()
 		var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
 		add_child(level)
 		await _until_level_ready(level)
+		var env: Environment = null
+		for node: Node in _find_section(level).get_children():
+			if node is WorldEnvironment:
+				env = (node as WorldEnvironment).environment
+		var preset: Dictionary = GraphicsQuality.PRESETS[t]
+		var vpt: Viewport = get_viewport()
+		vpt.scaling_3d_scale = float(preset.scaling_3d_scale)
+		vpt.msaa_3d = int(preset.msaa_3d)
+		vpt.screen_space_aa = int(preset.screen_space_aa)
+		vpt.mesh_lod_threshold = float(preset.mesh_lod_threshold)
+		vpt.positional_shadow_atlas_size = int(preset.positional_shadow_atlas_size)
+		RenderingServer.directional_shadow_atlas_set_size(
+			int(preset.directional_shadow_size), true)
+		RenderingServer.directional_soft_shadow_filter_set_quality(preset.shadow_soft_quality)
+		RenderingServer.positional_soft_shadow_filter_set_quality(preset.shadow_soft_quality)
+		if env != null:
+			env.ssr_enabled = bool(preset.ssr)
+			if bool(preset.ssr):
+				env.ssr_max_steps = int(preset.ssr_steps)
+			env.ssao_enabled = bool(preset.ssao)
+			env.ssil_enabled = bool(preset.ssil)
+			env.sdfgi_enabled = bool(preset.sdfgi)
+			if bool(preset.sdfgi):
+				env.sdfgi_bounce_feedback = float(preset.sdfgi_bounce)
+			env.volumetric_fog_enabled = bool(preset.volumetric_fog)
+			env.volumetric_fog_gi_inject = float(preset.get("fog_gi_inject", 0.0))
+			env.volumetric_fog_anisotropy = float(preset.get("fog_anisotropy", 0.2))
 		# Let SDFGI converge and the shaders finish compiling before counting.
 		await _frames(240)
 
@@ -531,8 +682,7 @@ func _tiers(arg: String) -> void:
 			Performance.get_monitor(Performance.RENDER_TEXTURE_MEM_USED) / 1048576.0])
 		_shut_down(level)
 		await _frames(30)
-	GraphicsQuality.set_tier(was)   # the player's own tier, put back
-	print("  (tier restored to %s)" % was)
+	GraphicsQuality.dev_clear_overrides()
 
 
 ## Which knob in a tier is actually paying for the frame. Boots a level on
@@ -541,8 +691,11 @@ func _tiers(arg: String) -> void:
 ## cannot tell you.
 func _ablate() -> void:
 	Engine.max_fps = 0
-	GraphicsQuality.set_tier("max")
-	var was: String = "ultra"
+	# Through the dev seam, never set_tier(): that writes the player's own
+	# quality setting to disk, and a run that dies halfway leaves it wrong.
+	GraphicsQuality.dev_clear_overrides()
+	for key: String in (GraphicsQuality.PRESETS["max"] as Dictionary):
+		GraphicsQuality.dev_override(key, GraphicsQuality.PRESETS["max"][key])
 	await _frames(10)
 	_story_context()
 	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
@@ -606,8 +759,7 @@ func _ablate() -> void:
 
 	_shut_down(level)
 	await _frames(10)
-	GraphicsQuality.set_tier(was)
-	print("  (tier restored to %s)" % was)
+	GraphicsQuality.dev_clear_overrides()
 
 
 ## Candidate settings for a cheaper "max" that still looks like max. Each one
@@ -809,6 +961,7 @@ func _compare_looks() -> void:
 			"%s/look_%s.png" % [SHOT_DIR, cand[0]])
 		print("  look_%s" % cand[0])
 	get_tree().paused = false
+	get_tree().paused = false
 	_shut_down(level)
 	await _frames(10)
 
@@ -901,6 +1054,151 @@ func _upgrades() -> void:
 ## driven to the same PATH DISTANCE before the shot, not the same elapsed time,
 ## because a slower candidate covers less ground per second and would otherwise
 ## be photographed somewhere else entirely.
+## The electric blackout, photographed either side of a zone edge. There is no
+## way to fake this: the gates only grow their arcs if the chart says that part
+## of the song is electric, so the only honest test is to play up to a real one.
+func _electric_zones(song: String) -> void:
+	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
+	_story_context(song)
+	Run.run_seed = ABLATE_SEED
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	var s: Node = _find_section(level)
+	var zones: Array = s.get("_electric_zones") as Array
+	print("  %s: %d electric zones" % [Run.current_song_key, zones.size()])
+	if zones.is_empty():
+		print("  nothing electric in this chart — try another song key")
+		_shut_down(level)
+		return
+	for z: Dictionary in zones:
+		print("     %.1fs .. %.1fs" % [float(z.get("start_t", 0.0)), float(z.get("end_t", 0.0))])
+
+	var first: float = float((zones[0] as Dictionary).get("start_t", 0.0))
+	var shot_before: bool = false
+	var shot_marks: Dictionary = {}
+	var shot_inside: bool = false
+	for i in 60000:
+		await get_tree().process_frame
+		var t: float = float(s.call("_song_time"))
+		if not shot_before and t >= first - 2.2 and t < first - 0.4:
+			shot_before = true
+			await _shoot("elec_before")
+			_check(float(s.get("_elec_dark")) < 0.2, "the lights were already down before the zone")
+		for mark: float in [3.0, 6.5, 10.0]:
+			if not shot_marks.has(mark) and t >= first + mark:
+				shot_marks[mark] = true
+				await _shoot("elec_inside_%d" % int(mark))
+		if not shot_inside and t >= first + 10.0:
+			shot_inside = true
+			await _check_electric_detail(s)
+			_check(float(s.get("_elec_dark")) > 0.8,
+				"inside the zone the dark only reached %.2f" % float(s.get("_elec_dark")))
+			break
+		if t > first + 24.0:
+			break
+	_check(shot_before and shot_inside, "never reached the first electric zone")
+	_shut_down(level)
+	await _frames(10)
+
+
+## The two things a screenshot cannot show: that the gate lights actually
+## flicker, and that the gates drift on their mounts without the judge areas
+func _check_electric_detail(s: Node) -> void:
+	var looks: Variant = s.get("_looks")
+	var lights: Array = looks.get("arc_lights") as Array
+	var idx: Array = looks.get("arc_gate_idx") as Array
+	# It has to be a light the player is actually near: the ones behind are not
+	# written any more and hold whatever value they had when they went past,
+	# which looks exactly like a flicker that is not working.
+	var zs: PackedFloat32Array = s.get("gate_world_zs")
+	var pd: float = float(s.get("_player_path_dist"))
+	var lit: OmniLight3D = null
+	var lit_i: int = -1
+	for i in lights.size():
+		var l := lights[i] as OmniLight3D
+		if l == null or not is_instance_valid(l):
+			continue
+		var gi0: int = int(idx[i]) if i < idx.size() else -1
+		if gi0 < 0 or gi0 >= zs.size():
+			continue
+		if zs[gi0] < pd + 5.0 or zs[gi0] > pd + 120.0:
+			continue
+		lit = l
+		lit_i = i
+		break
+	if not _check(lit != null, "no gate light ahead of the player inside the zone"):
+		return
+	var lo: float = 1e9
+	var hi: float = -1e9
+	for f in 40:
+		await get_tree().process_frame
+		lo = minf(lo, lit.light_energy)
+		hi = maxf(hi, lit.light_energy)
+	_check(hi - lo > 0.2, "gate light never flickered (%.2f..%.2f)" % [lo, hi])
+	_check(lit.omni_range > 10.0, "gate light did not widen its throw (%.1f m)" % lit.omni_range)
+
+	# The visual drifts; the thing being judged does not.
+	var gates: Array = s.get("gate_nodes") as Array
+	var gi: int = int(idx[lit_i]) if lit_i < idx.size() else -1
+	if gi >= 0 and gi < gates.size():
+		var gate: Node3D = gates[gi]
+		var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
+		_check(vis != null and vis.position.length() > 0.001,
+			"the gate visual is not drifting inside the dark")
+		var area: Node3D = null
+		for c: Node in gate.get_children():
+			if c is Area3D:
+				area = c as Node3D
+		_check(area == null or area.position.length() < 0.001,
+			"the judge area moved with the visual — hits would drift with it")
+
+
+## Photographs a frame mid-run, then once more with each group of the level
+## switched off. Finding a thing from a screenshot by grepping for likely
+## names does not work when the thing has no name worth grepping for.
+func _big_meshes() -> void:
+	_story_context()
+	Run.run_seed = ABLATE_SEED
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	# Out of the rift intro and into open track, where the thing being
+	# looked for is actually on screen.
+	var section: Node = _find_section(level)
+	while float(section.get("_player_path_dist")) < 250.0:
+		await get_tree().process_frame
+	get_tree().paused = true
+	await _frames(20)
+	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
+	get_viewport().get_texture().get_image().save_png("%s/bigmesh_frame.png" % SHOT_DIR)
+	var cam: Camera3D = get_viewport().get_camera_3d()
+	if cam == null:
+		print("  no camera")
+		return
+	# Hide each group in turn and photograph the result, so a thing seen in a
+	# screenshot can be traced to the code that draws it. Geometry queries are
+	# no good for this: an AABB around a long diagonal laser covers half the
+	# screen, and the thing being looked for is usually not the biggest box.
+	for child: Node in _find_section(level).get_children():
+		var vis := child as Node3D
+		if vis == null or not vis.visible:
+			continue
+		vis.visible = false
+		await _frames(4)
+		get_viewport().get_texture().get_image().save_png(
+			"%s/hide_%s.png" % [SHOT_DIR, child.name])
+		print("  hide_%s.png" % child.name)
+		vis.visible = true
+		await _frames(2)
+	get_tree().paused = false
+	_shut_down(level)
+	await _frames(10)
+
+
+## How much more neon the frame can carry. These knobs are read once while the
+## level builds itself, so each candidate needs its own boot — and each boot is
+## photographed at the shared post-load state, before anything has moved.
 func _world_density() -> void:
 	Engine.max_fps = 0
 	DirAccess.make_dir_recursive_absolute(SHOT_DIR)

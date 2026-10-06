@@ -69,6 +69,27 @@ var music_volume:  float = 1.0     # Music bus, relative to Master
 var sfx_volume:    float = 1.0     # SFX bus, relative to Master
 var fullscreen:    bool  = true
 var vsync_enabled: bool  = true
+
+## Photosensitivity. The game opens on an epilepsy warning and then flashes hard
+## on every beat; this is the setting that warning implies should exist. It does
+## not change what the player has to do — gates are read by lane and by shape,
+## never by colour — it only takes the punch out of the per-beat spike, the HUD
+## hit flashes and the strobing lasers.
+var reduced_flashing: bool = false
+
+## Frame-rate readout on the HUD, off by default. The quality tiers span 593 fps
+## to 87 on the same machine, and a tier the machine cannot hold reads as the
+## game being wrong rather than the setting being too high.
+var show_fps: bool = false
+
+## How much of the on-beat flash to keep. One number, so everything that pulses
+## stays in step with everything else instead of each effect picking its own
+## reduction.
+const REDUCED_FLASH_SCALE: float = 0.22
+
+
+func flash_scale() -> float:
+	return REDUCED_FLASH_SCALE if reduced_flashing else 1.0
 var max_fps:       int   = 120     # 0 = unlimited
 
 
@@ -372,6 +393,8 @@ func save() -> void:
 	cfg.set_value("display",    "laser_count",          laser_count)
 	cfg.set_value("display",    "fullscreen",           fullscreen)
 	cfg.set_value("display",    "vsync",                vsync_enabled)
+	cfg.set_value("display",    "reduced_flashing",     reduced_flashing)
+	cfg.set_value("display",    "show_fps",             show_fps)
 	cfg.set_value("display",    "max_fps",              max_fps)
 	cfg.set_value("audio",      "master_volume",        master_volume)
 	cfg.set_value("audio",      "music_volume",         music_volume)
@@ -417,6 +440,8 @@ func load_from_disk() -> void:
 	advanced_lighting   = bool(cfg.get_value("display", "advanced_lighting", advanced_lighting))
 	fullscreen          = bool(cfg.get_value("display", "fullscreen", fullscreen))
 	vsync_enabled       = bool(cfg.get_value("display", "vsync",      vsync_enabled))
+	reduced_flashing    = bool(cfg.get_value("display", "reduced_flashing", reduced_flashing))
+	show_fps            = bool(cfg.get_value("display", "show_fps", show_fps))
 	max_fps             = maxi(0, int(cfg.get_value("display", "max_fps", max_fps)))
 	master_volume       = clampf(float(cfg.get_value("audio", "master_volume", master_volume)), 0.0, 1.0)
 	music_volume        = clampf(float(cfg.get_value("audio", "music_volume",  music_volume)),  0.0, 1.0)
@@ -458,6 +483,8 @@ func reset_defaults() -> void:
 	sfx_volume          = 1.0
 	fullscreen          = true
 	vsync_enabled       = true
+	reduced_flashing    = false
+	show_fps            = false
 	max_fps             = 120
 	gate_preview_beats  = 2.5
 	halo_size           = 4.2
