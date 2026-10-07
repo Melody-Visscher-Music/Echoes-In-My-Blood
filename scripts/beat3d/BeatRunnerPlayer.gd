@@ -1114,6 +1114,32 @@ func _override_mesh_albedo(node_name: String, color: Color) -> void:
 		mesh_node.set_surface_override_material(surf, new_mat)
 
 
+## Static charge, 0 to 1. In an electric blackout the air is live, and the most
+## reliable place to show that is the thing the player is already looking at:
+## his coat lifts, stands away from the body and stops lying along the surface.
+##
+## Pushes three SO FLUFFY properties at once — longer strands, growth blended
+## off the surface normal, and a world-space up direction for them to stand in.
+## Everything is driven from the authored values rather than remembered
+## separately, so turning the charge back to 0 restores exactly what was set in
+## the inspector.
+func set_static_charge(amount: float) -> void:
+	var a: float = clampf(amount, 0.0, 1.0)
+	if absf(a - _static_charge) < 0.004:
+		return
+	_static_charge = a
+	_set_fur_all(&"length", fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a))
+	_set_fur_all(&"normal_strength", fur_normal_strength * lerpf(1.0, 0.25, a))
+	_set_fur_all(&"static_direction_world", Vector3.UP * a)
+	_set_fur_all(&"scruffiness", fur_scruffiness * lerpf(1.0, _STATIC_SCRUFF_GAIN, a))
+
+
+## How much longer and wilder the coat gets at full charge.
+const _STATIC_LENGTH_GAIN: float = 1.9
+const _STATIC_SCRUFF_GAIN: float = 2.2
+var _static_charge: float = 0.0
+
+
 func _set_fur_all(prop: StringName, val: Variant) -> void:
 	# Applies a SO FLUFFY property to the body fur and both accent nodes in one call.
 	if _so_fluffy_node and is_instance_valid(_so_fluffy_node):

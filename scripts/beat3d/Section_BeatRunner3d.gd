@@ -249,8 +249,10 @@ var _ambient_cursor: int                  = 0
 ## Held so the ambient term can be faded; _setup_world_environment() builds it.
 var _world_env: Environment = null
 
-## How fast the lights go out, per second. A snap reads as a bug.
-const _ELEC_DARK_RATE: float = 2.2
+## How fast the world dims once the front has reached the player. A snap reads
+## as a bug, but this is the last link in a chain that has to finish before the
+## first gate of the zone — see _ELEC_PREROLL_S.
+const _ELEC_DARK_RATE: float = 3.6
 ## What is left of an overhead light inside the dark. Not zero: the floor still
 ## has to be legible enough to aim at, and the lane dashes are self-lit anyway.
 const _ELEC_AMBIENT_FLOOR: float = 0.10
@@ -267,12 +269,55 @@ const _ELEC_WORLD_GLOW: float = 0.05
 ## this is what decides whether the zone reads as a dark room or as a lit one
 ## with the lamps off.
 const _ELEC_SKY_GLOW: float = 0.06
-## The scene's normal distance fog, held as a constant so the blackout can scale
-## it and put it back exactly.
+## The scene's normal distance fog, named rather than inline because the
+## blackout's darkness leans on it: dark fog is what turns the distance black.
 const _FOG_DENSITY: float = 0.008
-## How much of that fog is left in the dark. Darkness should come from nothing
-## being lit, not from a black fog that hides what little is.
-const _ELEC_FOG_THIN: float = 0.22
+
+## How early the blackout arms, in seconds before the zone's own start time.
+## The whole sequence — front travels the lead distance, then the world dims —
+## has to be FINISHED by the time the first electric gate arrives, or the player
+## meets that gate mid-fade and the zone looks like it is still making its mind
+## up. Everything below is sized against this.
+const _ELEC_PREROLL_S: float = 1.4
+
+## How far up the track the blackout front starts, and how fast it runs back at
+## the player. The speed is derived rather than typed, so the front always
+## covers its lead in a bit over half the preroll and leaves the rest for the
+## dimming — change the preroll and the wave keeps up on its own.
+const _ELEC_WAVE_LEAD_M:  float = 200.0
+const _ELEC_WAVE_SPEED:   float = _ELEC_WAVE_LEAD_M / (_ELEC_PREROLL_S * 0.55)
+## Path distance of the front. INF when there is no blackout running.
+var _elec_wave_pd: float = INF
+
+## A miss in the dark arcs hard enough to light the room for a moment. This is
+## how long it lasts — long enough to lose your night vision, short enough that
+## it is a punishment and not a reprieve.
+const _ELEC_BLIND_S: float = 0.30
+var _elec_blind_t: float = 0.0
+
+## A zone pays double, so it costs double: no healing on a hit, and a miss is
+## 15% instead of 10%.
+const _ELEC_MISS_COST: float = 0.15
+
+## How close a gate has to be before its arcs strike at all, and the band over
+## which it fizzes in rather than snapping on. At the runner's speed the ignite
+## distance is a little over three seconds of warning.
+const _ELEC_IGNITE_M: float = 62.0
+const _ELEC_FIZZ_M:   float = 18.0
+## What a gate's arcs are down to between beats, as a fraction of their on-beat
+## brightness. Not zero: it is a swell, not a switch, and a gate you cannot see
+## between beats is a gate you cannot read.
+const _ELEC_BEAT_DIP: float = 0.45
+## How far behind the player a gate he has just passed stays on screen. Without
+## it the gate he is crossing blinks out from under him.
+const _ELEC_SHOW_BEHIND_M: float = 14.0
+
+## Nothing here any more: a gate past the ignite distance throws no light at
+## all, so the distance stays genuinely black. What stops it from popping into
+## existence is that its own emission never went away — only its illumination
+## of everything else did.
+## The live rail running the length of each zone — see _spawn_elec_conduits.
+var _elec_conduit_mat: ShaderMaterial = null
 ## How much harder a gate burns when it is the only light in the room.
 const _ELEC_GATE_GAIN: float = 5.0
 ## ...and how far it throws, in metres.
@@ -946,6 +991,7 @@ func _process(delta: float) -> void:
 				_player_path_dist, _DECO_WINDOW_BEHIND_M, _deco_window_ahead_m,
 				lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark))
 		_update_electric_dark(dt_pulse, t_s)
+		_update_electric_gate_visuals(t_s)
 		_update_electric_pulse(dt_pulse, t_s)
 
 	# Beat phase decays quickly (full fade in ~0.28 s) — drives beat-sync brightness spikes
@@ -984,7 +1030,8 @@ func _process(delta: float) -> void:
 	# the music even if the frame rate moves.
 	if _laser_rig != null:
 		_laser_rig.advance(_player_path_dist)
-		_laser_rig.tick(t_s, _beat_phase * GameConfig.flash_scale())
+		if _laser_rig.visible:
+			_laser_rig.tick(t_s, _beat_phase * GameConfig.flash_scale())
 
 	# slow palette drift. (Was guarded by has_method("_update_color_cycle") — a
 	# String-to-StringName conversion plus a method-table lookup every frame, for a
@@ -3664,6 +3711,7 @@ func _action_color(action: String) -> Color:
 # High-voltage transmission pylons with glowing insulator tips replace city
 # buildings.  Tip glows pulse gently on beat; obstacle arcs pulse hard.
 func _spawn_electric_environment() -> void:
+	_spawn_elec_conduits()
 	var end_z: float = _song_end_z()
 	var tw:    float = _track_full_width()
 	const PYLON_SPACING: float = 55.0
@@ -3839,7 +3887,32 @@ func _spawn_electric_environment() -> void:
 ## _update_electric_pulse because that one returns early when there is no beat
 ## left to decay, and the dark has to hold between beats — that is the point.
 func _update_electric_dark(delta: float, t_s: float) -> void:
-	var want: float = 1.0 if _is_electric_at(t_s) else 0.0
+	var pd: float = _player_path_dist
+	# Armed before the zone, not at it. _is_electric_at() is the real boundary
+	# and stays that way for scoring; this is the lighting cue, and it has to
+	# run ahead of the thing it is cueing.
+	var in_zone: bool = _elec_blackout_at(t_s)
+
+	# ── The blackout arrives as a front, not as a dimmer ─────────────────────
+	# It starts a couple of hundred metres up the track and runs back at the
+	# player faster than he is going, so the lamps go out in sequence ahead of
+	# him and the dark closes the last of the distance itself. A global fade
+	# reads as a setting being changed; this reads as something happening.
+	if not in_zone:
+		_elec_wave_pd = INF
+	elif is_inf(_elec_wave_pd):
+		_elec_wave_pd = pd + _ELEC_WAVE_LEAD_M
+	else:
+		_elec_wave_pd = maxf(pd, _elec_wave_pd - _ELEC_WAVE_SPEED * delta)
+
+	# A miss arcs hard enough to bring the lights back for a moment — see
+	# _on_gate_scored. The dark returns the instant it passes.
+	_elec_blind_t = maxf(0.0, _elec_blind_t - delta)
+
+	# The world only goes dark once the front has actually reached him.
+	var want: float = 0.0
+	if in_zone and _elec_wave_pd <= pd + 1.0 and _elec_blind_t <= 0.0:
+		want = 1.0
 	_elec_dark = move_toward(_elec_dark, want, delta * _ELEC_DARK_RATE)
 
 	if _world_env != null:
@@ -3851,22 +3924,24 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 		# background is not an object. These two are.
 		_world_env.background_energy_multiplier = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
 		_world_env.fog_light_energy = lerpf(1.0, _ELEC_SKY_GLOW, _elec_dark)
-		# ...and the fog gets THINNER as it gets darker, which is the whole
-		# reason the floor cues were vanishing. Fog blends what is behind it
-		# toward its own colour, so dark fog swallows distant surfaces: the
-		# three approach marks and the safe strip sit 20-100 m ahead when they
-		# matter, and at density 0.008 that is a third to a half of the way to
-		# black. The gates survived it because their arcs burn five times
-		# brighter; the cues, which are lit panels with modest emission, did
-		# not. Thinning the fog keeps the room dark without putting a black
-		# curtain between the player and the thing telling them where to go.
-		_world_env.fog_density = lerpf(_FOG_DENSITY, _FOG_DENSITY * _ELEC_FOG_THIN,
-			_elec_dark)
 
-	# The lights switch on their OWN path distance, not the player's, so the
-	# dark stretch is something you can see coming rather than something that
-	# falls on you once you are already in it.
-	var pd: float = _player_path_dist
+	# The side lasers are house lighting, and the house is dark. They fade out
+	# with the blackout and then switch off outright — set_intensity only
+	# reaches the beams, and hiding the rig takes the lens flares with it.
+	if _laser_rig != null:
+		var lit: float = 1.0 - _elec_dark
+		_laser_rig.set_intensity(lit)
+		_laser_rig.visible = lit > 0.02
+
+	# The two things that are not the world: his coat, and the readouts.
+	if player != null and player.has_method("set_static_charge"):
+		player.set_static_charge(_elec_dark)
+	if _hud != null and _hud.has_method("set_interference"):
+		_hud.set_interference(_elec_dark)
+
+	# A lamp is out when it is inside a zone AND the front has passed it. The
+	# front moves toward the player, so the far lamps die first and the wave
+	# comes at him down the track.
 	var lo: float = pd - _DECO_WINDOW_BEHIND_M
 	var hi: float = pd + _deco_window_ahead_m
 	while _ambient_cursor < _ambient_pds.size() and _ambient_pds[_ambient_cursor] < lo:
@@ -3874,8 +3949,73 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 	for i in range(_ambient_cursor, _ambient_lights.size()):
 		if i >= _ambient_pds.size() or _ambient_pds[i] > hi:
 			break
+		var lamp_out: bool = (
+			_elec_blind_t <= 0.0
+			and _z_blackout(_ambient_pds[i])
+			and _ambient_pds[i] >= _elec_wave_pd)
 		_ambient_lights[i].light_energy = 2.2 * (
-			_ELEC_AMBIENT_FLOOR if _z_is_electric(_ambient_pds[i]) else 1.0)
+			_ELEC_AMBIENT_FLOOR if lamp_out else 1.0)
+
+
+## A live rail down both sides of every electric zone, so the gates in there
+## read as points on one circuit rather than as a row of unrelated obstacles.
+## The stripe scroll in the panel shader does the work: current visibly runs
+## along it, in the direction of travel, between one gate and the next.
+##
+## One MultiMesh for every segment in the song — a few hundred short boxes
+## following the path, so corners bend with it — and one shared material, which
+## means one draw call and one place to drive the whole circuit from.
+##
+## Deliberately NOT dimmed by the blackout. Everything else in a zone goes dark
+## because nothing is powering it; this is the thing that IS powered. It shows
+## the shape of the track without showing which lane is safe, which is the line
+## the floor cues crossed.
+func _spawn_elec_conduits() -> void:
+	if _electric_zones.is_empty() or player == null or player.forward_speed <= 0.0:
+		return
+	const STEP_M: float = 4.0
+	const SEG_LEN: float = 3.2
+	var tw: float = _track_full_width()
+	var lateral: float = tw * 0.5 + 0.22
+	var speed: float = player.forward_speed
+	var end_pd: float = _song_end_z()
+
+	var tf: Array[Transform3D] = []
+	for zone: Dictionary in _electric_zones:
+		var a: float = maxf(0.0, float(zone.get("start_t", 0.0)) * speed)
+		var b: float = minf(end_pd, float(zone.get("end_t", 0.0)) * speed)
+		var pd: float = a
+		while pd < b:
+			var fwd: Vector3 = _path_forward_at(pd)
+			var yrot: float = atan2(fwd.x, fwd.z)
+			for side in [-1.0, 1.0]:
+				var basis := Basis(Vector3.UP, yrot)
+				tf.append(Transform3D(basis, _path_world_pos(pd, side * lateral, 0.55)))
+			pd += STEP_M
+	if tf.is_empty():
+		return
+
+	var mesh := BoxMesh.new()
+	mesh.size = Vector3(0.10, 0.16, SEG_LEN)
+	var mat: ShaderMaterial = NeonMat.panel(Color(0.45, 0.85, 1.00), 2.6)
+	mat.set_shader_parameter("detail", 2.0)        # stripes on: current flowing
+	mat.set_shader_parameter("stripe_amount", 0.75)
+	mat.set_shader_parameter("stripe_speed", 2.6)
+	mat.set_shader_parameter("scan_speed", 0.9)
+	_elec_conduit_mat = mat
+
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = tf.size()
+	for i in tf.size():
+		mm.set_instance_transform(i, tf[i])
+
+	var mmi := MultiMeshInstance3D.new()
+	mmi.name = "ElecConduit"
+	mmi.multimesh = mm
+	mmi.material_override = mat
+	world_fx_root.add_child(mmi)
 
 
 func _update_electric_pulse(delta: float, t_s: float) -> void:
@@ -3903,6 +4043,12 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 	# Scenery, not gates: the pylons go dark with the rest of the room. Only the
 	# thing the player has to navigate is allowed to stay lit.
 	var world_mul: float = lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark)
+
+	# The conduit is the exception — it is the circuit, and it surges brighter
+	# in the dark rather than dimmer.
+	if _elec_conduit_mat != null:
+		NeonMat.set_energy(_elec_conduit_mat,
+			lerpf(2.6, 5.2, _elec_dark) * (1.0 + _elec_pulse_t * 0.6))
 	var env_e:    float = lerpf(env_base, env_peak, _elec_pulse_t) * world_mul
 	for mat in _elec_env_mats:
 		NeonMat.set_energy(mat, env_e)
@@ -3942,13 +4088,35 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 			if _elec_dark <= 0.001:
 				lt.light_energy = lt_e
 			else:
+				# How far off it still is. Beyond the ignite distance the arcs
+				# are down to a trace rather than out, so the gate reads as a
+				# shape in the dark that has not struck yet — then comes up as
+				# it closes, instead of appearing from nothing.
+				var ahead: float = 0.0
+				if gi >= 0 and gi < gate_world_zs.size():
+					ahead = gate_world_zs[gi] - _player_path_dist
+				var ignite: float = clampf(
+					(_ELEC_IGNITE_M - ahead) / maxf(_ELEC_FIZZ_M, 0.01), 0.0, 1.0)
+				ignite = ignite * ignite
+				# ...and the beat swells it rather than switching it. Damped by
+				# the photosensitivity setting like every other pulse here.
+				var swell: float = lerpf(_ELEC_BEAT_DIP, 1.0, _beat_phase)
+				swell = lerpf(1.0, swell, GameConfig.flash_scale())
 				# Two sines at odds with each other: a fast rattle and a slower
 				# swell, offset per light so neighbouring gates never flicker
 				# in unison. Damped by the photosensitivity setting, because a
 				# strobing light source is exactly what that setting is for.
-				var fl: float = 0.70 					+ 0.30 * sin(t_s * (13.0 + float(i % 5) * 2.7) + float(i) * 1.9) 					* (0.55 + 0.45 * sin(t_s * 1.7 + float(i) * 0.6))
+				var fl: float = (0.70
+					+ 0.30 * sin(t_s * (13.0 + float(i % 5) * 2.7) + float(i) * 1.9)
+					* (0.55 + 0.45 * sin(t_s * 1.7 + float(i) * 0.6)))
 				fl = lerpf(1.0, fl, GameConfig.flash_scale())
-				lt.light_energy = lerpf(lt_e, lt_e + _ELEC_GATE_GAIN * fl, _elec_dark)
+				# The whole thing scales by ignite, base included, so a gate
+				# that has not struck yet throws NOTHING — the track around it
+				# stays black and it reads as a shape out there rather than as
+				# a lamp. Its own neon is emissive and unaffected, so the gate
+				# is still on screen; it just is not lighting anything.
+				lt.light_energy = lerpf(
+					lt_e, (lt_e + _ELEC_GATE_GAIN * fl * swell) * ignite, _elec_dark)
 				lt.omni_range = lerpf(lt.omni_range, _ELEC_GATE_RANGE, 0.15)
 			_sway_electric_gate(gi, t_s, i)
 
@@ -3960,6 +4128,60 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 		if i >= _elec_pylon_pds.size() or _elec_pylon_pds[i] > hi:
 			break
 		_elec_pylon_lights[i].light_energy = lt_e * world_mul
+
+
+## One gate at a time, and the drift.
+##
+## Outside a zone, gate_preview_beats decides how far ahead the player can see
+## and that is the player's business. Inside one it is overridden: exactly one
+## gate ahead, whatever the setting says. Reading four gates ahead and planning
+## a route is the skill the rest of the game asks for; the blackout asks for a
+## different one, and leaving the preview in place would let a player opt out
+## of it from the options menu.
+##
+## Note what this does NOT do. It does not blink gates on the beat and it does
+## not hide them past an ignite distance — both were tried and both made the
+## zone unreadable, because a gate that comes and goes cannot be judged. Each
+## gate is revealed once, at whatever distance it stands, and stays until it is
+## behind the player. Its arcs are still dark that far out (see
+## _update_electric_pulse), so it arrives as a shape and lights up as it closes
+## rather than snapping into being.
+func _update_electric_gate_visuals(t_s: float) -> void:
+	var pd: float = _player_path_dist
+	var blackout: bool = _elec_dark > 0.001
+
+	# The nearest electric gate the player has not reached yet.
+	var next_ahead: int = -1
+	var next_d: float = INF
+	if blackout:
+		for i in range(gate_nodes.size()):
+			if i >= gate_is_electric.size() or not gate_is_electric[i]:
+				continue
+			if i >= gate_world_zs.size():
+				continue
+			var d: float = gate_world_zs[i] - pd
+			if d > 0.0 and d < next_d:
+				next_d = d
+				next_ahead = i
+
+	for i in range(gate_nodes.size()):
+		if i >= gate_is_electric.size() or not gate_is_electric[i]:
+			continue
+		var gate: Node3D = gate_nodes[i]
+		if gate == null or not is_instance_valid(gate) or not gate.visible:
+			continue
+		var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
+		if vis == null:
+			continue
+		var want: bool = true
+		if blackout and i < gate_world_zs.size():
+			# The one coming, plus the one being passed — a gate does not
+			# vanish out of the player's lap the instant he crosses it.
+			var d2: float = gate_world_zs[i] - pd
+			want = (i == next_ahead) or (d2 <= 0.0 and d2 > -_ELEC_SHOW_BEHIND_M)
+		if vis.visible != want:
+			vis.visible = want
+		_sway_electric_gate(i, t_s, i)
 
 
 ## A loose mounting, not a moving target. This rides VisRoot, which exists so
@@ -3994,6 +4216,18 @@ func _sway_electric_gate(gate_index: int, t_s: float, seed_i: int) -> void:
 
 
 # ── Electric zone helpers ──────────────────────────────────────────────────────
+
+## Whether the BLACKOUT should be running — the zone's own window, opened early
+## by the preroll. Scoring, gate electrification and the double payout all use
+## _is_electric_at() and the real bounds; only the lights come on early.
+func _elec_blackout_at(t_s: float) -> bool:
+	for zone: Dictionary in _electric_zones:
+		if (t_s >= float(zone.get("start_t", 0.0)) - _ELEC_PREROLL_S
+				and t_s < float(zone.get("end_t", 0.0))):
+			return true
+	return false
+
+
 func _is_electric_at(t_s: float) -> bool:
 	for zone: Dictionary in _electric_zones:
 		if t_s >= float(zone.get("start_t", 0.0)) and t_s < float(zone.get("end_t", 0.0)):
@@ -4004,6 +4238,16 @@ func _z_is_electric(world_z: float) -> bool:
 	if player == null or player.forward_speed <= 0.0:
 		return false
 	return _is_electric_at(world_z / player.forward_speed)
+
+
+## The same question for the blackout rather than the zone, so a lamp standing
+## in the stretch just before the first gate goes out with the rest. Without
+## this the world dimmed early but the last few lamps stayed on, and the player
+## met that gate with light still on the track.
+func _z_blackout(world_z: float) -> bool:
+	if player == null or player.forward_speed <= 0.0:
+		return false
+	return _elec_blackout_at(world_z / player.forward_speed)
 
 
 # ── Section geometry (corridors, elevated paths, ramps) ────────────────────
@@ -6304,9 +6548,13 @@ func _on_gate_scored(success: bool) -> void:
 		_combo += 1
 		_max_combo = maxi(_max_combo, _combo)
 		_gates_hit += 1
-		var _base_gate_pts: int = 1000 if _is_electric_at(_song_time()) else 500
+		var in_zone: bool = _is_electric_at(_song_time())
+		var _base_gate_pts: int = 1000 if in_zone else 500
 		_score += _base_gate_pts * _score_multiplier()
-		_health_pct = clamp(_health_pct + 0.05, 0.0, 1.0)
+		# No healing in the dark. The zone pays double and costs double — you
+		# can bank points in there, you cannot repair yourself.
+		if not in_zone:
+			_health_pct = clamp(_health_pct + 0.05, 0.0, 1.0)
 		_world_vitality = clamp(_world_vitality + 0.25, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
@@ -6324,13 +6572,21 @@ func _on_gate_scored(success: bool) -> void:
 			_gates_missed += 1
 			_update_hud_score()
 			return
+		var miss_in_zone: bool = _is_electric_at(_song_time())
 		_combo = 0
 		_gates_missed += 1
 		_world_vitality = clamp(_world_vitality - 0.18, 0.0, 1.0)
-		_health_pct = clamp(_health_pct - 0.10, 0.0, 1.0)
+		_health_pct = clamp(_health_pct - (_ELEC_MISS_COST if miss_in_zone else 0.10), 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health()
-		_hud_flash_color(Color(1.00, 0.10, 0.10, 0.17), 0.34)   # fires on every miss — must not blind
+		if miss_in_zone:
+			# Clipping a live gate arcs. The room comes back for a third of a
+			# second — every lamp, every surface — and then the dark slams shut
+			# again, which costs you the night vision you had just earned.
+			_elec_blind_t = _ELEC_BLIND_S
+			_hud_flash_color(Color(0.85, 0.95, 1.00, 0.55), 0.22)
+		else:
+			_hud_flash_color(Color(1.00, 0.10, 0.10, 0.17), 0.34)   # fires on every miss — must not blind
 		_shake_camera()
 		# Combo label flash red then vanish
 		if _hud != null:

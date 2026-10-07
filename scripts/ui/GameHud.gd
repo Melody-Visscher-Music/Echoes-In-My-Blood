@@ -177,6 +177,7 @@ func _process(delta: float) -> void:
 	_update_score_rainbow(delta)
 	_update_callout(delta)
 	_update_fps(delta)
+	_update_interference(delta)
 
 
 func _refresh_vp() -> void:
@@ -299,6 +300,49 @@ func _build() -> void:
 ## 87 on the same machine, and without this the only way to find out whether the
 ## tier you picked is one your machine can hold is to feel the judder — which in
 ## a rhythm game reads as the game being wrong rather than the setting.
+## Electrical interference, 0 to 1. The readouts are the one thing in the frame
+## that is not part of the world, so when the world goes live they should look
+## like they are having trouble with it: scanlines crank up, the holo grid comes
+## forward, the scan rolls faster and the whole plate jitters a pixel or two.
+##
+## Drives shader uniforms the plate already has rather than a new shader, and
+## the jitter is applied as an offset from each plate's laid-out position so a
+## resize still puts them where _layout() says.
+func set_interference(amount: float) -> void:
+	var a: float = clampf(amount, 0.0, 1.0)
+	_interference = a
+	for plate: ColorRect in [_score_plate, _hp_bar]:
+		if plate == null:
+			continue
+		var m := plate.material as ShaderMaterial
+		if m == null:
+			continue
+		m.set_shader_parameter("scan_amount", lerpf(0.35, 0.95, a))
+		m.set_shader_parameter("scan_speed", lerpf(11.0, 46.0, a))
+		m.set_shader_parameter("grid_amount", lerpf(0.30, 0.80, a))
+
+
+## Called from _process so the jitter has motion. Zero interference costs one
+## comparison and no writes.
+func _update_interference(_delta: float) -> void:
+	if _interference <= 0.001:
+		if _jitter_applied:
+			_jitter_applied = false
+			_layout()
+		return
+	_jitter_applied = true
+	var j: float = _interference * 2.6 * _s
+	for plate: Control in [_score_group, _hp_group]:
+		if plate == null:
+			continue
+		plate.position = Vector2(
+			randf_range(-j, j), randf_range(-j * 0.6, j * 0.6))
+
+
+var _interference: float = 0.0
+var _jitter_applied: bool = false
+
+
 func _build_fps() -> void:
 	_fps_label = UiStyle.label("", UiStyle.caption(2.0), int(12 * _s), Color.WHITE)
 	_fps_label.self_modulate = Color(0.70, 0.80, 1.00, 0.70)

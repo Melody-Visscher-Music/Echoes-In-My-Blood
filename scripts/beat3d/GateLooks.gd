@@ -485,11 +485,12 @@ func _vis_elec_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) 
 
 		gi += 1
 
-	# Safe-lane cues (same as city theme)
+	# No floor cues in here. Everywhere else the three approach marks and the
+	# safe-lane strip paint the way through; an electric zone is a blackout lit
+	# only by the gates themselves, and reading the gate IS the challenge. The
+	# arch stays — it is part of the gate, not a hint about which lane to take.
 	var safe_x: float = lane_xs[safe_lane]
 	pieces.arch(root, safe_x, lane_blocker_width * 0.88, 0.0, lane_blocker_height, tint)
-	pieces.approach_marks(root, safe_x, lane_blocker_width * 0.80, tint)
-	root.add_child(pieces.safe_strip(safe_x, tint))
 
 
 # ── Electric jump gate ────────────────────────────────────────────────────────
@@ -523,8 +524,6 @@ func _vis_elec_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 		chev2.position   = Vector3(sign * chev_off * 0.7, chev_y + 0.32, -gate_depth * 0.5 - 0.05)
 		chev2.rotation.z = deg_to_rad(-sign * 32.0)
 		root.add_child(chev2)
-
-	pieces.approach_marks(root, 0.0, tw, tint)
 
 
 # ── Electric slide gate ───────────────────────────────────────────────────────
@@ -572,8 +571,6 @@ func _vis_elec_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 	var fsmat := floor_strip.material_override as StandardMaterial3D
 	if fsmat != null: fsmat.emission_energy_multiplier = 2.5
 	root.add_child(floor_strip)
-
-	pieces.approach_marks(root, 0.0, tw, tint)
 
 
 # ── Electric wall gate ────────────────────────────────────────────────────────

@@ -529,7 +529,10 @@ func _verify_menus() -> void:
 
 	# Death: the card arrives behind a fade, so give it time to land.
 	section.call("_trigger_death")
-	await _frames(90)
+	# Time, not frames: the card arrives behind a 0.87 s tween, and ninety
+	# frames stopped being a second and a half the moment the harness started
+	# running with V-Sync off.
+	await _until(func() -> bool: return bool(menus.call("is_death_open")), 4.0)
 	_check(bool(menus.call("is_death_open")), "death card did not open")
 	var death_before: int = int(menus.get("_death_sel"))
 	menus.call("handle_death_key", _key(KEY_DOWN))
@@ -545,7 +548,7 @@ func _verify_menus() -> void:
 	section = _find_section(level)
 	menus = section.get("_menus")
 	section.call("_spawn_results_panel")
-	await _frames(90)
+	await _until(func() -> bool: return bool(menus.call("is_results_open")), 4.0)
 	_check(bool(menus.call("is_results_open")), "results panel did not open")
 	var results_before: int = int(menus.get("_results_sel"))
 	menus.call("handle_results_key", _key(KEY_RIGHT))
@@ -1061,6 +1064,10 @@ func _electric_zones(song: String) -> void:
 	DirAccess.make_dir_recursive_absolute(SHOT_DIR)
 	_story_context(song)
 	Run.run_seed = ABLATE_SEED
+	# Four times the default preview. "No matter how much preview someone has"
+	# is the requirement, so the test has to actually ask for a lot of it.
+	var was_preview: float = GameConfig.gate_preview_beats
+	GameConfig.gate_preview_beats = 10.0
 	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
 	add_child(level)
 	await _until_level_ready(level)
@@ -1077,19 +1084,28 @@ func _electric_zones(song: String) -> void:
 	var first: float = float((zones[0] as Dictionary).get("start_t", 0.0))
 	var shot_before: bool = false
 	var probed_after: bool = false
+	var checked_start: bool = false
 	var shot_marks: Dictionary = {}
 	var shot_inside: bool = false
 	for i in 60000:
 		await get_tree().process_frame
 		var t: float = float(s.call("_song_time"))
-		if not shot_before and t >= first - 0.6 and t < first - 0.1:
+		if not shot_before and t >= first - 2.6 and t < first - 1.8:
 			shot_before = true
 			await _shoot("elec_before")
 			_cue_probe_before = _probe_cues(s)
-			_check(float(s.get("_elec_dark")) < 0.2, "the lights were already down before the zone")
+			_check(float(s.get("_elec_dark")) < 0.05,
+				"the blackout had already started more than a preroll before the zone")
 		# Close to the edge, where the same gates are still in front of the
 		# player: "it breaks right when it dims" is a two-second window, and
 		# ten seconds later every gate from the first sample is long gone.
+		# The point of the preroll: by the zone's own start time the blackout is
+		# finished, not starting. The first electric gate arrives into a room
+		# that is already dark.
+		if shot_before and not checked_start and t >= first and t < first + 0.35:
+			checked_start = true
+			_check(float(s.get("_elec_dark")) > 0.9,
+				"at the zone's first gate the dark had only reached %.2f" % float(s.get("_elec_dark")))
 		if shot_before and not probed_after and t >= first + 1.5:
 			probed_after = true
 			_report_cue_changes(s)
@@ -1107,6 +1123,7 @@ func _electric_zones(song: String) -> void:
 		if t > first + 24.0:
 			break
 	_check(shot_before and shot_inside, "never reached the first electric zone")
+	GameConfig.gate_preview_beats = was_preview
 	_shut_down(level)
 	await _frames(10)
 
@@ -1231,6 +1248,55 @@ func _gate_cue_census(s: Node, where: String) -> void:
 	print("  %-16s settled gates %d, displaced %d (worst %.2f m), with floor cues %d" % [
 		where, shown, stray, worst, cues])
 	_check(stray == 0, "%s: %d settled gate visuals are away from their gate" % [where, stray])
+	# Electric gates carry no floor cues by design — no approach marks, no
+	# safe strip. The zone is a blackout and reading the gate is the challenge,
+	# so nothing in there paints the way through.
+	if where.begins_with("inside") and shown > 0:
+		_check(cues == 0, "%d gates inside the zone still show floor cues" % cues)
+		# Gates are always on screen; what changes is how hard they burn. So the
+		# thing to check is that a gate still out in the dark is dimmer than one
+		# that has closed — not that it is missing, which is what this used to
+		# assert and what made the zone unreadable to play.
+		var looks2: Variant = s.get("_looks")
+		var lights2: Array = looks2.get("arc_lights") as Array
+		var idx2: Array = looks2.get("arc_gate_idx") as Array
+		var near_e: float = -1.0
+		var far_e: float = -1.0
+		for li in lights2.size():
+			var l2 := lights2[li] as OmniLight3D
+			if l2 == null or not is_instance_valid(l2) or li >= idx2.size():
+				continue
+			var g4: int = int(idx2[li])
+			if g4 < 0 or g4 >= zs2.size():
+				continue
+			var ahead2: float = zs2[g4] - pd2
+			if ahead2 > 10.0 and ahead2 < 45.0:
+				near_e = maxf(near_e, l2.light_energy)
+			elif ahead2 > 110.0 and ahead2 < 200.0:
+				far_e = maxf(far_e, l2.light_energy)
+		if near_e >= 0.0 and far_e >= 0.0:
+			print("    gate arcs: %.2f near, %.2f far" % [near_e, far_e])
+			_check(far_e < near_e * 0.6,
+				"a gate out at distance burns %.2f against %.2f up close — it is not igniting late" % [
+					far_e, near_e])
+
+		# Exactly one gate ahead, whatever the preview is set to.
+		var ahead_vis: int = 0
+		for gi5 in gates2.size():
+			if gi5 >= zs2.size() or not bool((s.get("gate_is_electric") as Array)[gi5]):
+				continue
+			if zs2[gi5] - pd2 <= 0.0:
+				continue
+			var g5: Node3D = gates2[gi5]
+			if g5 == null or not g5.visible:
+				continue
+			var v5: Node3D = g5.get_node_or_null("VisRoot") as Node3D
+			if v5 != null and v5.visible:
+				ahead_vis += 1
+		print("    gates readable ahead: %d (preview %.1f beats)" % [
+			ahead_vis, GameConfig.gate_preview_beats])
+		_check(ahead_vis <= 1,
+			"%d electric gates are readable ahead — the zone can be planned" % ahead_vis)
 
 
 ## The two things a screenshot cannot show: that the gate lights actually
@@ -1384,6 +1450,18 @@ func _world_density() -> void:
 		await _frames(20)
 	GraphicsQuality.dev_clear_overrides()
 	print("  written to %s" % ProjectSettings.globalize_path(SHOT_DIR))
+
+
+## Waits for something to become true, or gives up after `seconds`. Anything
+## driven by a tween has to be waited for in seconds: a frame count means one
+## thing at 60 fps and something quite different at 130.
+func _until(cond: Callable, seconds: float) -> void:
+	var waited: float = 0.0
+	while waited < seconds:
+		await get_tree().process_frame
+		waited += get_process_delta_time()
+		if bool(cond.call()):
+			return
 
 
 ## Mean frame time over 300 frames, in milliseconds.
