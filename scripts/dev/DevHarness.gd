@@ -1116,6 +1116,7 @@ func _electric_zones(song: String) -> void:
 		if not shot_inside and t >= first + 10.0:
 			shot_inside = true
 			await _check_electric_detail(s)
+			await _check_preview_budget(s)
 			_gate_cue_census(s, "inside the zone")
 			_check(float(s.get("_elec_dark")) > 0.8,
 				"inside the zone the dark only reached %.2f" % float(s.get("_elec_dark")))
@@ -1240,6 +1241,8 @@ func _gate_cue_census(s: Node, where: String) -> void:
 		worst = maxf(worst, off)
 		if off > 0.6:
 			stray += 1
+		if not bool((s.get("gate_is_electric") as Array)[gi2]):
+			continue
 		for c2: Node in v2.get_children():
 			if c2 is MultiMeshInstance3D or (c2 is MeshInstance3D
 					and (c2 as Node3D).position.y < 0.2):
@@ -1280,23 +1283,50 @@ func _gate_cue_census(s: Node, where: String) -> void:
 				"a gate out at distance burns %.2f against %.2f up close — it is not igniting late" % [
 					far_e, near_e])
 
-		# Exactly one gate ahead, whatever the preview is set to.
-		var ahead_vis: int = 0
-		for gi5 in gates2.size():
-			if gi5 >= zs2.size() or not bool((s.get("gate_is_electric") as Array)[gi5]):
+
+
+
+## How many gates are readable ahead, averaged over a few seconds of real play.
+## The preview is a fraction, so a single frame cannot test it: the gate after
+## next is up for part of each gap and down for the rest, and either sample on
+## its own looks like a whole number.
+func _check_preview_budget(s: Node) -> void:
+	var gates: Array = s.get("gate_nodes") as Array
+	var elec: Array = s.get("gate_is_electric") as Array
+	var total: int = 0
+	var worst: int = 0
+	var samples: int = 0
+	var waited: float = 0.0
+	while waited < 4.0:
+		await get_tree().process_frame
+		waited += get_process_delta_time()
+		var zs: PackedFloat32Array = s.get("gate_world_zs")
+		var pd: float = float(s.get("_player_path_dist"))
+		var n: int = 0
+		for gi in gates.size():
+			if gi >= zs.size() or gi >= elec.size() or not bool(elec[gi]):
 				continue
-			if zs2[gi5] - pd2 <= 0.0:
+			# Clearly ahead, not the one being crossed. _player_path_dist is a
+			# projection onto the path and wobbles either side of a gate as the
+			# player passes through it, so a gate at zero flickers between
+			# behind and ahead and lands in the count twice.
+			if zs[gi] - pd <= 2.0:
 				continue
-			var g5: Node3D = gates2[gi5]
-			if g5 == null or not g5.visible:
+			var g: Node3D = gates[gi]
+			if g == null or not g.visible:
 				continue
-			var v5: Node3D = g5.get_node_or_null("VisRoot") as Node3D
-			if v5 != null and v5.visible:
-				ahead_vis += 1
-		print("    gates readable ahead: %d (preview %.1f beats)" % [
-			ahead_vis, GameConfig.gate_preview_beats])
-		_check(ahead_vis <= 1,
-			"%d electric gates are readable ahead — the zone can be planned" % ahead_vis)
+			var v: Node3D = g.get_node_or_null("VisRoot") as Node3D
+			if v != null and v.visible:
+				n += 1
+		total += n
+		worst = maxi(worst, n)
+		samples += 1
+	var mean: float = float(total) / float(maxi(samples, 1))
+	print("    gates readable ahead: %.2f average, %d worst (preview %.1f beats)" % [
+		mean, worst, GameConfig.gate_preview_beats])
+	_check(worst <= 2, "%d electric gates were readable at once — the zone can be planned" % worst)
+	_check(mean > 1.3 and mean < 2.1,
+		"average gates ahead was %.2f, which is not the 1.5-2 the zone is meant to give" % mean)
 
 
 ## The two things a screenshot cannot show: that the gate lights actually

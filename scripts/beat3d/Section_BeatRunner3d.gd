@@ -312,6 +312,15 @@ const _ELEC_BEAT_DIP: float = 0.45
 ## it the gate he is crossing blinks out from under him.
 const _ELEC_SHOW_BEHIND_M: float = 14.0
 
+## How many gates are readable ahead inside a zone, as an average over the run.
+## Not a whole number on purpose: at 1.0 the next gate arrived with nothing
+## behind it and the zone read as a series of unrelated stops, and at 2.0 there
+## is enough to plan against. Between the two the gate after next joins while
+## the player is already committed to the one in front — he can see what is
+## coming without being able to route it. Whatever this says, it overrides
+## GameConfig.gate_preview_beats inside a zone.
+const _ELEC_PREVIEW_GATES: float = 1.75
+
 ## Nothing here any more: a gate past the ignite distance throws no light at
 ## all, so the distance stays genuinely black. What stops it from popping into
 ## existence is that its own emission never went away — only its illumination
@@ -4148,11 +4157,18 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 ## rather than snapping into being.
 func _update_electric_gate_visuals(t_s: float) -> void:
 	var pd: float = _player_path_dist
-	var blackout: bool = _elec_dark > 0.001
+	# Keyed on being in the zone, NOT on how dark it currently is. Those came
+	# apart at the blind flash: a miss knocks _elec_dark to zero for a third of
+	# a second, which was lifting the preview cap with it and showing the whole
+	# layout. Missing on purpose to read the zone is not a tactic worth having.
+	var blackout: bool = _elec_blackout_at(t_s)
 
-	# The nearest electric gate the player has not reached yet.
-	var next_ahead: int = -1
-	var next_d: float = INF
+	# The electric gates the player has not reached yet, nearest first. Only the
+	# first few matter, so this keeps two ranks rather than sorting the song.
+	var rank0: int = -1
+	var rank1: int = -1
+	var d0: float = INF
+	var d1: float = INF
 	if blackout:
 		for i in range(gate_nodes.size()):
 			if i >= gate_is_electric.size() or not gate_is_electric[i]:
@@ -4160,9 +4176,27 @@ func _update_electric_gate_visuals(t_s: float) -> void:
 			if i >= gate_world_zs.size():
 				continue
 			var d: float = gate_world_zs[i] - pd
-			if d > 0.0 and d < next_d:
-				next_d = d
-				next_ahead = i
+			if d <= 0.0:
+				continue
+			if d < d0:
+				d1 = d0
+				rank1 = rank0
+				d0 = d
+				rank0 = i
+			elif d < d1:
+				d1 = d
+				rank1 = i
+
+	# Whether the gate after next has joined yet. The preview is a fraction, not
+	# a count: the whole part is always up, and the extra one appears once the
+	# player has closed to within that fraction of the gap behind it. Over a run
+	# of evenly spaced gates the AVERAGE number on screen is the constant
+	# itself — 1.75 means a second gate for three quarters of every gap, which
+	# is enough to see what is coming without being enough to plan a route.
+	var show_second: bool = false
+	if blackout and rank1 >= 0 and is_finite(d1):
+		var gap: float = maxf(d1 - d0, 0.01)
+		show_second = d0 <= (_ELEC_PREVIEW_GATES - 1.0) * gap
 
 	for i in range(gate_nodes.size()):
 		if i >= gate_is_electric.size() or not gate_is_electric[i]:
@@ -4178,7 +4212,10 @@ func _update_electric_gate_visuals(t_s: float) -> void:
 			# The one coming, plus the one being passed — a gate does not
 			# vanish out of the player's lap the instant he crosses it.
 			var d2: float = gate_world_zs[i] - pd
-			want = (i == next_ahead) or (d2 <= 0.0 and d2 > -_ELEC_SHOW_BEHIND_M)
+			want = (
+				i == rank0
+				or (show_second and i == rank1)
+				or (d2 <= 0.0 and d2 > -_ELEC_SHOW_BEHIND_M))
 		if vis.visible != want:
 			vis.visible = want
 		_sway_electric_gate(i, t_s, i)
