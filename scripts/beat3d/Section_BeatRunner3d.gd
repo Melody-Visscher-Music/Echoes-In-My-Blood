@@ -201,11 +201,26 @@ var _gate_animated: Array[bool] = []      # true once the gate's intro tween has
 ## writes that position has to wait its turn or it fights the tween and leaves
 ## the visual stranded metres from the gate it belongs to.
 var _gate_spawn_done: Array[bool] = []
+## The arrival tween per gate, so a replay can cancel one still running rather
+## than fight it for the same transform.
+var _gate_intro_tw: Dictionary = {}
+## Whether the electric preview has already shown this gate. Latched, so a gate
+## cannot flicker on the threshold that revealed it.
+var _gate_revealed: Array[bool] = []
 
 # ── Gate color-cycle material cache ────────────────────────────────────────────
 # Flat per-gate material lists collected once at build time (see _collect_cycle_mats),
 # so _update_color_cycle can pulse gates without a per-frame recursive tree walk.
 var _gate_cycle_mats: Array[Array] = []
+
+## Test seam, for the dev harness only. A harness run plays with nobody at the
+## controls, so the runner takes every hit in the chart and dies somewhere in
+## the first minute — which stops the song, freezes _song_time(), and leaves any
+## check waiting on a later part of the track hanging until a human notices.
+## With this on, misses still count and still break the combo; they just cost no
+## health, so a run reaches the end of whatever it was sent to measure. Nothing
+## in the game sets it.
+var dev_no_death: bool = false
 
 ## The skyline behind the track — see CityScape. This file owns the beat and
 ## tells it when to strike; what the city is made of, and how it answers, is
@@ -295,9 +310,14 @@ var _elec_wave_pd: float = INF
 const _ELEC_BLIND_S: float = 0.30
 var _elec_blind_t: float = 0.0
 
-## A zone pays double, so it costs double: no healing on a hit, and a miss is
-## 15% instead of 10%.
-const _ELEC_MISS_COST: float = 0.15
+## What a miss costs inside a zone. LOWER than the 10% outside it, not higher:
+## the zone's punishment is that nothing heals, so damage taken in there is
+## permanent for the rest of the song. Pairing that with a bigger hit as well
+## was too much — meeko_on_the_run puts two ordinary gates before its first
+## zone, so a player can arrive at about 35% health, and at 15% a stake that is
+## three misses from dead. At 7.5% the zone grinds him down instead of
+## executing him, which is the difference between tense and unfair.
+const _ELEC_MISS_COST: float = 0.075
 
 ## How close a gate has to be before its arcs strike at all, and the band over
 ## which it fizzes in rather than snapping on. At the runner's speed the ignite
@@ -313,13 +333,16 @@ const _ELEC_BEAT_DIP: float = 0.45
 const _ELEC_SHOW_BEHIND_M: float = 14.0
 
 ## How many gates are readable ahead inside a zone, as an average over the run.
-## Not a whole number on purpose: at 1.0 the next gate arrived with nothing
-## behind it and the zone read as a series of unrelated stops, and at 2.0 there
-## is enough to plan against. Between the two the gate after next joins while
-## the player is already committed to the one in front — he can see what is
-## coming without being able to route it. Whatever this says, it overrides
+## Not a whole number on purpose: the whole part is always up and the next one
+## joins partway through each gap, so the count breathes between two values
+## instead of sitting on one. Whatever this says, it overrides
 ## GameConfig.gate_preview_beats inside a zone.
-const _ELEC_PREVIEW_GATES: float = 1.75
+##
+## Was 1.75, which played too tight once the zone had also taken away the floor
+## cues: one gate with nothing behind it most of the time is reacting blind
+## rather than reading ahead. At 2.25 there are two gates up with a third
+## joining for the last quarter of each gap.
+const _ELEC_PREVIEW_GATES: float = 2.25
 
 ## Nothing here any more: a gate past the ignite distance throws no light at
 ## all, so the distance stays genuinely black. What stops it from popping into
@@ -331,10 +354,10 @@ var _elec_conduit_mat: ShaderMaterial = null
 const _ELEC_GATE_GAIN: float = 5.0
 ## ...and how far it throws, in metres.
 const _ELEC_GATE_RANGE: float = 16.0
-## Visual drift, in metres. On VisRoot, never on the gate root: the judge Area3D
-## stays exactly where the chart put it, so a drifting gate is a thing to look
-## at and not a thing that moves the hit out from under the player.
-const _ELEC_SWAY_M: float = 0.16
+## Electric gates used to drift on their mounts. They do not any more: a gate
+## that is still moving when the player is trying to read it is the difference
+## between atmosphere and interference, and the drift read as a shake rather
+## than as a loose fitting. They slide in and then hold.
 # Shared mesh resources — all arc segments + pylon parts reuse these so the
 # renderer can GPU-instance them instead of issuing one draw call per node.
 var _pylon_pole_mesh:  BoxMesh    = null
@@ -992,6 +1015,12 @@ func _process(delta: float) -> void:
 	# paused, for a value this function already has.
 	var t_s: float = _song_time()
 
+	# Which gates the zone lets the player see is gameplay, not decoration, so
+	# it runs every frame rather than on the staggered tick. On the tick a gate
+	# that should have gone could linger for up to a tick, and three were
+	# readable where the zone allows two.
+	_update_electric_gate_visuals(t_s)
+
 	# City / electric pulse decay runs even when paused so lights don't freeze mid-flash
 	var dt_pulse: float = _visual_tick(_TICK_PULSE, delta)
 	if dt_pulse > 0.0:
@@ -1000,7 +1029,6 @@ func _process(delta: float) -> void:
 				_player_path_dist, _DECO_WINDOW_BEHIND_M, _deco_window_ahead_m,
 				lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark))
 		_update_electric_dark(dt_pulse, t_s)
-		_update_electric_gate_visuals(t_s)
 		_update_electric_pulse(dt_pulse, t_s)
 
 	# Beat phase decays quickly (full fade in ~0.28 s) — drives beat-sync brightness spikes
@@ -3432,6 +3460,7 @@ func _build_all_gate_visuals() -> void:
 	gate_is_electric.clear()
 	_gate_animated.clear()
 	_gate_spawn_done.clear()
+	_gate_revealed.clear()
 	_gate_cycle_mats.clear()
 
 	_judge_index = 0
@@ -3452,6 +3481,7 @@ func _build_all_gate_visuals() -> void:
 		gate_world_zs.append(gate.global_position.z)
 		_gate_animated.append(false)
 		_gate_spawn_done.append(false)
+		_gate_revealed.append(false)
 		_gate_cycle_mats.append([] as Array[Material])
 		_gate_vis_built.append(false)
 		gate_actions.append(String(entry.get("action", "")))
@@ -4127,7 +4157,6 @@ func _update_electric_pulse(delta: float, t_s: float) -> void:
 				lt.light_energy = lerpf(
 					lt_e, (lt_e + _ELEC_GATE_GAIN * fl * swell) * ignite, _elec_dark)
 				lt.omni_range = lerpf(lt.omni_range, _ELEC_GATE_RANGE, 0.15)
-			_sway_electric_gate(gi, t_s, i)
 
 	# Pylon ambient lights — already in increasing path order.
 	while _elec_pylon_cursor < _elec_pylon_pds.size() \
@@ -4167,8 +4196,10 @@ func _update_electric_gate_visuals(t_s: float) -> void:
 	# first few matter, so this keeps two ranks rather than sorting the song.
 	var rank0: int = -1
 	var rank1: int = -1
+	var rank2: int = -1
 	var d0: float = INF
 	var d1: float = INF
+	var d2a: float = INF
 	if blackout:
 		for i in range(gate_nodes.size()):
 			if i >= gate_is_electric.size() or not gate_is_electric[i]:
@@ -4179,77 +4210,131 @@ func _update_electric_gate_visuals(t_s: float) -> void:
 			if d <= 0.0:
 				continue
 			if d < d0:
+				d2a = d1
+				rank2 = rank1
 				d1 = d0
 				rank1 = rank0
 				d0 = d
 				rank0 = i
 			elif d < d1:
+				d2a = d1
+				rank2 = rank1
 				d1 = d
 				rank1 = i
+			elif d < d2a:
+				d2a = d
+				rank2 = i
 
-	# Whether the gate after next has joined yet. The preview is a fraction, not
-	# a count: the whole part is always up, and the extra one appears once the
-	# player has closed to within that fraction of the gap behind it. Over a run
-	# of evenly spaced gates the AVERAGE number on screen is the constant
-	# itself — 1.75 means a second gate for three quarters of every gap, which
-	# is enough to see what is coming without being enough to plan a route.
-	var show_second: bool = false
+	# The preview is a fraction, not a count. The whole part is always up, and
+	# the one after it joins once the player has closed to within the remaining
+	# fraction of the gap behind it — so over evenly spaced gates the AVERAGE
+	# number on screen is the constant itself.
+	var whole: int = int(floor(_ELEC_PREVIEW_GATES))
+	var frac: float = _ELEC_PREVIEW_GATES - float(whole)
+	var show_second: bool = whole >= 2
+	var show_third: bool = whole >= 3
 	if blackout and rank1 >= 0 and is_finite(d1):
-		var gap: float = maxf(d1 - d0, 0.01)
-		show_second = d0 <= (_ELEC_PREVIEW_GATES - 1.0) * gap
+		# The phase inside the current gap is d0 — how close the player is to
+		# the gate he is heading for — whichever rank the extra gate happens to
+		# be. Measuring it from d1 instead meant the third gate's condition was
+		# comparing a distance of at least one whole gap against a fraction of
+		# one, so it never came on at all.
+		var extra_on: bool = d0 <= frac * maxf(d1 - d0, 0.01)
+		if whole == 1:
+			show_second = extra_on
+		elif whole == 2:
+			show_third = rank2 >= 0 and is_finite(d2a) and extra_on
 
 	for i in range(gate_nodes.size()):
 		if i >= gate_is_electric.size() or not gate_is_electric[i]:
 			continue
 		var gate: Node3D = gate_nodes[i]
-		if gate == null or not is_instance_valid(gate) or not gate.visible:
+		if gate == null or not is_instance_valid(gate):
 			continue
 		var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
 		if vis == null:
 			continue
+		# Deliberately NOT skipping gates that are still out of range. Skipping
+		# them left their VisRoot at whatever it was, so the moment the preview
+		# window reached one it appeared with a stale visible VisRoot and the
+		# player got a frame of a gate eighty metres away before this pass took
+		# it back. They are set here whether or not anyone can see them yet.
 		var want: bool = true
 		if blackout and i < gate_world_zs.size():
-			# The one coming, plus the one being passed — a gate does not
-			# vanish out of the player's lap the instant he crosses it.
 			var d2: float = gate_world_zs[i] - pd
-			want = (
-				i == rank0
-				or (show_second and i == rank1)
-				or (d2 <= 0.0 and d2 > -_ELEC_SHOW_BEHIND_M))
+			if d2 < -_ELEC_SHOW_BEHIND_M:
+				want = false                      # well behind; forget it
+				_gate_revealed[i] = false
+			elif d2 <= 0.0:
+				want = true                       # being crossed
+			else:
+				# Reveals LATCH. The thresholds behind rank0 and rank1 are
+				# computed from _player_path_dist, which is a projection onto
+				# the path and wobbles by a few centimetres as the player
+				# moves; a gate sitting right on one of them was flipping
+				# visible and hidden every frame, and since a reveal replays
+				# the arrival, it restarted that animation every frame too.
+				# That is what the shaking was. Once shown, a gate stays shown
+				# until it is behind him.
+				if (i == rank0
+						or (show_second and i == rank1)
+						or (show_third and i == rank2)):
+					_gate_revealed[i] = true
+				want = _gate_revealed[i]
 		if vis.visible != want:
 			vis.visible = want
-		_sway_electric_gate(i, t_s, i)
+			# Revealed by the preview, not by coming into range: play the
+			# arrival here, where the player can actually see it happen. Only
+			# worth animating for a gate the player is actually looking at.
+			if want and blackout and gate.visible:
+				_play_gate_intro(i)
 
 
-## A loose mounting, not a moving target. This rides VisRoot, which exists so
-## the spawn animation can scale the meshes without touching the judge Area3D —
-## so the gate the player has to hit stays exactly where the chart put it while
-## the thing they are looking at drifts on its own.
-func _sway_electric_gate(gate_index: int, t_s: float, seed_i: int) -> void:
-	if gate_index < 0 or gate_index >= gate_nodes.size():
+
+## The gate's arrival: jumps rise from below, slides drop from above, and
+## everything else comes in from one side or the other.
+##
+## Pulled out of _update_gate_visibility so the electric preview can replay it.
+## In a zone a gate is usually built and shown long before the preview lets the
+## player see it — with a generous gate_preview_beats it may have run this whole
+## animation while hidden — so the reveal would otherwise be the gate simply
+## being there one frame and not the next.
+##
+## Clears _gate_spawn_done for the duration: this owns VisRoot's transform until
+## it finishes, and the electric sway has to keep its hands off until then.
+func _play_gate_intro(i: int) -> void:
+	if i < 0 or i >= gate_nodes.size():
 		return
-	var gate: Node3D = gate_nodes[gate_index]
+	var gate: Node3D = gate_nodes[i]
 	if gate == null or not is_instance_valid(gate):
-		return
-	# The intro tween owns VisRoot.position until it has finished. Writing to it
-	# before then fought the tween and left gates — and the floor marks and safe
-	# strip under them — sitting a metre or more off to one side, or stranded
-	# mid-slide. Some arrived correctly, some never appeared where they should:
-	# it came down to whether this ran during that gate's 0.22 s of animation.
-	if gate_index >= _gate_spawn_done.size() or not _gate_spawn_done[gate_index]:
 		return
 	var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
 	if vis == null:
 		return
-	if _elec_dark <= 0.001:
-		if vis.position != Vector3.ZERO:
-			vis.position = Vector3.ZERO
-		return
-	var a: float = _ELEC_SWAY_M * _elec_dark
-	vis.position = Vector3(
-		sin(t_s * 2.3 + float(seed_i) * 1.3) * a,
-		sin(t_s * 3.1 + float(seed_i) * 2.1) * a * 0.55,
-		0.0)
+	# A second intro landing on a gate still playing its first would have two
+	# tweens writing one transform.
+	var prev: Variant = _gate_intro_tw.get(i)
+	if prev != null and (prev as Tween) != null and (prev as Tween).is_valid():
+		(prev as Tween).kill()
+	if i < _gate_spawn_done.size():
+		_gate_spawn_done[i] = false
+	var atw := create_tween()
+	atw.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_BACK)
+	match gate_actions[i]:
+		"jump":  # always rise from below
+			vis.scale = Vector3(1.0, 0.0, 1.0)
+			atw.tween_property(vis, "scale:y", 1.0, 0.22)
+		"slide":  # always drop from above
+			vis.position = Vector3(vis.position.x, 3.5, vis.position.z)
+			atw.tween_property(vis, "position:y", 0.0, 0.22)
+		_:  # left / right / wall — cycle left and right sides
+			vis.position = Vector3(-4.0 if i % 2 == 0 else 4.0, vis.position.y, vis.position.z)
+			atw.tween_property(vis, "position:x", 0.0, 0.22)
+	# Only now does anything else get to touch this transform.
+	atw.tween_callback(func() -> void:
+		if i < _gate_spawn_done.size():
+			_gate_spawn_done[i] = true)
+	_gate_intro_tw[i] = atw
 
 
 # ── Electric zone helpers ──────────────────────────────────────────────────────
@@ -5574,7 +5659,7 @@ func _miss_descent_spark() -> void:
 	if _charge_mult_timer > 0.0:
 		return
 	_combo = 0
-	if descent_miss_health > 0.0:
+	if descent_miss_health > 0.0 and not dev_no_death:
 		_health_pct = clampf(_health_pct - descent_miss_health, 0.0, 1.0)
 		_update_hud_health()
 		if _health_pct <= 0.0:
@@ -6589,7 +6674,9 @@ func _on_gate_scored(success: bool) -> void:
 		var _base_gate_pts: int = 1000 if in_zone else 500
 		_score += _base_gate_pts * _score_multiplier()
 		# No healing in the dark. The zone pays double and costs double — you
-		# can bank points in there, you cannot repair yourself.
+		# can bank points in there, you cannot repair yourself. What made this
+		# feel unfair at first was not the rule, it was having only one gate of
+		# warning to go with it; the preview was widened instead.
 		if not in_zone:
 			_health_pct = clamp(_health_pct + 0.05, 0.0, 1.0)
 		_world_vitality = clamp(_world_vitality + 0.25, 0.0, 1.0)
@@ -6613,7 +6700,9 @@ func _on_gate_scored(success: bool) -> void:
 		_combo = 0
 		_gates_missed += 1
 		_world_vitality = clamp(_world_vitality - 0.18, 0.0, 1.0)
-		_health_pct = clamp(_health_pct - (_ELEC_MISS_COST if miss_in_zone else 0.10), 0.0, 1.0)
+		if not dev_no_death:
+			_health_pct = clamp(
+				_health_pct - (_ELEC_MISS_COST if miss_in_zone else 0.10), 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health()
 		if miss_in_zone:
@@ -6631,7 +6720,7 @@ func _on_gate_scored(success: bool) -> void:
 		if _sfx_miss != null:
 			_sfx_miss.stop()
 			_sfx_miss.play()
-		if _health_pct <= 0.0:
+		if _health_pct <= 0.0 and not dev_no_death:
 			_trigger_death()
 
 
@@ -7932,28 +8021,7 @@ func _update_gate_visibility() -> void:
 
 		if should_show and not gate.visible and not _gate_animated[i]:
 			_gate_animated[i] = true
-			var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
-			if vis != null:
-				var gate_action: String = gate_actions[i]
-				var atw := create_tween()
-				atw.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_BACK)
-				match gate_action:
-					"jump":  # always rise from below
-						vis.scale = Vector3(1.0, 0.0, 1.0)
-						atw.tween_property(vis, "scale:y", 1.0, 0.22)
-					"slide":  # always drop from above
-						vis.position.y = 3.5
-						atw.tween_property(vis, "position:y", 0.0, 0.22)
-					_:  # left / right / wall — cycle left and right sides
-						if i % 2 == 0:
-							vis.position.x = -4.0
-						else:
-							vis.position.x = 4.0
-						atw.tween_property(vis, "position:x", 0.0, 0.22)
-				# Only now does anything else get to touch this position.
-				atw.tween_callback(func() -> void:
-					if i < _gate_spawn_done.size():
-						_gate_spawn_done[i] = true)
+			_play_gate_intro(i)
 
 		# Electric zones: pause/resume arc tweens with gate visibility so they
 		# don't burn CPU on gates hundreds of metres from the player.

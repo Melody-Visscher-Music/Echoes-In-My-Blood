@@ -39,6 +39,12 @@ func _ready() -> void:
 	var mode: String = args[0] if args.size() > 0 else "verify"
 	var arg: String = args[1] if args.size() > 1 else ""
 	print("-- dev harness: %s --" % mode)
+	# Silence. A run plays the same minute or two of a song every time and
+	# there is no reason for anyone in earshot to sit through it.
+	for bus_name: String in ["Music", "SFX", "Master"]:
+		var bus: int = AudioServer.get_bus_index(bus_name)
+		if bus >= 0:
+			AudioServer.set_bus_mute(bus, true)
 	# Every frame-time number here is worthless with V-Sync on: the display
 	# caps at 60 Hz, so a frame that really costs 9 ms and one that really
 	# costs 16 ms both measure 16.67, and a change looks free right up until
@@ -392,6 +398,11 @@ func _verify_rules() -> void:
 	add_child(level)
 	await _until_level_ready(level)
 	var s: Node = _find_section(level)
+	# These checks ARE the health economy — what a hit heals, what a miss costs,
+	# what happens at zero — so this is the one place that asks for the runner's
+	# mortality back. Everywhere else the harness keeps him alive so a run does
+	# not need anyone sitting in front of it.
+	s.set("dev_no_death", false)
 
 	# ── The multiplier ladder: +1 every 10 combo, capped at x20 ──────────────
 	for pair: Array in [[0, 1], [9, 1], [10, 2], [19, 2], [20, 3], [189, 19], [190, 20], [500, 20]]:
@@ -445,6 +456,36 @@ func _verify_rules() -> void:
 	_check(int(s.get("_gates_missed")) == 1, "a miss should count as a miss")
 	_check(absf(float(s.get("_health_pct")) - 0.4) < 0.001, "a miss should cost 10%")
 
+	# ── The electric zone's own economy ─────────────────────────────────────
+	# Nothing heals in there, and a miss costs less than it does outside, not
+	# more: the punishment is that the damage is permanent. Checked by pushing
+	# a zone over the current song time rather than playing to a real one.
+	# Mutated in place, not replaced: _electric_zones is an Array[Dictionary],
+	# and set() with a plain Array does not take. The window starts well before
+	# zero because the level is fresh, the countdown has not finished and
+	# _song_time() is still negative here.
+	var zones: Array = s.get("_electric_zones") as Array
+	var real_zones: Array = zones.duplicate()
+	zones.clear()
+	zones.append({"start_t": -99999.0, "end_t": 99999.0})
+
+	s.set("_health_pct", 0.5)
+	s.set("_combo", 0)
+	s.call("_on_gate_scored", true)
+	_check(absf(float(s.get("_health_pct")) - 0.5) < 0.001,
+		"a hit inside a zone healed %.3f — nothing should heal in there" % (
+			float(s.get("_health_pct")) - 0.5))
+
+	s.set("_health_pct", 0.5)
+	s.call("_on_gate_scored", false)
+	_check(absf(float(s.get("_health_pct")) - 0.425) < 0.001,
+		"a miss inside a zone cost %.3f, not the 7.5%% it should" % (
+			0.5 - float(s.get("_health_pct"))))
+
+	zones.clear()
+	for z: Dictionary in real_zones:
+		zones.append(z)
+
 	# Health hitting zero ends the run.
 	s.set("_health_pct", 0.05)
 	s.call("_on_gate_scored", false)
@@ -476,6 +517,7 @@ func _verify_rules() -> void:
 	GameConfig.reduced_flashing = true
 	_check(GameConfig.flash_scale() < 0.5, "reduced flashing should actually reduce the flash")
 	GameConfig.reduced_flashing = was
+	s.set("dev_no_death", true)
 
 	# ── The FPS readout, end to end rather than by inspection ───────────────
 	var hud: Node = s.get("_hud")
@@ -1294,6 +1336,7 @@ func _check_preview_budget(s: Node) -> void:
 	var gates: Array = s.get("gate_nodes") as Array
 	var elec: Array = s.get("gate_is_electric") as Array
 	var total: int = 0
+	var arriving: int = 0
 	var worst: int = 0
 	var samples: int = 0
 	var waited: float = 0.0
@@ -1303,6 +1346,7 @@ func _check_preview_budget(s: Node) -> void:
 		var zs: PackedFloat32Array = s.get("gate_world_zs")
 		var pd: float = float(s.get("_player_path_dist"))
 		var n: int = 0
+		var done: Array = s.get("_gate_spawn_done") as Array
 		for gi in gates.size():
 			if gi >= zs.size() or gi >= elec.size() or not bool(elec[gi]):
 				continue
@@ -1318,15 +1362,23 @@ func _check_preview_budget(s: Node) -> void:
 			var v: Node3D = g.get_node_or_null("VisRoot") as Node3D
 			if v != null and v.visible:
 				n += 1
+				# Mid-arrival: the intro owns the transform and clears the
+				# spawn-done flag until it lands. Seeing this at all is how we
+				# know a revealed gate animates in rather than just being there.
+				if gi < done.size() and not bool(done[gi]):
+					arriving += 1
 		total += n
 		worst = maxi(worst, n)
 		samples += 1
 	var mean: float = float(total) / float(maxi(samples, 1))
 	print("    gates readable ahead: %.2f average, %d worst (preview %.1f beats)" % [
 		mean, worst, GameConfig.gate_preview_beats])
-	_check(worst <= 2, "%d electric gates were readable at once — the zone can be planned" % worst)
-	_check(mean > 1.3 and mean < 2.1,
-		"average gates ahead was %.2f, which is not the 1.5-2 the zone is meant to give" % mean)
+	_check(worst <= 3, "%d electric gates were readable at once — the zone can be planned" % worst)
+	_check(mean > 1.75 and mean < 2.6,
+		"average gates ahead was %.2f, which is not the 1.75-2.5 the zone is meant to give" % mean)
+	print("    frames with a gate mid-arrival: %d of %d" % [arriving, samples])
+	_check(arriving > 0,
+		"no revealed gate ever played its arrival — they are just appearing")
 
 
 ## The two things a screenshot cannot show: that the gate lights actually
@@ -1370,9 +1422,14 @@ func _check_electric_detail(s: Node) -> void:
 	var gi: int = int(idx[lit_i]) if lit_i < idx.size() else -1
 	if gi >= 0 and gi < gates.size():
 		var gate: Node3D = gates[gi]
+		# Gates slide in and then hold. A visual still off its gate once the
+		# arrival has landed means something is moving it that should not be.
 		var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
-		_check(vis != null and vis.position.length() > 0.001,
-			"the gate visual is not drifting inside the dark")
+		var done2: Array = s.get("_gate_spawn_done") as Array
+		var settled: bool = gi < done2.size() and bool(done2[gi])
+		_check(vis == null or not settled or vis.position.length() < 0.02,
+			"a settled gate visual is %.3f m off its gate — something is still moving it" % (
+				0.0 if vis == null else vis.position.length()))
 		var area: Node3D = null
 		for c: Node in gate.get_children():
 			if c is Area3D:
@@ -1715,6 +1772,13 @@ func _set_hour(map: Node, hour: float) -> void:
 ## keeps of its own steps.
 func _until_level_ready(level: Node) -> void:
 	var section: Node = level if level.has_method("_loading_step") else _find_section(level)
+	# Nobody is at the controls during a harness run, so the runner takes every
+	# hit in the chart. Left alone it dies inside the first minute, the song
+	# stops, _song_time() freezes and anything waiting on a later part of the
+	# track hangs until a human notices. Checks that are ABOUT dying turn this
+	# back off for the moment they need it — see _verify_rules.
+	if section != null and section.get("dev_no_death") != null:
+		section.set("dev_no_death", true)
 	for i in 600:
 		await get_tree().process_frame
 		if section == null or not is_instance_valid(section):
