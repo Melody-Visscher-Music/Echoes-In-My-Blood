@@ -265,6 +265,11 @@ func _style_btn(btn: Button, s: float = 1.0) -> void:
 
 # ── Options panel ──────────────────────────────────────────────────────────────
 
+## Options > Audio offset slider and its readout; see _refresh_offset_slider.
+var _offset_slider: HSlider = null
+var _offset_val:    Label   = null
+
+
 func _build_options_panel() -> Control:
 	var s   := _ui_s()
 	var arr := _panel_bg(Color(0.02, 0.01, 0.10, 0.92))
@@ -322,6 +327,35 @@ func _build_options_panel() -> Control:
 			sfx_val.text = "%d%%" % int(v * 100)
 			_mark_dirty(), s)
 
+	# The offset itself, by hand. The calibrator below measures it; this is for
+	# the player who already knows their number or wants to lean it a few ms.
+	# Written straight to the per-device store (not _mark_dirty: that store saves
+	# itself), so it is in force the moment the handle moves.
+	_offset_val = Label.new()
+	var offset_row := _opt_row(vbox, "Audio Offset", s)
+	_offset_slider = HSlider.new()
+	_offset_slider.min_value = -300.0; _offset_slider.max_value = 600.0
+	_offset_slider.step = 5.0
+	_offset_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_offset_slider.custom_minimum_size   = Vector2(160.0 * s, 0)
+	_offset_slider.tooltip_text = "How late the sound reaches you. Gates arrive early? Raise it. Late? Lower it."
+	UiStyle.style_slider(_offset_slider, s)
+	_offset_val.custom_minimum_size = Vector2(110.0 * s, 0)
+	_offset_val.vertical_alignment  = VERTICAL_ALIGNMENT_CENTER
+	_offset_val.add_theme_font_override("font", UiStyle.display(700))
+	_offset_val.add_theme_font_size_override("font_size", int(14 * s))
+	_offset_val.add_theme_color_override("font_color", UiStyle.CYAN)
+	offset_row.add_child(_offset_slider)
+	offset_row.add_child(_offset_val)
+	_offset_slider.value_changed.connect(func(v: float) -> void:
+		GameConfig.set_audio_offset_for_current_device(v)
+		_refresh_offset_slider())
+	# A method, not a lambda: GameConfig outlives this scene, and a method
+	# connection is dropped with the node where a lambda would be left dangling.
+	if not GameConfig.audio_device_changed.is_connected(_on_offset_device_changed):
+		GameConfig.audio_device_changed.connect(_on_offset_device_changed)
+	_refresh_offset_slider()
+
 	# Calibration used to be reachable only from the in-game pause menu, so a
 	# player who never paused never found the one setting that makes Bluetooth
 	# playable. It belongs next to the volume sliders.
@@ -334,7 +368,7 @@ func _build_options_panel() -> Control:
 	vbox.add_child(cal_btn)
 
 	var cal_note := Label.new()
-	cal_note.text = "Measures your headphones' audio delay so gates line up with the beat. Worth running once on Bluetooth."
+	cal_note.text = "Measures your headphones' audio delay so gates line up with the beat. Worth running once on Bluetooth. Gates early? Raise the offset. Late? Lower it."
 	cal_note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	cal_note.add_theme_font_size_override("font_size", int(12 * s))
 	cal_note.add_theme_color_override("font_color", Color(0.5, 0.5, 0.62, 1.0))
@@ -1282,6 +1316,25 @@ func _rebuild_settings_panels() -> void:
 	add_child(_options_panel)
 
 
+## Puts the offset slider and its readout back in step with the store — after
+## the calibrator saves or resets, or the output device changes under it.
+## set_value_no_signal, or showing the value would save it: an uncalibrated
+## device would become "calibrated" just by opening Options.
+func _refresh_offset_slider() -> void:
+	if _offset_slider == null or _offset_val == null:
+		return
+	var ms: float = GameConfig.get_audio_offset_ms()
+	_offset_slider.set_value_no_signal(ms)
+	if GameConfig.has_audio_calibration():
+		_offset_val.text = "%s%.0f ms" % ["+" if ms >= 0.0 else "", ms]
+	else:
+		_offset_val.text = "auto  %.0f ms" % ms
+
+
+func _on_offset_device_changed(_dev: String) -> void:
+	_refresh_offset_slider()
+
+
 ## Opens the latency calibrator over the main menu. Same component the pause
 ## menu uses; Main is not paused, so nothing needs process-mode juggling.
 func _on_calibrate_audio() -> void:
@@ -1289,6 +1342,7 @@ func _on_calibrate_audio() -> void:
 		_options_panel.visible = false
 	var cal: Node = load("res://scripts/AudioCalibrator.gd").new()
 	var reopen := func(_a: Variant = null) -> void:
+		_refresh_offset_slider()
 		if _options_panel != null:
 			_options_panel.visible = true
 			_focus_panel.call_deferred(_options_panel)

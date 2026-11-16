@@ -22,7 +22,16 @@ extends CanvasLayer
 ##  incapable of producing.
 ##
 ##  DONE    → shows measured result and consistency rating
-##            [ENTER] save and close   [ESC] discard and go back
+##            [ENTER] save and close   [F] fine-tune it by eye   [ESC] discard
+##
+##  TUNE    → a click loops once a second and a ball bounces to it. Nudge the
+##            offset until the ball lands exactly on the click. No tapping, so
+##            nothing about the player's hands or reflexes is in the answer —
+##            which is the one thing the tap test cannot promise: people answer
+##            a sound a little faster than a flash, and that difference does
+##            not cancel. Reachable from IDLE too, starting from whatever is in
+##            force now.
+##            [←/→] ±5 ms   [↑/↓] ±1 ms   [ENTER] save and close   [ESC] back
 ##
 ## Add as a child of any PROCESS_MODE_ALWAYS node (Section is already set to
 ## that while paused, so just add_child(cal) from _launch_audio_calibrator).
@@ -57,7 +66,7 @@ const BT_HINTS: PackedStringArray = [
 
 # ── Phase state ───────────────────────────────────────────────────────────────
 ## VISUAL and AUDIO are the two measurement passes; see the header.
-enum Phase { IDLE, VISUAL, AUDIO, DONE }
+enum Phase { IDLE, VISUAL, AUDIO, DONE, TUNE }
 var _phase: Phase = Phase.IDLE
 
 ## Trimmed means of each pass, in seconds. Both include the player's reaction
@@ -83,8 +92,25 @@ var _run_start_usec: int = 0
 ## switch cannot vote twice for the same beat.
 var _last_tap_beat:  int = 0
 
+# ── Fine-tune by eye ──────────────────────────────────────────────────────────
+## Limits of what can be dialled in. Past these something else is wrong.
+const TUNE_MIN_MS: float = -300.0
+const TUNE_MAX_MS: float = 600.0
+## The offset being tried, in ms. Applied to the ball only — nothing is saved
+## until the player says so.
+var _tune_ms:    float = 0.0
+## Where in the one-second loop the ball was last frame, to catch the landing.
+var _tune_phase: float = 0.0
+## Landing flash, 1 → 0.
+var _tune_flash: float = 0.0
+
 # ── Audio ─────────────────────────────────────────────────────────────────────
 var _click: AudioStreamPlayer = null
+## The fine-tune metronome: one click at the top of a looping one-second
+## stream. A loop rather than a click fired from _process, because a stream has
+## a playback position — so the ball can be driven by the exact clock the game
+## drives its gates with, and what looks right here is right there.
+var _metro: AudioStreamPlayer = null
 
 # ── UI refs ───────────────────────────────────────────────────────────────────
 var _title:      Label     = null
@@ -92,6 +118,8 @@ var _dev_lbl:    Label     = null
 var _saved_lbl:  Label     = null
 var _body:       Label     = null
 var _circle:     ColorRect = null
+var _ring_wrap:  Control   = null   # holds _circle; hidden while the stage is up
+var _stage:      Control   = null   # the bouncing ball, drawn by hand
 var _count_lbl:  Label     = null
 var _tap_lbl:    Label     = null
 var _avg_lbl:    Label     = null
@@ -161,6 +189,8 @@ func _auto_suggest() -> Dictionary:
 func _enter_idle() -> void:
 	_phase = Phase.IDLE
 	_click.stop()
+	_metro.stop()
+	_show_stage(false)
 	_elapsed    = 0.0
 	_beat_count = 0
 	_taps.clear()
@@ -189,9 +219,10 @@ func _enter_idle() -> void:
 	else:
 		_body.text = "Two quick steps: tap what you SEE, then tap what you HEAR.\nThe gap between them is your audio delay. Headphones on."
 
-	_hint.text    = "[ENTER]  Calibrate (2 steps)     [R]  Reset     [ESC]  Close"
+	_hint.text    = "[ENTER]  Calibrate (2 steps)     [F]  Fine-tune by eye     [R]  Reset     [ESC]  Close"
 	_set_buttons([
 		["CALIBRATE",   _enter_running, UiStyle.CYAN],
+		["FINE-TUNE",   _enter_tune_from_saved, UiStyle.CYAN],
 		["RESET",       _do_reset,      UiStyle.VIOLET],
 		["CLOSE",       _do_cancel,     UiStyle.VIOLET],
 	])
@@ -255,16 +286,109 @@ func _enter_done() -> void:
 		+ "headphone delay; your reaction time is in both and cancels out.")
 	if _inconsistent:
 		_body.text += "\n⚠  Inconsistent taps — consider redoing calibration"
-	_hint.text      = "[ENTER]  Save & close     [ESC]  Discard"
+	_hint.text      = "[ENTER]  Save & close     [F]  Fine-tune by eye     [ESC]  Discard"
 	_set_buttons([
 		["SAVE & CLOSE", _do_save,   UiStyle.CYAN],
+		["FINE-TUNE",    _enter_tune_from_result, UiStyle.CYAN],
 		["DISCARD",      _enter_idle, UiStyle.VIOLET],
 	])
+
+
+## Fine-tune, starting from what the game is using right now.
+func _enter_tune_from_saved() -> void:
+	_enter_tune(GameConfig.get_audio_offset_ms())
+
+
+## Fine-tune, starting from the tap test that has just finished.
+func _enter_tune_from_result() -> void:
+	_enter_tune(_result_ms)
+
+
+func _enter_tune(start_ms: float) -> void:
+	_phase = Phase.TUNE
+	_click.stop()
+	_set_measure_visible(false)
+	_show_stage(true)
+	_tune_ms    = clampf(roundf(start_ms), TUNE_MIN_MS, TUNE_MAX_MS)
+	_tune_phase = 0.0
+	_tune_flash = 0.0
+	_metro.play()
+
+	_title.text     = "FINE-TUNE"
+	_dev_lbl.text   = "Device:  %s" % AudioServer.get_output_device()
+	_body.text      = ("Watch the ball, listen to the click.\n"
+		+ "Nudge until it LANDS exactly on the click.")
+	_hint.text      = "[←/→]  5 ms     [↑/↓]  1 ms     [ENTER]  Save & close     [ESC]  Back"
+	_set_buttons([
+		["-5", _nudge_tune.bind(-5.0), UiStyle.VIOLET],
+		["-1", _nudge_tune.bind(-1.0), UiStyle.VIOLET],
+		["+1", _nudge_tune.bind(1.0),  UiStyle.VIOLET],
+		["+5", _nudge_tune.bind(5.0),  UiStyle.VIOLET],
+		["SAVE & CLOSE", _do_save_tune, UiStyle.CYAN],
+		["BACK",         _enter_idle,   UiStyle.VIOLET],
+	], 104.0)
+	_refresh_tune_label()
+
+
+func _nudge_tune(by_ms: float) -> void:
+	_tune_ms = clampf(_tune_ms + by_ms, TUNE_MIN_MS, TUNE_MAX_MS)
+	_refresh_tune_label()
+
+
+## Says which way the number moves the ball, because "+" on its own means
+## nothing to someone who has not read the code.
+func _refresh_tune_label() -> void:
+	_saved_lbl.text = "%s%.0f ms" % ["+" if _tune_ms >= 0.0 else "", _tune_ms]
+	_saved_lbl.text += "     ball lands early?  go +     ·     lands late?  go -"
+
+
+func _do_save_tune() -> void:
+	_result_ms = _tune_ms
+	_do_save()
+
+
+## The fine-tune ball: where it is in its one-second bounce, 0..1, with 0 the
+## instant it touches down. This is GameConfig.song_clock()'s formula with the
+## trial offset in place of the saved one — on purpose, so a value that looks
+## right here is the value that is right in a level.
+func _tune_bounce_phase() -> float:
+	var t: float = _metro.get_playback_position() + AudioServer.get_time_since_last_mix() \
+		- _tune_ms / 1000.0
+	return fposmod(t, INTERVAL) / INTERVAL
+
+
+func _draw_stage() -> void:
+	var w: float = _stage.size.x
+	var h: float = _stage.size.y
+	var floor_y: float = h - 34.0
+	var r: float = 20.0
+	var p: float = _tune_phase
+	# A thrown-ball arc: fastest at the floor, so the landing is a sharp event
+	# the eye can time, not a slow approach it has to guess the end of.
+	var lift: float = (h - 80.0) * 4.0 * p * (1.0 - p)
+	var flash: float = _tune_flash * GameConfig.flash_scale()
+	var line_col: Color = UiStyle.VIOLET.lerp(Color.WHITE, flash * 0.8)
+	_stage.draw_line(Vector2(w * 0.5 - 150.0, floor_y), Vector2(w * 0.5 + 150.0, floor_y),
+		line_col, 3.0 + flash * 3.0, true)
+	var c := Vector2(w * 0.5, floor_y - r - lift)
+	_stage.draw_circle(c, r + 7.0, Color(UiStyle.CYAN, 0.18 + flash * 0.25))
+	_stage.draw_circle(c, r, UiStyle.CYAN.lerp(Color.WHITE, flash * 0.7))
 
 
 # ── Update loop ───────────────────────────────────────────────────────────────
 func _process(delta: float) -> void:
 	_pulse = maxf(0.0, _pulse - delta * 6.0)
+
+	if _phase == Phase.TUNE:
+		var p: float = _tune_bounce_phase()
+		# Wrapped past the top of the loop since last frame = it just landed.
+		# (Not a nudge: those move the phase by a few thousandths, not most of 1.)
+		if p < _tune_phase - 0.5:
+			_tune_flash = 1.0
+		_tune_phase = p
+		_tune_flash = maxf(0.0, _tune_flash - delta * 7.0)
+		_stage.queue_redraw()
+		return
 
 	var in_pass: bool  = _phase == Phase.VISUAL or _phase == Phase.AUDIO
 	var is_audio: bool = _phase == Phase.AUDIO
@@ -319,6 +443,9 @@ func _input(event: InputEvent) -> void:
 			elif event is InputEventKey and \
 					(event as InputEventKey).keycode == KEY_R:
 				_do_reset()
+			elif event is InputEventKey and \
+					(event as InputEventKey).keycode == KEY_F:
+				_enter_tune_from_saved()
 			elif event.is_action_pressed("ui_accept") or \
 					(event is InputEventKey and
 					(event as InputEventKey).keycode == KEY_SPACE):
@@ -342,10 +469,33 @@ func _input(event: InputEvent) -> void:
 			get_viewport().set_input_as_handled()
 			if event.is_action_pressed("ui_cancel"):
 				_enter_idle()
+			elif event is InputEventKey and \
+					(event as InputEventKey).keycode == KEY_F:
+				_enter_tune_from_result()
 			elif event.is_action_pressed("ui_accept") or \
 					(event is InputEventKey and
 					(event as InputEventKey).keycode == KEY_SPACE):
 				_do_save()
+
+		Phase.TUNE:
+			if is_mouse:
+				return   # the mouse belongs to the nudge buttons
+			# allow_echo on the nudges: holding an arrow should keep walking.
+			if event.is_action_pressed("ui_left", true):
+				_nudge_tune(-5.0)
+			elif event.is_action_pressed("ui_right", true):
+				_nudge_tune(5.0)
+			elif event.is_action_pressed("ui_down", true):
+				_nudge_tune(-1.0)
+			elif event.is_action_pressed("ui_up", true):
+				_nudge_tune(1.0)
+			elif event.is_action_pressed("ui_cancel"):
+				_enter_idle()
+			elif event.is_action_pressed("ui_accept"):
+				_do_save_tune()
+			else:
+				return
+			get_viewport().set_input_as_handled()
 
 
 # ── Tap handling ──────────────────────────────────────────────────────────────
@@ -490,6 +640,23 @@ func _build_click() -> void:
 	_click.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(_click)
 
+	# The same click at the head of INTERVAL seconds of silence, looped.
+	var loop_n: int = int(INTERVAL * float(sr))
+	var loop_data: PackedByteArray = PackedByteArray()
+	loop_data.resize(loop_n * 2)   # zero-filled = silence
+	for i in range(n * 2):
+		loop_data[i] = data[i]
+	var loop := AudioStreamWAV.new()
+	loop.data = loop_data; loop.format = AudioStreamWAV.FORMAT_16_BITS
+	loop.mix_rate = sr; loop.stereo = false
+	loop.loop_mode  = AudioStreamWAV.LOOP_FORWARD
+	loop.loop_begin = 0
+	loop.loop_end   = loop_n
+	_metro = AudioStreamPlayer.new()
+	_metro.stream = loop; _metro.bus = "Master"
+	_metro.process_mode = Node.PROCESS_MODE_ALWAYS
+	add_child(_metro)
+
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 func _build_ui() -> void:
@@ -552,6 +719,15 @@ func _build_ui() -> void:
 	_circle.resized.connect(func() -> void:
 		cm.set_shader_parameter("rect_size", _circle.size))
 	cw.add_child(_circle)
+	_ring_wrap = cw
+
+	# Fine-tune stage: takes the ring's place while that phase is up.
+	_stage = Control.new()
+	_stage.custom_minimum_size = Vector2(0, 250)
+	_stage.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_stage.visible = false
+	_stage.draw.connect(_draw_stage)
+	col.add_child(_stage)
 
 	# Measurement labels (visible only during RUNNING phase)
 	_count_lbl = _lbl("", 30, Color(0.55, 1.00, 0.70), UiStyle.display(800))
@@ -581,7 +757,7 @@ func _build_ui() -> void:
 
 ## Swaps the button row for the current phase. Each spec is
 ## [label, on_pressed, accent].
-func _set_buttons(specs: Array) -> void:
+func _set_buttons(specs: Array, min_width: float = 190.0) -> void:
 	if _btn_row == null:
 		return
 	for c in _btn_row.get_children():
@@ -589,7 +765,7 @@ func _set_buttons(specs: Array) -> void:
 		c.queue_free()
 	for spec: Array in specs:
 		var b := PlateButton.create(String(spec[0]), spec[1], 14, spec[2])
-		b.custom_minimum_size = Vector2(190, 44)
+		b.custom_minimum_size = Vector2(min_width, 44)
 		b.set_padding(16.0, 9.0)
 		# The phase machine already answers ui_accept and ui_cancel directly, so
 		# a focusable button here would be a second, competing way to fire the
@@ -617,6 +793,14 @@ func _set_circle_color(c: Color) -> void:
 		m.set_shader_parameter("edge_color", c)
 		m.set_shader_parameter("edge_color2", c.lightened(0.25))
 		m.set_shader_parameter("fill_color", Color(c.r * 0.18, c.g * 0.12, c.b * 0.30, 0.85))
+
+
+## Swaps the pulsing ring for the fine-tune stage, or back.
+func _show_stage(on: bool) -> void:
+	if _stage != null:
+		_stage.visible = on
+	if _ring_wrap != null:
+		_ring_wrap.visible = not on
 
 
 func _set_measure_visible(v: bool) -> void:

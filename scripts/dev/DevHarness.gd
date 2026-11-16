@@ -135,6 +135,7 @@ func _verify() -> void:
 	await _verify_boots()
 	_verify_save()
 	_verify_latency()
+	await _verify_fine_tune()
 	await _verify_rules()
 	await _verify_menus()
 	await _verify_lazy_gates()
@@ -458,6 +459,65 @@ func _verify_latency() -> void:
 	GameConfig.dev_use_audio_path(GameConfig._AUDIO_PATH)   # back to the real store
 	DirAccess.remove_absolute(ProjectSettings.globalize_path(scratch))
 	print("  tap matching, trimming, per-device store (engine latency here: %.0f ms)" % engine_ms)
+
+
+## The calibrator's fine-tune screen, opened for real: the click loop runs, the
+## nudges move the number and stop at the limits, and the offset moves the ball
+## by exactly that much. Nothing is saved — it is closed with BACK, and the
+## store is on a scratch file anyway in case that ever stops being true.
+func _verify_fine_tune() -> void:
+	print("fine-tune:")
+	var scratch: String = "user://devaudio_offsets.cfg"
+	GameConfig.dev_use_audio_path(scratch)
+	var cal: Node = CALIBRATOR.new()
+	add_child(cal)
+	await _frames(3)
+	cal.call("_enter_tune", 40.0)
+	await _frames(20)
+	var metro: AudioStreamPlayer = cal.get("_metro") as AudioStreamPlayer
+	_check(int(cal.get("_phase")) == int(CALIBRATOR.Phase.TUNE), "fine-tune did not open")
+	_check(metro != null and metro.playing, "the fine-tune click loop is not playing")
+	_check((cal.get("_stage") as Control).visible and not (cal.get("_ring_wrap") as Control).visible,
+		"the bouncing ball did not take the ring's place")
+	_check(absf(float(cal.get("_tune_ms")) - 40.0) < 0.001, "fine-tune did not start from the value given")
+
+	cal.call("_nudge_tune", 5.0)
+	cal.call("_nudge_tune", -1.0)
+	_check(absf(float(cal.get("_tune_ms")) - 44.0) < 0.001, "nudges did not add up")
+	cal.call("_nudge_tune", 99999.0)
+	_check(absf(float(cal.get("_tune_ms")) - float(CALIBRATOR.TUNE_MAX_MS)) < 0.001, "no upper limit on the offset")
+	cal.call("_nudge_tune", -99999.0)
+	_check(absf(float(cal.get("_tune_ms")) - float(CALIBRATOR.TUNE_MIN_MS)) < 0.001, "no lower limit on the offset")
+
+	# Half a beat of offset must put the ball half a bounce away. Read back to
+	# back, so the stream has not moved on between the two.
+	cal.set("_tune_ms", 0.0)
+	var p0: float = float(cal.call("_tune_bounce_phase"))
+	cal.set("_tune_ms", 500.0)
+	var p1: float = float(cal.call("_tune_bounce_phase"))
+	_check(p0 >= 0.0 and p0 < 1.0 and p1 >= 0.0 and p1 < 1.0, "bounce phase left 0..1")
+	_check(absf(fposmod(p0 - p1, 1.0) - 0.5) < 0.01,
+		"a 500 ms offset moved the ball %.3f of a bounce, not half" % fposmod(p0 - p1, 1.0))
+
+	# It keeps time: a second of real time is one bounce, give or take a frame.
+	cal.set("_tune_ms", 0.0)
+	var before: float = float(cal.call("_tune_bounce_phase"))
+	var t0: int = Time.get_ticks_usec()
+	await _frames(30)
+	var dt: float = float(Time.get_ticks_usec() - t0) / 1_000_000.0
+	var moved: float = fposmod(float(cal.call("_tune_bounce_phase")) - before, 1.0)
+	var drift: float = absf(fposmod(moved - dt + 0.5, 1.0) - 0.5)
+	_check(drift < 0.05, "the ball is %.0f ms off the wall clock after %.2f s" % [drift * 1000.0, dt])
+
+	cal.call("_enter_idle")
+	await _frames(2)
+	_check(not metro.playing, "the click loop kept playing after leaving fine-tune")
+	_check(not GameConfig.has_audio_calibration(), "fine-tune saved without being asked to")
+	cal.queue_free()
+	await _frames(2)
+	GameConfig.dev_use_audio_path(GameConfig._AUDIO_PATH)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(scratch))
+	print("  opens, nudges, clamps, tracks the click loop, closes without saving")
 
 
 ## The rules of the game, asserted against a real level rather than read off
