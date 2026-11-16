@@ -3,8 +3,10 @@ extends Node
 ## All values are applied at game-scene start (BeatRunnerPlayer, Section_BeatRunner3d).
 ## Call save() to write to disk; load_from_disk() is called from Main._ready().
 
-## Emitted when the OS switches to a different audio output device.
-## Section_BeatRunner3d listens to this to auto-apply the saved offset.
+## Emitted when the OS switches to a different audio output device. The offset
+## cache below is already refreshed by the time this fires, so gameplay needs no
+## listener; AudioCalibrator uses it to abandon a measurement taken half on one
+## device and half on another.
 signal audio_device_changed(new_device: String)
 
 # ── Player appearance ──────────────────────────────────────────────────────────
@@ -117,21 +119,33 @@ func _set_bus_volume(bus_name: String, linear: float) -> void:
 
 
 # ── Audio latency (per-device) ─────────────────────────────────────────────────
-## Per output-device audio offset in milliseconds.
-## Positive = gates arrive later (compensates for audio that's heard late).
-## Negative = gates arrive earlier (rare; only needed if audio is ahead of visual).
+## Per output-device audio offset in milliseconds: how much later the sound
+## reaches the ear than the matching frame reaches the eye.
+## Positive = sound is late (the usual case; Bluetooth is +150..300).
+## Negative = sound is ahead of the picture (rare; a slow TV on a fast DAC).
+##
+## A device with NO entry is "not calibrated", which is not the same thing as a
+## device calibrated to 0 ms — see has_audio_calibration(). An uncalibrated
+## device falls back to the one part of the delay the engine can measure itself,
+## AudioServer.get_output_latency(). That is also what tools/ManualMapper has
+## always subtracted while charting, so an uncalibrated player now hears a chart
+## the way it was authored instead of one mix buffer early.
 var _audio_offsets:         Dictionary = {}   # device_name -> float (ms)
 var _current_audio_device:  String     = ""   # last known device name
 var _device_poll_t:         float      = 0.0  # accumulator for 1-second polling
 ## Offset for the CURRENT device, in seconds, kept in sync by _refresh_audio_offset_cache().
-## _song_time() in Section_BeatRunner3d calls get_audio_offset_s() several times a frame; it
-## used to go through AudioServer.get_output_device() plus a string-keyed dictionary lookup
-## every single time, for a value that can only change when the device itself changes — and
-## this file already polls for exactly that once a second.
+## The song clock is read several times a frame; it used to go through
+## AudioServer.get_output_device() plus a string-keyed dictionary lookup every
+## single time, for a value that can only change when the device itself changes —
+## and this file already polls for exactly that once a second.
 var _audio_offset_s_cache:  float      = 0.0
+## Dev-harness seam: when set, replaces the offset outright and nothing is
+## written to disk. See dev_override_audio_offset_ms().
+var _dev_audio_offset_ms:   Variant    = null
 
 const _PATH:        String = "user://gameconfig.cfg"
 const _AUDIO_PATH:  String = "user://audio_offsets.cfg"
+var _audio_path:    String = _AUDIO_PATH
 
 
 ## Poll audio device once per second; emit audio_device_changed if it switches.
@@ -145,23 +159,48 @@ func _process(delta: float) -> void:
 		_current_audio_device = dev
 		_refresh_audio_offset_cache()
 		emit_signal("audio_device_changed", dev)
+	elif not has_audio_calibration():
+		# The uncalibrated fallback is the engine's own buffer latency, which the
+		# driver can renegotiate without the device name changing.
+		_refresh_audio_offset_cache()
 
 
 ## Recomputes _audio_offset_s_cache from the current device. Call after anything that
 ## can change either the active output device or the stored per-device offsets.
 func _refresh_audio_offset_cache() -> void:
-	_audio_offset_s_cache = float(_audio_offsets.get(AudioServer.get_output_device(), 0.0)) / 1000.0
+	_audio_offset_s_cache = get_audio_offset_ms() / 1000.0
 
 
-## Returns the calibrated offset for the current output device, in seconds.
-## Returned value is added directly to _song_time() in Section_BeatRunner3d.
+## True once the current output device has been through the calibrator (even if
+## the answer was 0 ms).
+func has_audio_calibration() -> bool:
+	return _audio_offsets.has(AudioServer.get_output_device())
+
+
+## The offset in force for the current output device, in seconds: the calibrated
+## value if there is one, otherwise the engine's reported output latency.
 func get_audio_offset_s() -> float:
 	return _audio_offset_s_cache
 
 
-## Returns the calibrated offset for the current device in milliseconds.
+## Same, in milliseconds, uncached.
 func get_audio_offset_ms() -> float:
-	return _audio_offsets.get(AudioServer.get_output_device(), 0.0)
+	if _dev_audio_offset_ms != null:
+		return float(_dev_audio_offset_ms)
+	var dev: String = AudioServer.get_output_device()
+	if _audio_offsets.has(dev):
+		return float(_audio_offsets[dev])
+	return AudioServer.get_output_latency() * 1000.0
+
+
+## THE song clock: where in `player`'s stream the listener is right now, in
+## seconds, as it lines up with the frame being drawn. The game and the mapper
+## both read this one function so a chart is authored and played on the same
+## clock. Not clamped — it runs negative for the first `offset` seconds of a
+## song, which is what lets the level hold the runner until the sound arrives.
+func song_clock(player: AudioStreamPlayer) -> float:
+	return player.get_playback_position() + AudioServer.get_time_since_last_mix() \
+		- _audio_offset_s_cache
 
 
 ## Saves a calibrated offset (ms) for the device that is currently active.
@@ -172,22 +211,52 @@ func set_audio_offset_for_current_device(ms: float) -> void:
 	_save_audio_offsets()
 
 
+## Forgets the current device's calibration, putting it back on the engine
+## fallback. This is what "reset" means — writing 0 would claim the device had
+## been measured and found to have no delay at all.
+func clear_audio_offset_for_current_device() -> void:
+	_audio_offsets.erase(AudioServer.get_output_device())
+	_refresh_audio_offset_cache()
+	_save_audio_offsets()
+
+
+## Dev harness only: force the offset for this run without touching the
+## player's file. Pass null to hand control back to the stored values.
+func dev_override_audio_offset_ms(ms: Variant) -> void:
+	_dev_audio_offset_ms = ms
+	_refresh_audio_offset_cache()
+
+
+## Dev harness only: point the offset store at another file and reload it, so a
+## round-trip test never writes the player's own calibration.
+func dev_use_audio_path(path: String) -> void:
+	_audio_path = path
+	_audio_offsets.clear()
+	_load_audio_offsets()
+	_refresh_audio_offset_cache()
+
+
 func _save_audio_offsets() -> void:
 	var cfg := ConfigFile.new()
 	for dev in _audio_offsets:
 		cfg.set_value("offsets", dev, _audio_offsets[dev])
-	if cfg.save(_AUDIO_PATH) != OK:
+	if cfg.save(_audio_path) != OK:
 		push_warning("[GameConfig] Failed to save audio offsets.")
 
 
 func _load_audio_offsets() -> void:
 	var cfg := ConfigFile.new()
-	if cfg.load(_AUDIO_PATH) != OK:
-		return   # first launch — no saved offsets yet
-	if not cfg.has_section("offsets"):
-		return
-	for key in cfg.get_section_keys("offsets"):
-		_audio_offsets[key] = cfg.get_value("offsets", key, 0.0)
+	# Start clean: this is re-run by the mapper to pick up what the game saved,
+	# and a device the game has since reset must not survive in memory here.
+	_audio_offsets.clear()
+	if cfg.load(_audio_path) == OK and cfg.has_section("offsets"):
+		for key in cfg.get_section_keys("offsets"):
+			var ms: float = float(cfg.get_value("offsets", key, 0.0))
+			# Older builds wrote exactly 0.0 for "reset" and read it back as "not
+			# calibrated". A measured result is a difference of two averages and
+			# never lands on exactly zero, so 0.0 in a file is always that marker.
+			if ms != 0.0:
+				_audio_offsets[key] = ms
 	_refresh_audio_offset_cache()
 
 

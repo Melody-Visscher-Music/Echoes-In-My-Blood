@@ -530,7 +530,44 @@ class TrackSeg:
 	func path_end() -> float: return path_start + length
 
 var _track_segs:        Array          = []      # Array[TrackSeg]
-var _player_path_dist:  float          = 0.0    # song_time × forward_speed
+var _player_path_dist:  float          = 0.0    # where the runner IS; the song clock says where he should be
+
+# ── Song sync ─────────────────────────────────────────────────────────────────
+# The chart lives in song time and the track is laid out at time x forward_speed,
+# but the runner used to get down it on physics alone: forward_speed integrated
+# from the frame music.play() was called, and never compared with the song again.
+# Two things followed. Anything that cost him ground — a long frame (physics
+# only catches up 8 steps), a turn taken in the outside lane, a late audio
+# start — stayed lost for the rest of the song. And the calibrated audio offset
+# moved the beat flashes but not one gate, because gates are judged by where he
+# is and nothing tied where he is to the clock the offset corrects.
+#
+# So each frame the level works out where the song says he should be and trims
+# his forward speed a little toward it. A trim, not a teleport: he stays a
+# physics body, so floors, walls, wall-jump ledges and rails all still work,
+# and a correction is a few percent of speed spread over a second or two
+# rather than a visible jump.
+## Speed change per second of error: 2.0 pulls an error in with a ~0.5 s time
+## constant while it is small enough not to hit the limit below.
+const _SYNC_GAIN:      float = 2.0
+## Most the trim may change his speed, either way. Small enough that a jump
+## still clears what it was authored to clear while he is catching up; large
+## enough to carry the outside lane round a 20 m turn, which is ~10 % further.
+const _SYNC_MAX_TRIM:  float = 0.12
+## How fast the trim itself may move (1/s). His measured position steps a little
+## at each joint of a curve when he is off the centre line; this keeps those
+## steps from reaching his speed as steps.
+const _SYNC_SMOOTH:    float = 8.0
+## Path distance he stood at when the song started. The target is measured from
+## here, so the sync holds him exactly as far along the chart as an undisturbed
+## run always was instead of quietly re-timing every gate by his spawn offset.
+var _sync_origin_dist: float = 0.0
+## Runner is being held at the start line until the song clock reaches zero —
+## i.e. for the length of a positive audio offset. See _start_level().
+var _sync_hold:        bool  = false
+## Seconds the runner is AHEAD of the song (negative = behind). Read by the HUD-
+## less dev harness (`sync` mode); nothing in the game branches on it.
+var _sync_err_s:       float = 0.0
 var _last_seg_idx:      int            = 0
 var _floor_cutoff_dist: float          = INF    # floor not spawned past this (wall-jump void)
 # Path distances of every arc turn — start and end — used to cull gates.
@@ -1049,6 +1086,12 @@ func _process(delta: float) -> void:
 
 	player.set_song_time(t_s)
 
+	# First frames of a song on a device whose sound runs late: the stream is
+	# playing but none of it has reached the ear yet. Let him go when it does.
+	if _sync_hold and _song_clock() >= 0.0:
+		_sync_hold = false
+		player.set_physics_process(true)
+
 	# Charge OVERDRIVE window countdown (gameplay time — not while paused).
 	if _charge_mult_timer > 0.0:
 		_charge_mult_timer = maxf(0.0, _charge_mult_timer - delta)
@@ -1101,6 +1144,8 @@ func _process(delta: float) -> void:
 
 		_last_seg_idx     = seg_idx
 		_player_path_dist = cur_seg.path_start + clampf(proj, 0.0, cur_seg.length)
+
+	_update_song_sync(delta)
 
 	if not _track_segs.is_empty():
 		var seg_idx: int      = _path_seg_idx_at(_player_path_dist)
@@ -1293,12 +1338,19 @@ func _start_level() -> void:
 		if cl != null:
 			gtw.tween_callback(cl.queue_free)
 
-	# Re-enable physics, input, and start music all on the same frame —
-	# player movement and audio clock both begin at exactly t=0.
-	player.set_physics_process(true)
+	# Start the music and hand back input on the same frame. The runner starts
+	# with it too, unless this device's sound arrives late: then the song clock
+	# opens below zero (it is "position minus offset") and he waits at the line
+	# until it gets there — _process releases him. Starting him now and letting
+	# the sync claw the offset back would play the opening bars visibly slow.
+	_sync_origin_dist = _path_dist_of_player_unclamped()
+	_sync_err_s = 0.0
+	player.sync_speed_scale = 1.0
 	player.input_disabled = false
 	if music.stream != null:
 		music.play()
+	_sync_hold = music.stream != null and GameConfig.get_audio_offset_s() > 0.0
+	player.set_physics_process(not _sync_hold)
 
 
 func _setup_music() -> void:
@@ -1319,20 +1371,61 @@ func _setup_music() -> void:
 	if music.stream == null:
 		push_warning("BeatRunner: no song found — set song_path in the beatmap JSON or assign song_stream in the Inspector.")
 
-func _song_time() -> float:
+## The song clock, unclamped: seconds into the song as the player HEARS it,
+## lined up with the frame being drawn. GameConfig.song_clock() owns the
+## formula — playback position, plus the time since the last mix, minus this
+## output device's offset — and the mapper reads the same one.
+##
+## The offset is the calibrated audio-vs-display delay when the device has been
+## through AudioCalibrator, which already contains the engine's buffer latency;
+## otherwise it IS the engine's buffer latency. Either way it is subtracted
+## exactly once, so do not also subtract AudioServer.get_output_latency() here.
+##
+## Runs negative for the first `offset` seconds after the song starts.
+func _song_clock() -> float:
 	if not _level_started:
 		return 0.0   # countdown is running — no song yet
-	var tplay: float = music.get_playback_position()
-	tplay += AudioServer.get_time_since_last_mix()
-	# NOTE: do NOT also subtract AudioServer.get_output_latency() here — the
-	# two-pass calibration in AudioCalibrator already measures the full
-	# audio-vs-display latency (engine buffer + BT/hardware; the player's
-	# reaction time appears in both of its passes and cancels), so
-	# GameConfig's offset already cancels the engine buffer once. Subtracting
-	# it again here double-corrects and shifts gameplay by an extra helping
-	# of buffer latency on top of the calibrated value.
-	tplay -= GameConfig.get_audio_offset_s()   # per-device calibration offset (total round-trip)
-	return max(0.0, tplay)
+	return GameConfig.song_clock(music)
+
+
+func _song_time() -> float:
+	return maxf(0.0, _song_clock())
+
+
+## Where the runner is along the path right now, WITHOUT the clamp to the first
+## segment that _player_path_dist carries — he may spawn a little behind the
+## start of it, and the sync origin has to see that.
+func _path_dist_of_player_unclamped() -> float:
+	if _track_segs.is_empty() or player == null:
+		return _player_path_dist
+	# Looked up from his tracked distance, NOT read off _last_seg_idx: that is a
+	# shared cursor which every _path_seg_at() call moves, and by the time the
+	# countdown ends the gate build has left it parked far down the track.
+	# Projecting him onto that segment put the origin ~88 s of track away.
+	var seg: TrackSeg = _path_seg_at(_player_path_dist)
+	return seg.path_start + (player.global_position - seg.origin).dot(seg.direction)
+
+
+## Holds the runner on the song. See the block comment at _SYNC_GAIN.
+func _update_song_sync(delta: float) -> void:
+	if player == null:
+		return
+	# Only while there is a live clock to follow. A stopped stream reports
+	# position 0, and steering toward that would brake him to the limit for the
+	# whole of a death fall or the run-out after the last note.
+	if not _level_started or _sync_hold or _song_finish_pending \
+			or not music.playing or music.stream_paused:
+		player.sync_speed_scale = 1.0
+		return
+	# Floored at zero because _player_path_dist is: he may spawn a step behind
+	# the first segment, and until he crosses onto it both read 0.
+	var target: float = maxf(0.0, _sync_origin_dist + _song_clock() * player.forward_speed)
+	_sync_err_s = (_player_path_dist - target) / maxf(player.forward_speed, 0.001)
+	var want: float = 1.0 - clampf(_sync_err_s * _SYNC_GAIN,
+		-_SYNC_MAX_TRIM, _SYNC_MAX_TRIM)
+	player.sync_speed_scale = lerpf(player.sync_speed_scale, want,
+		1.0 - exp(-_SYNC_SMOOTH * delta))
+
 
 func _thin_beats(events: Array[Dictionary], min_gap_s: float) -> Array[Dictionary]:
 	# Drop any beat that arrives less than min_gap_s after the previous kept beat.
@@ -7212,7 +7305,7 @@ func _resume_game() -> void:
 	# countdown and resuming used to switch physics on regardless, so the runner
 	# started moving (forward_speed is applied whether or not input is enabled)
 	# before the music had started — desyncing the whole chart.
-	player.set_physics_process(_level_started)
+	player.set_physics_process(_level_started and not _sync_hold)
 	player.set_process(true)
 
 	_menus.close_pause()

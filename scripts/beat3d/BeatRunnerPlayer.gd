@@ -283,6 +283,11 @@ var _char_tail_root:  Node3D = null
 var _anim_time:       float  = 0.0
 var _run_freq:        float  = 2.4
 var _forward_speed_base: float = -1.0   # scene-authored forward_speed, captured once
+## Trim on the forward speed, written every frame by Section_BeatRunner3d to hold
+## the runner on the song clock (see _update_song_sync there). Kept apart from
+## forward_speed on purpose: forward_speed is also the chart's time-to-distance
+## scale, read all over the level, and must not wobble with the correction.
+var sync_speed_scale: float = 1.0
 var _char_root_base_y: float = 0.0
 # Corner bank — raw -1..1 arc value set each frame by Section_BeatRunner3d
 var _arc_bank_raw: float = 0.0
@@ -668,8 +673,9 @@ func _physics_process(delta: float) -> void:
 		target_lateral = lane_xs[target_lane]
 	var cur_lateral:    float = (global_position - _track_center).dot(right_dir)
 	var dlateral:       float = (target_lateral - cur_lateral) * lane_lerp_speed
-	velocity.x = forward_dir.x * forward_speed + right_dir.x * dlateral
-	velocity.z = forward_dir.z * forward_speed + right_dir.z * dlateral
+	var fwd_speed: float = forward_speed * sync_speed_scale
+	velocity.x = forward_dir.x * fwd_speed + right_dir.x * dlateral
+	velocity.z = forward_dir.z * fwd_speed + right_dir.z * dlateral
 
 	move_and_slide()
 

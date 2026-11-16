@@ -267,7 +267,7 @@ This is told as DLC specifically so it doesn't soften Xevia during the main game
 - procedual level gen (random gate placement each run)
 - low detailed and low polly meeko asset
 - lyrical system
-- Audio Calibration (for wired vs bluetooth latency sync - Fully Automated now)
+- Audio Calibration (for wired vs bluetooth latency sync - two-step tap test, saved per output device; gates follow the calibrated song clock)
 
 
 End of Document

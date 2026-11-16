@@ -1133,7 +1133,7 @@ func _build_audio_calib_window() -> void:
 	margin.add_child(vb)
 
 	var note := Label.new()
-	note.text = "Reads/writes the exact same GameConfig audio-offset store the game uses (user://audio_offsets.cfg, keyed by output device). Separate from this tool's own chart Offset / [ ] latency_ms fields."
+	note.text = "Reads/writes the exact same GameConfig audio-offset store the game uses (user://audio_offsets.cfg, keyed by output device). The mapper's playhead runs on this same offset; this tool's own chart Offset / [ ] latency_ms fields are extra nudges on top of it."
 	note.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	note.add_theme_font_size_override("font_size", 13)
 	note.add_theme_color_override("font_color", Color(0.6, 0.6, 0.72))
@@ -1163,9 +1163,9 @@ func _build_audio_calib_window() -> void:
 	btn_row.add_child(btn_run)
 
 	var btn_reset := Button.new()
-	btn_reset.text = "Reset to 0"
+	btn_reset.text = "Reset (uncalibrate)"
 	btn_reset.pressed.connect(func() -> void:
-		GameConfig.set_audio_offset_for_current_device(0.0)
+		GameConfig.clear_audio_offset_for_current_device()
 		_refresh_audio_calib_labels()
 	)
 	btn_row.add_child(btn_reset)
@@ -1185,7 +1185,8 @@ func _refresh_audio_calib_labels() -> void:
 		return
 	var dev: String = AudioServer.get_output_device()
 	var ms: float = GameConfig.get_audio_offset_ms()
-	var ms_str: String = ("not calibrated" if ms == 0.0
+	var ms_str: String = ("not calibrated — using the engine estimate below"
+		if not GameConfig.has_audio_calibration()
 		else ("%s%.0f ms" % ["+" if ms >= 0.0 else "", ms]))
 	_audio_calib_dev_lbl.text = "Output device:  %s" % dev
 	_audio_calib_offset_lbl.text = "Saved offset (GameConfig):  %s" % ms_str
@@ -4092,12 +4093,13 @@ func _on_tag_category_changed(index: int) -> void:
 # ============================================================
 
 func _play_time() -> float:
-	var tplay: float = song_player.get_playback_position()
-	tplay += AudioServer.get_time_since_last_mix()
-	tplay -= AudioServer.get_output_latency()
-
+	# The game's own clock (GameConfig.song_clock), so a note is placed on the
+	# same timeline it will be played back on: the calibrated offset for this
+	# output device, or the engine's buffer latency when there is none — which is
+	# what this function subtracted by hand before the two were unified.
+	# latency_ms stays on top as this tool's own per-session nudge ([ and ]).
 	var comp: float = float(latency_ms) / 1000.0
-	return max(0.0, tplay - comp)
+	return max(0.0, GameConfig.song_clock(song_player) - comp)
 
 func _tbase() -> float:
 	if song_player.stream == null:

@@ -15,6 +15,10 @@ extends Node
 ##   play <seconds>    runs a story level for real and watches it: screenshots
 ##                     as it goes, worst frame times, and how much of the track
 ##                     built itself on the way (see _build_gate_body)
+##   sync <seconds>    plays a level and checks the runner stays on the song
+##                     clock: with no audio offset, with a late and an early
+##                     one, through a deliberate 300 ms stall, and held in an
+##                     outside lane round the turns
 ##   bake              re-bakes Calder City, then verifies it
 ##
 ## BAKE AND SHOTS MUST RUN WINDOWED. Headless has no renderer: a bake done that
@@ -27,6 +31,7 @@ const RUNNER_SCENE: String = "res://scenes/beat3d/Section_BeatRunner3D.tscn"
 const BEATMAP_DIR: String = "res://data/beatmaps"
 ## Where shots land.
 const SHOT_DIR: String = "user://devshots"
+const CALIBRATOR := preload("res://scripts/AudioCalibrator.gd")
 ## The copy of the save every run works on. Never the player's own file.
 const RUN_SAVE: String = "user://devsave_run.cfg"
 
@@ -81,11 +86,14 @@ func _ready() -> void:
 			await _big_meshes()
 		"bake":
 			await _bake()
+		"sync":
+			await _sync(float(arg) if arg != "" else 30.0,
+				args[2] if args.size() > 2 else "")
 		"play":
 			await _play(float(arg) if arg != "" else 14.0,
 				args[2] if args.size() > 2 else "")
 		_:
-			print("unknown mode '%s' - try verify | perf | loadtime | shots | ui | tiers | ablate | candidates | bake" % mode)
+			print("unknown mode '%s' - try verify | perf | loadtime | shots | ui | tiers | ablate | candidates | sync | bake" % mode)
 	if _checks > 0:
 		print("-- %d checks, %d failed --" % [_checks, _failures])
 	_release_save()
@@ -126,6 +134,7 @@ func _verify() -> void:
 	await _verify_baked_city()
 	await _verify_boots()
 	_verify_save()
+	_verify_latency()
 	await _verify_rules()
 	await _verify_menus()
 	await _verify_lazy_gates()
@@ -385,6 +394,70 @@ func _verify_save() -> void:
 	for name: String in DirAccess.open("user://").get_files():
 		if name.begins_with("devsave_") or name.begins_with("save.corrupt-"):
 			DirAccess.remove_absolute(ProjectSettings.globalize_path("user://" + name))
+
+
+## Audio latency: the calibrator's arithmetic and the per-device store. The store
+## is pointed at a scratch file first — this must never touch a calibration the
+## player sat through thirty taps to get.
+func _verify_latency() -> void:
+	print("latency:")
+
+	# A tap belongs to the beat it is nearest in intent, early or late. The early
+	# case is the one that used to be filed against the previous beat.
+	for case: Array in [[5.00, 5, 0.0], [5.12, 5, 0.12], [4.85, 5, -0.15],
+			[5.65, 5, 0.65], [5.75, 6, -0.25], [6.02, 6, 0.02]]:
+		var hit: Array = CALIBRATOR.beat_for_tap(float(case[0]))
+		_check(int(hit[0]) == int(case[1]) and absf(float(hit[1]) - float(case[2])) < 0.0005,
+			"a tap at %.2f s should be beat %d %+.0f ms, got beat %d %+.0f ms" % [
+				case[0], case[1], float(case[2]) * 1000.0, int(hit[0]), float(hit[1]) * 1000.0])
+
+	# Three wild taps either end must not move the average.
+	var taps: Array[float] = [-0.5, -0.4, -0.3, 0.09, 0.10, 0.10, 0.10, 0.10, 0.10,
+		0.10, 0.11, 0.6, 0.6, 0.6]
+	_check(absf(CALIBRATOR._trimmed_mean(taps) - 0.10) < 0.002,
+		"trimmed mean let outliers through: %.3f" % CALIBRATOR._trimmed_mean(taps))
+	_check(CALIBRATOR._trimmed_stddev(taps) < 0.01,
+		"trimmed spread counted the outliers: %.3f" % CALIBRATOR._trimmed_stddev(taps))
+
+	var scratch: String = "user://devaudio_offsets.cfg"
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(scratch))
+	GameConfig.dev_use_audio_path(scratch)
+	var engine_ms: float = AudioServer.get_output_latency() * 1000.0
+	_check(not GameConfig.has_audio_calibration(), "a fresh store should be uncalibrated")
+	_check(absf(GameConfig.get_audio_offset_ms() - engine_ms) < 0.5,
+		"uncalibrated should fall back to the engine latency (%.1f ms), got %.1f" % [
+			engine_ms, GameConfig.get_audio_offset_ms()])
+
+	GameConfig.set_audio_offset_for_current_device(187.0)
+	GameConfig.dev_use_audio_path(scratch)   # re-open from disk
+	_check(GameConfig.has_audio_calibration(), "a saved calibration did not survive a reload")
+	_check(absf(GameConfig.get_audio_offset_ms() - 187.0) < 0.001, "saved offset came back wrong")
+	_check(absf(GameConfig.get_audio_offset_s() - 0.187) < 0.00001, "cached offset is stale")
+
+	# A negative result is legal (sound ahead of the picture) and must be kept.
+	GameConfig.set_audio_offset_for_current_device(-35.0)
+	_check(absf(GameConfig.get_audio_offset_ms() + 35.0) < 0.001, "a negative offset was not kept")
+
+	GameConfig.clear_audio_offset_for_current_device()
+	GameConfig.dev_use_audio_path(scratch)
+	_check(not GameConfig.has_audio_calibration(), "reset left the device calibrated")
+
+	# Files from before the flag existed used 0.0 to mean "reset".
+	var old := ConfigFile.new()
+	old.set_value("offsets", AudioServer.get_output_device(), 0.0)
+	old.save(scratch)
+	GameConfig.dev_use_audio_path(scratch)
+	_check(not GameConfig.has_audio_calibration(), "an old 0.0 entry read as a calibration")
+
+	# The harness override wins and writes nothing.
+	GameConfig.dev_override_audio_offset_ms(250.0)
+	_check(absf(GameConfig.get_audio_offset_s() - 0.25) < 0.00001, "dev override did not take")
+	GameConfig.dev_override_audio_offset_ms(null)
+	_check(absf(GameConfig.get_audio_offset_ms() - engine_ms) < 0.5, "dev override did not let go")
+
+	GameConfig.dev_use_audio_path(GameConfig._AUDIO_PATH)   # back to the real store
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(scratch))
+	print("  tap matching, trimming, per-device store (engine latency here: %.0f ms)" % engine_ms)
 
 
 ## The rules of the game, asserted against a real level rather than read off
@@ -1717,6 +1790,124 @@ func _play(seconds: float, song_key: String = "") -> void:
 	print("  shots in %s" % ProjectSettings.globalize_path(SHOT_DIR))
 	_shut_down(level)
 	await _frames(5)
+
+
+## Is the runner where the song says he should be? This is the claim the song
+## sync makes, so it is measured the way a player would feel it: seconds between
+## where he is on the track and where the music is, sampled every frame of a
+## real run.
+##
+## Each case boots its own level. The offset is forced through GameConfig's dev
+## seam, so nothing here writes the player's calibration.
+func _sync(seconds: float, song_key: String) -> void:
+	for case: Array in [
+		# name, audio offset ms, hold an outside lane
+		["no offset", 0.0, false],
+		["sound 180 ms late", 180.0, false],
+		["sound 60 ms early", -60.0, false],
+		["outside lane", 0.0, true],
+	]:
+		await _sync_case(String(case[0]), float(case[1]), bool(case[2]), seconds, song_key)
+	GameConfig.dev_override_audio_offset_ms(null)
+
+
+func _sync_case(label: String, offset_ms: float, outside: bool, seconds: float,
+		song_key: String) -> void:
+	print("sync, %s:" % label)
+	GameConfig.dev_override_audio_offset_ms(offset_ms)
+	_story_context(song_key)
+	Run.run_seed = ABLATE_SEED   # the same track for every case
+	var level: Node = (load(GAME_SCENE) as PackedScene).instantiate()
+	add_child(level)
+	await _until_level_ready(level)
+	var s: Node = _find_section(level)
+	var runner: Node3D = s.get("player") as Node3D
+	var music: AudioStreamPlayer = level.find_child("Music", true, false) as AudioStreamPlayer
+	if not _check(runner != null and music != null, "no runner or no music in the level"):
+		_shut_down(level)
+		return
+
+	# Through the countdown.
+	await _until(func() -> bool: return bool(s.get("_level_started")) and music.playing, 20.0)
+	if not _check(bool(s.get("_level_started")) and music.playing, "the song never started"):
+		_shut_down(level)
+		return
+
+	# While the sound has not arrived yet he must not have left the line.
+	var start_pos: Vector3 = runner.global_position
+	var crept: float = 0.0
+	var held_frames: int = 0
+	while bool(s.get("_sync_hold")):
+		crept = maxf(crept, runner.global_position.distance_to(start_pos))
+		held_frames += 1
+		await get_tree().process_frame
+	if offset_ms > 0.0:
+		_check(held_frames > 0, "a late-sound device should hold the runner at the start")
+		_check(crept < 0.05, "he moved %.2f m before the song reached him" % crept)
+	else:
+		_check(held_frames == 0, "he was held at the start with no late sound to wait for")
+
+	var speed: float = float(runner.get("forward_speed"))
+	var origin: float = float(s.get("_sync_origin_dist"))
+	var errs: PackedFloat32Array = PackedFloat32Array()
+	var worst_trim: float = 0.0
+	var elapsed: float = 0.0
+	var stalled: bool = false
+	var stall_at: float = seconds * 0.5
+	var err_after_stall: float = 0.0
+	var quiet_until: float = 3.0   # shaders are still compiling in the first bars
+	while elapsed < seconds and music.playing:
+		await get_tree().process_frame
+		elapsed += get_process_delta_time()
+		if outside:
+			runner.set("target_lane", 0)
+		if not stalled and elapsed >= stall_at:
+			# A frame nobody could have rendered through. Physics makes up at most
+			# eight ticks of it; the song does not wait at all.
+			stalled = true
+			OS.delay_msec(300)
+			await get_tree().process_frame
+			await get_tree().process_frame
+			err_after_stall = float(s.get("_sync_err_s"))
+			quiet_until = elapsed + 5.0
+			continue
+		if elapsed < quiet_until:
+			continue
+		errs.append(absf(float(s.get("_sync_err_s"))))
+		worst_trim = maxf(worst_trim, absf(float(runner.get("sync_speed_scale")) - 1.0))
+
+		# The independent reading, straight off the stream rather than through
+		# the level's own bookkeeping: his distance down the track, as seconds,
+		# against the raw playback position. The gap between them IS the offset
+		# the player calibrated — which is the whole point of the change.
+		if errs.size() == 240:
+			var heard: float = music.get_playback_position() + AudioServer.get_time_since_last_mix()
+			var at: float = (float(s.get("_player_path_dist")) - origin) / speed
+			_check(absf((heard - at) - offset_ms / 1000.0) < 0.03,
+				"gates should run %.0f ms behind the stream, measured %.0f ms" % [
+					offset_ms, (heard - at) * 1000.0])
+
+	if _check(errs.size() > 120, "the run was too short to measure (%d samples)" % errs.size()):
+		var sorted: Array = Array(errs)
+		sorted.sort()
+		var median: float = sorted[sorted.size() / 2]
+		var p99: float = sorted[int(float(sorted.size()) * 0.99)]
+		var worst: float = sorted[sorted.size() - 1]
+		print("  off the song by: median %.1f ms, 99th %.1f ms, worst %.1f ms   (trim peaked at %.1f%%)" % [
+			median * 1000.0, p99 * 1000.0, worst * 1000.0, worst_trim * 100.0])
+		print("  after a 300 ms stall he was %+.0f ms off; five seconds later he is measured above" % (
+			err_after_stall * 1000.0))
+		# The outside lane is the hard case — every turn asks for more ground than
+		# the trim is allowed to give at once — so it gets the looser bound.
+		_check(median < (0.030 if outside else 0.010),
+			"median error %.1f ms — he is not being held on the song" % (median * 1000.0))
+		_check(p99 < (0.120 if outside else 0.040),
+			"99th-percentile error %.1f ms" % (p99 * 1000.0))
+	print("  gates judged: %d hit, %d missed" % [int(s.get("_gates_hit")), int(s.get("_gates_missed"))])
+	_check(int(s.get("_gates_hit")) + int(s.get("_gates_missed")) > 0 or seconds < 20.0,
+		"no gate was judged in %.0f s — is he reaching them?" % seconds)
+	_shut_down(level)
+	await _frames(10)
 
 
 # ── Baking ───────────────────────────────────────────────────────────────────

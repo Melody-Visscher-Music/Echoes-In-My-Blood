@@ -2,7 +2,7 @@ extends CanvasLayer
 ## Audio latency calibrator — three-phase flow.
 ##
 ##  IDLE    → shows current device + saved offset + Bluetooth detection
-##            [ENTER] start calibration   [R] reset to 0   [ESC] close
+##            [ENTER] start calibration   [R] reset   [ESC] close
 ##
 ##  PASS 1  → SILENT. The ring flashes on each beat; tap when you SEE it.
 ##  PASS 2  → DARK. A click plays on each beat; tap when you HEAR it.
@@ -36,8 +36,14 @@ const INTERVAL:  float = 60.0 / BPM     # 1.000 s — comfortable tapping pace
 const WARMUP_N:  int   = 4              # beats to run before measuring, per pass
 const COLLECT_N: int   = 14             # taps collected per pass
 const TRIM_N:    int   = 3              # discard this many highest + lowest, per pass
-# Max lag accepted per tap — 88 % of interval covers ~880 ms (worst Bluetooth).
-const MAX_LAG:   float = INTERVAL * 0.88
+## How far BEFORE a beat a tap still belongs to that beat. At a steady 60 BPM
+## people stop reacting and start predicting within a few beats, so taps land
+## either side of the stimulus. The window is lopsided on purpose: a tap can be
+## this early, or up to INTERVAL - EARLY_WINDOW (700 ms) late, which still covers
+## the slowest Bluetooth link.
+const EARLY_WINDOW: float = 0.30
+## Trimmed standard deviation above which a pass is called inconsistent.
+const MAX_SPREAD:   float = 0.04
 
 # Keywords checked against the lowercased output device name.
 # Broad on purpose — a false BT-positive is harmless; a miss isn't.
@@ -58,6 +64,10 @@ var _phase: Phase = Phase.IDLE
 ## time; subtracting one from the other is what removes it.
 var _visual_mean: float = 0.0
 var _audio_mean:  float = 0.0
+## Spread of each pass. The result is a difference, so it is only as good as
+## the worse of the two.
+var _visual_sd:   float = 0.0
+var _audio_sd:    float = 0.0
 
 var _elapsed:    float        = 0.0
 var _next_beat:  float        = 1.0
@@ -68,8 +78,10 @@ var _result_ms:  float        = 0.0
 var _inconsistent: bool       = false
 
 # High-precision timing — replaces delta accumulation to eliminate drift.
-var _run_start_usec: int       = 0
-var _beat_usec_log:  Array[int] = []   # exact usec timestamp of each post-warmup beat
+var _run_start_usec: int = 0
+## Beat number of the last tap that counted, so a double-tap or a bouncing
+## switch cannot vote twice for the same beat.
+var _last_tap_beat:  int = 0
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 var _click: AudioStreamPlayer = null
@@ -96,6 +108,14 @@ func _ready() -> void:
 	layer = 120
 	_build_click()
 	_build_ui()
+	_enter_idle()
+	GameConfig.audio_device_changed.connect(_on_device_changed)
+
+
+## Headphones unplugged or connected mid-flow. A pass measured across two
+## devices means nothing, and even the idle card is now describing the wrong
+## one — so whatever was on screen, go back to a fresh idle card.
+func _on_device_changed(_new_device: String) -> void:
 	_enter_idle()
 
 
@@ -144,21 +164,18 @@ func _enter_idle() -> void:
 	_elapsed    = 0.0
 	_beat_count = 0
 	_taps.clear()
-	_beat_usec_log.clear()
 	_set_measure_visible(false)
 
 	var dev      := AudioServer.get_output_device()
-	var saved_ms := GameConfig.get_audio_offset_ms()
 	var suggest  := _auto_suggest()
-
-	var ms_str: String = ("not calibrated" if saved_ms == 0.0
-		else ("%s%.0f ms" % ["+" if saved_ms >= 0.0 else "", saved_ms]))
+	var calibrated: bool = GameConfig.has_audio_calibration()
+	var ms_str: String = _saved_offset_text()
 
 	_title.text     = "AUDIO LATENCY"
 	_dev_lbl.text   = "Device:  %s  [%s]" % [dev, suggest.label]
 	_saved_lbl.text = "Saved offset:  %s" % ms_str
 
-	if suggest.is_bt and saved_ms == 0.0:
+	if suggest.is_bt and not calibrated:
 		_body.text = (
 			"⚡ Bluetooth detected.\n"
 			+ "Engine buffer: %.0f ms  |  Estimated wireless: +150–280 ms\n" % suggest.engine_ms
@@ -172,10 +189,10 @@ func _enter_idle() -> void:
 	else:
 		_body.text = "Two quick steps: tap what you SEE, then tap what you HEAR.\nThe gap between them is your audio delay. Headphones on."
 
-	_hint.text    = "[ENTER]  Calibrate (2 steps)     [R]  Reset to 0     [ESC]  Close"
+	_hint.text    = "[ENTER]  Calibrate (2 steps)     [R]  Reset     [ESC]  Close"
 	_set_buttons([
 		["CALIBRATE",   _enter_running, UiStyle.CYAN],
-		["RESET TO 0",  _do_reset,      UiStyle.VIOLET],
+		["RESET",       _do_reset,      UiStyle.VIOLET],
 		["CLOSE",       _do_cancel,     UiStyle.VIOLET],
 	])
 	_set_circle_color(Color(0.35, 0.20, 0.70, 1.0))
@@ -198,7 +215,7 @@ func _enter_pass(pass_phase: Phase) -> void:
 	_next_beat  = 1.0
 	_beat_count = 0
 	_taps.clear()
-	_beat_usec_log.clear()
+	_last_tap_beat  = 0
 	_run_start_usec = Time.get_ticks_usec()   # anchor to monotonic clock
 	_set_measure_visible(true)
 
@@ -225,9 +242,7 @@ func _enter_done() -> void:
 	_set_measure_visible(false)
 
 	var sgn: String = "+" if _result_ms >= 0.0 else ""
-	var ms:  float  = GameConfig.get_audio_offset_ms()
-	var ms_str: String = ("not calibrated" if ms == 0.0
-		else ("%s%.0f ms" % ["+" if ms >= 0.0 else "", ms]))
+	var ms_str: String = _saved_offset_text()
 
 	_title.text     = "RESULT"
 	_dev_lbl.text   = ""
@@ -271,9 +286,7 @@ func _process(delta: float) -> void:
 				_click.play()
 			else:
 				_pulse = 1.0
-			var measuring := _beat_count > WARMUP_N
-			if measuring:
-				_beat_usec_log.append(now_usec)   # log exact usec for this beat
+			if _beat_count > WARMUP_N:
 				_title.text = "TAP!"
 			else:
 				_title.text = "GET READY  (%d)" % maxi(0, WARMUP_N - _beat_count + 1)
@@ -316,7 +329,7 @@ func _input(event: InputEvent) -> void:
 				get_viewport().set_input_as_handled()
 				_enter_idle()
 				return
-			if not pressed or _beat_count <= WARMUP_N:
+			if not pressed:
 				return
 			if is_mouse and _over_buttons(event):
 				return   # that click is CANCEL, not a tap
@@ -336,25 +349,29 @@ func _input(event: InputEvent) -> void:
 
 
 # ── Tap handling ──────────────────────────────────────────────────────────────
+## Which beat a tap at `elapsed` seconds into a pass belongs to, and how far
+## off it was: [beat_number, lag_seconds]. Beat k is scheduled at k * INTERVAL.
+## Negative lag = tapped before the beat.
+##
+## Pure and static so the dev harness can check it without a window. It works
+## from the SCHEDULE, not from the beats that have already fired: the old code
+## only looked back, so a tap 150 ms ahead of a beat was filed as 850 ms behind
+## the previous one and dragged the average up by most of a second.
+static func beat_for_tap(elapsed: float) -> Array:
+	var k: int = int(floor((elapsed + EARLY_WINDOW) / INTERVAL))
+	return [k, elapsed - float(k) * INTERVAL]
+
+
 func _record_tap() -> void:
-	if _beat_usec_log.is_empty():
-		return   # tapped before any measuring beat fired
-
 	var tap_usec := Time.get_ticks_usec()
+	var hit: Array = beat_for_tap(float(tap_usec - _run_start_usec) / 1_000_000.0)
+	var beat: int  = hit[0]
+	var lag: float = hit[1]
 
-	# Find which logged beat is nearest to this tap.
-	# Only need to check the last two — taps always land close to the most recent beat.
-	var nearest_usec := _beat_usec_log[_beat_usec_log.size() - 1]
-	if _beat_usec_log.size() >= 2:
-		var prev_usec := _beat_usec_log[_beat_usec_log.size() - 2]
-		if absi(tap_usec - prev_usec) < absi(tap_usec - nearest_usec):
-			nearest_usec = prev_usec
-
-	# Positive = tapped after the beat fired = audio is delayed. Expected for BT.
-	var lag := float(tap_usec - nearest_usec) / 1_000_000.0
-
-	if absf(lag) > MAX_LAG:
-		return   # wild tap, ignore
+	# Warm-up beats are for finding the pulse, and one beat gets one vote.
+	if beat <= WARMUP_N or beat == _last_tap_beat:
+		return
+	_last_tap_beat = beat
 
 	_taps.append(lag)
 
@@ -374,9 +391,11 @@ func _record_tap() -> void:
 	if _taps.size() >= COLLECT_N:
 		if _phase == Phase.VISUAL:
 			_visual_mean = _trimmed_mean(_taps)
+			_visual_sd   = _trimmed_stddev(_taps)
 			_enter_pass(Phase.AUDIO)
 		else:
 			_audio_mean = _trimmed_mean(_taps)
+			_audio_sd   = _trimmed_stddev(_taps)
 			_compute_result()
 			_enter_done()
 
@@ -384,7 +403,7 @@ func _record_tap() -> void:
 # ── Result math ───────────────────────────────────────────────────────────────
 ## Mean of `samples` with the TRIM_N highest and lowest discarded, in seconds.
 ## Falls back to a plain mean if there are too few samples to trim.
-func _trimmed_mean(samples: Array[float]) -> float:
+static func _trimmed_mean(samples: Array[float]) -> float:
 	if samples.is_empty():
 		return 0.0
 	var sorted: Array[float] = samples.duplicate()
@@ -399,7 +418,7 @@ func _trimmed_mean(samples: Array[float]) -> float:
 
 
 ## Population std-dev of the trimmed set, in seconds — the consistency warning.
-func _trimmed_stddev(samples: Array[float]) -> float:
+static func _trimmed_stddev(samples: Array[float]) -> float:
 	if samples.size() < 2:
 		return 0.0
 	var sorted: Array[float] = samples.duplicate()
@@ -418,7 +437,9 @@ func _trimmed_stddev(samples: Array[float]) -> float:
 ## both terms and cancels, which is the whole reason for the second pass; see
 ## the header. A positive result means sound arrives AFTER the picture.
 func _compute_result() -> void:
-	_inconsistent = _trimmed_stddev(_taps) > 0.04
+	# Either pass being loose spoils the difference — this used to look at the
+	# sound pass alone, so a wild sight pass saved without a word.
+	_inconsistent = maxf(_visual_sd, _audio_sd) > MAX_SPREAD
 	_result_ms = (_audio_mean - _visual_mean) * 1000.0
 
 
@@ -430,8 +451,17 @@ func _do_save() -> void:
 
 
 func _do_reset() -> void:
-	GameConfig.set_audio_offset_for_current_device(0.0)
+	GameConfig.clear_audio_offset_for_current_device()
 	_enter_idle()
+
+
+## The idle and result cards' "saved" line. "Not calibrated" is the absence of a
+## saved value, not a saved value of zero.
+func _saved_offset_text() -> String:
+	if not GameConfig.has_audio_calibration():
+		return "not calibrated  (engine estimate %.0f ms)" % GameConfig.get_audio_offset_ms()
+	var ms: float = GameConfig.get_audio_offset_ms()
+	return "%s%.0f ms" % ["+" if ms >= 0.0 else "", ms]
 
 
 func _do_cancel() -> void:
@@ -455,7 +485,7 @@ func _build_click() -> void:
 	wav.data = data; wav.format = AudioStreamWAV.FORMAT_16_BITS
 	wav.mix_rate = sr; wav.stereo = false
 	_click = AudioStreamPlayer.new()
-	_click.bus = "SFX"
+	# Master, not SFX: a player who has turned effects down still has to hear this.
 	_click.stream = wav; _click.bus = "Master"
 	_click.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(_click)
