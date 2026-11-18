@@ -2087,13 +2087,7 @@ func _analysis_failure_reason(vpath: String) -> String:
 	return ""
 
 func _on_analyzer_success(found_path: String) -> void:
-	_analyzer_dbg("DONE success → " + found_path)
-	_analyzer_dbg(" beats=%d downbeats=%d onsets=%d map_notes=%d" % [
-		analysis_beats_ms.size(),
-		analysis_downbeats_ms.size(),
-		analysis_onsets.size(),
-		analysis_map_notes.size()
-	])
+	_analyzer_dbg("output found (exit_code=%d) → %s" % [_analyzer_finalize_exit_code, found_path])
 	# The analyzer writes an output file whether it succeeded or not, so check
 	# what is IN it before calling this a success -- otherwise a run that failed
 	# for an obvious reason (missing audio) is reported as "done" and the real
@@ -2117,8 +2111,18 @@ func _on_analyzer_success(found_path: String) -> void:
 		_set_analyzer_progress(0.0, "Failed ✖")
 		_hide_analyzer_progress_after(0.6)
 		info.text = "Analyze failed: output could not be loaded."
+		_analyzer_dbg("FAILED: output could not be loaded")
 		_dump_analyzer_debug()
 		return
+
+	# Only now -- after the output validated and loaded -- is this a success.
+	_analyzer_dbg("DONE success → " + analysis_path)
+	_analyzer_dbg(" beats=%d downbeats=%d onsets=%d map_notes=%d" % [
+		analysis_beats_ms.size(),
+		analysis_downbeats_ms.size(),
+		analysis_onsets.size(),
+		analysis_map_notes.size()
+	])
 
 	info.text = "Analyzed → %s | Beats: %d | Onsets: %d" % [analysis_path, analysis_beats_ms.size(), analysis_onsets.size()]
 	queue_redraw()
