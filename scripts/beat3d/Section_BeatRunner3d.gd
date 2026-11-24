@@ -160,6 +160,12 @@ const _WJ_MULT_FADE_S: float = 0.35
 ## Path distance of the top of the climb (= where the elevated floor begins).
 ## Set by _spawn_wj_geometry_on_path; -1 when the level has no wall-jump section.
 var _wj_climb_top_z: float = -1.0
+## DEVTOOLS — the wall-jump climb, slot by slot (see _spawn_wj_geometry_on_path).
+## Read by scripts/dev/AutoPilot.gd and the no-death fall rescue.
+var _wj_slot_zs: Array[float] = []
+var _wj_slot_acts: Array[String] = []
+var _wj_slot_heights: Array[float] = []
+var _wj_ledge_half_z: float = 3.0
 
 # ── Death screen state ───────────────────────────────────────────────────────
 
@@ -350,6 +356,20 @@ const _ELEC_PREVIEW_GATES: float = 2.25
 ## of everything else did.
 ## The live rail running the length of each zone — see _spawn_elec_conduits.
 var _elec_conduit_mat: ShaderMaterial = null
+## Lateral offset of the conduit rails, so the surges ride the same line.
+var _elec_conduit_lat: float = 0.0
+
+## Atmosphere only: hum, breakers, sky lightning, surges, signs, shock effects.
+## See ElecMenace — none of it touches judging, timing or gate visibility.
+var _menace: ElecMenace = null
+## Next gate whose arcs have not finished igniting yet, for the whine + snap.
+var _elec_ignite_cursor: int = 0
+## Per overhead lamp: has the blackout front passed it? Tracked separately from
+## the light's energy so the blind flash on a miss does not re-trip a breaker.
+var _ambient_tripped: PackedByteArray = PackedByteArray()
+## How far ahead of the front lamps start to brown out before it kills them.
+## The front runs at ~260 m/s, so this is about half a second of stutter.
+const _ELEC_BROWN_M: float = 120.0
 ## How much harder a gate burns when it is the only light in the room.
 const _ELEC_GATE_GAIN: float = 5.0
 ## ...and how far it throws, in metres.
@@ -800,6 +820,7 @@ func _pick_random_lyric_font() -> void:
 
 
 func _ready() -> void:
+	DevTools.attach(self)   # DEVTOOLS — temporary testing console, remove before release
 	_load_t0 = Time.get_ticks_msec()
 	load_timings.clear()
 	# Disable input/physics immediately — level geometry now builds across
@@ -1057,6 +1078,8 @@ func _process(delta: float) -> void:
 	# that should have gone could linger for up to a tick, and three were
 	# readable where the zone allows two.
 	_update_electric_gate_visuals(t_s)
+	if _menace != null and not _paused:
+		_update_menace(delta, t_s)
 
 	# City / electric pulse decay runs even when paused so lights don't freeze mid-flash
 	var dt_pulse: float = _visual_tick(_TICK_PULSE, delta)
@@ -1185,6 +1208,8 @@ func _process(delta: float) -> void:
 		var _halo_col_a: Color = _current_halo_cycle_color(t_s)
 		var _halo_col_b: Color = _current_halo_cycle_color_b(t_s) 			if GameConfig.halo_dual_color else _halo_col_a
 		_fx_pool.update_halo_colors(_halo_col_a, _halo_col_b)
+		if _menace != null:
+			_menace.set_ring_colors(_halo_col_a, _halo_col_b)
 
 	# only show gates a few beats ahead instead of the whole song at once
 	_update_gate_visibility()
@@ -1212,6 +1237,9 @@ func _process(delta: float) -> void:
 	_update_grind_system(t_s)
 	# Charge tunnel — drop buildups (free-slide hoop threading → ×100 overdrive)
 	_update_charge_tunnel(t_s, delta)
+	# Smash gates — the mash window, the wall's cracks, the impact
+	if _smash != null:
+		_smash.update(t_s, delta)
 	# WJ descent ramp — jump lock while the player is in the drop zone
 	_update_wj_slide(delta)
 	# WJ ×2 bonus — ends the moment the top of the climb is reached. Has to run
@@ -1225,8 +1253,12 @@ func _process(delta: float) -> void:
 
 	# Fall detection — show death/retry screen if player drops into the void
 	if not _fell and player.global_position.y < -12.0:
-		_fell = true
-		_trigger_death()
+		# DEVTOOLS — no-death puts him back on the track instead. Remove with the console.
+		if dev_no_death and DevTools.no_death:
+			_dev_rescue()
+		else:
+			_fell = true
+			_trigger_death()
 
 # ── Countdown / level-start ───────────────────────────────────────────────────
 
@@ -1491,6 +1523,8 @@ func _load_chart_and_build_plan() -> void:
 
 	gameplay_events.sort_custom(Callable(self, "_sort_event_by_t"))
 	world_events.sort_custom(Callable(self, "_sort_event_by_t"))
+	# Beat holds become smash gates; the beats inside their windows go.
+	_extract_smash_holds()
 
 	# Remove beats that are too close together to be physically playable.
 	# The minimum gap scales with BPM: at high tempo we allow denser gates (down
@@ -1535,10 +1569,114 @@ func _load_chart_and_build_plan() -> void:
 	_parse_rap_data(d)
 
 	runner_plan = _build_runner_plan_from_beats(gameplay_events)
+	_insert_smash_entries()
 	_parse_drop_buildups(d)
 	_parse_electric_zones(d)
 	_parse_lyrics(d)
 	_apply_beatmap_lyric_font(d)
+
+# ── Smash gates ───────────────────────────────────────────────────────────────
+# See SmashGate.gd. A HOLD on the beats pass is a smash: mash for the length of
+# the hold, hit the wall at its end. Melody and fx holds are untouched.
+
+## Shortest beat hold that counts as a smash. Anything shorter is a stray drag
+## in the mapper rather than an intended hold.
+const _SMASH_MIN_HOLD_S: float = 0.35
+## Clear track after the impact before the next gate, so the first gate of the
+## (authored) electric zone does not arrive in the same breath as the wall.
+const _SMASH_RECOVER_S: float = 0.35
+
+var _smash_holds: Array[Dictionary] = []   # {t0, t1}
+var _smash: SmashGate = null
+
+
+func _extract_smash_holds() -> void:
+	_smash_holds.clear()
+	for e in gameplay_events:
+		if String(e.get("type", "")) != "hold":
+			continue
+		var dur: float = float(e.get("dur", 0.0))
+		if dur < _SMASH_MIN_HOLD_S:
+			continue
+		var t0: float = float(e.get("t", 0.0))
+		# Presses the mapper set for this wall; 0 = the recommended amount.
+		_smash_holds.append({"t0": t0, "t1": t0 + dur,
+			"mash_target": int(e.get("mash_target", 0))})
+	if _smash_holds.is_empty():
+		return
+	# No other gates during a mash: he is locked to the middle lane, charging.
+	var kept: Array[Dictionary] = []
+	for e in gameplay_events:
+		var t: float = float(e.get("t", 0.0))
+		var inside: bool = false
+		for h: Dictionary in _smash_holds:
+			if t >= float(h["t0"]) - 0.05 and t <= float(h["t1"]) + _SMASH_RECOVER_S:
+				inside = true
+				break
+		if not inside:
+			kept.append(e)
+	gameplay_events = kept
+
+
+func _insert_smash_entries() -> void:
+	if _smash_holds.is_empty():
+		return
+	var mid: int = player.lane_xs.size() / 2
+	for h: Dictionary in _smash_holds:
+		runner_plan.append({
+			"t":            float(h["t1"]),
+			"action":       "smash",
+			"pre_lane":     mid,
+			"post_lane":    mid,
+			"source_lane":  0,
+			"section_tag":  "smash",
+			"phrase_index": -1,
+			"mash_t0":      float(h["t0"]),
+			"mash_target":  int(h.get("mash_target", 0)),
+		})
+	runner_plan.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return float(a.get("t", 0.0)) < float(b.get("t", 0.0)))
+
+	# From story level 5 on, and always in freeplay, the charge burns echo
+	# energy and Meeko glows rainbow for it.
+	var rainbow: bool = true
+	if Run.in_story_mode():
+		var data: StoryMapData = StoryMapData.load_from()
+		rainbow = data != null and data.order.find(Run.story_node_id) >= 4
+	_smash = SmashGate.new()
+	add_child(_smash)
+	_smash.setup(self, rainbow)
+	for i in runner_plan.size():
+		if String(runner_plan[i].get("action", "")) == "smash":
+			_smash.add(i, float(runner_plan[i].get("mash_t0", 0.0)), float(runner_plan[i]["t"]),
+				int(runner_plan[i].get("mash_target", 0)))
+
+
+## Called by SmashGate when a wall breaks: score it, charge the health.
+func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float) -> void:
+	if gi >= 0 and gi < gate_judged.size():
+		gate_judged[gi] = true
+		gate_success[gi] = true
+	_gates_hit += 1
+	_combo += 1
+	_max_combo = maxi(_max_combo, _combo)
+	var ratio: float = clampf(float(presses) / float(maxi(target, 1)), 0.0, 1.5)
+	_score += int(1000.0 * ratio) * _score_multiplier()
+	if hp_cost > 0.0 and not dev_no_death:
+		_health_pct = clampf(_health_pct - hp_cost / 100.0, 0.0, 1.0)
+	_update_hud_score()
+	_update_hud_health()
+	_hud_flash_color(Color(1.0, 0.85, 0.95, 0.45), 0.30)
+	_shake_camera()
+	_beat_cam_t = 1.0
+	if _hud != null:
+		_hud.combo_flash(Color(1.5, 1.3, 0.4, 1.0), 0.05, 0.16)
+	var verdict: String = "SMASH!  no damage" if hp_cost <= 0.0 \
+		else "SMASH!  −%d HP" % int(round(hp_cost))
+	_show_grind_banner(verdict, Color(1.0, 0.45, 0.75) if hp_cost > 10.0 else Color(0.5, 1.0, 0.7))
+	if _health_pct <= 0.0 and not dev_no_death:
+		_trigger_death()
+
 
 func _setup_runner_rng() -> void:
 	if runner_seed_override != 0:
@@ -1917,7 +2055,9 @@ func _place_feasible_wall_jump(section_types: Array[String], phrases: Array, ana
 
 	if not GameConfig.wall_jumps_enabled or _runner_avg_beat_s >= MAX_WJ_BEAT_S:
 		return
-	if _runner_rng.randf() >= WJ_PLACE_PROB:
+	# DEVTOOLS — "force a wall jump" skips the coin flip. The roll still happens
+	# so the rest of the seeded layout is unchanged. Remove with the console.
+	if _runner_rng.randf() >= WJ_PLACE_PROB and not DevTools.force_wall_jump:
 		return   # intentionally WJ-free this song (variety)
 
 	# Collect EVERY feasible non-edge phrase with its score, then choose among
@@ -3578,7 +3718,10 @@ func _build_all_gate_visuals() -> void:
 		_gate_cycle_mats.append([] as Array[Material])
 		_gate_vis_built.append(false)
 		gate_actions.append(String(entry.get("action", "")))
-		gate_is_electric.append(_is_electric_at(float(entry.get("t", 0.0))))
+		# A smash gate sits on the zone's first instant, but it is the door INTO
+		# the zone, not part of it: never dressed or preview-capped as electric.
+		gate_is_electric.append(_is_electric_at(float(entry.get("t", 0.0)))
+			and String(entry.get("action", "")) != "smash")
 
 	# Only the opening stretch is fleshed out now; the rest arrives as the
 	# player does - see _build_gate_body.
@@ -3654,7 +3797,11 @@ func _build_gate_body(gate_index: int) -> void:
 	var tw: float   = _track_full_width()
 
 	# Authored Blender gate pieces take priority; the built look is the fallback.
-	if not _spawn_authored_gate(vis_root, action, post_lane, tw):
+	if action == "smash":
+		if _smash != null:
+			_smash.build_visual(vis_root, gate_index, tw, lane_blocker_height * 1.15,
+				_pieces, player.lane_xs, lane_blocker_width, gate_depth)
+	elif not _spawn_authored_gate(vis_root, action, post_lane, tw):
 		_looks.build(vis_root, action, post_lane, tint, _is_electric_at(t_s), gate_index)
 
 	_gate_cycle_mats[gate_index] = _collect_cycle_mats(gate)
@@ -3846,6 +3993,21 @@ func _spawn_electric_environment() -> void:
 	_spawn_elec_conduits()
 	var end_z: float = _song_end_z()
 	var tw:    float = _track_full_width()
+
+	_menace = ElecMenace.new()
+	add_child(_menace)
+	_menace.setup(_path_world_pos, _path_forward_at, _z_is_electric,
+		_elec_conduit_lat if _elec_conduit_lat > 0.0 else tw * 0.5 + 0.22)
+	_menace.setup_rings(GameConfig.halo_size)
+	# A pair of warning boards at every zone entrance. Placed so the runner
+	# reaches them about when the blackout front does: seen from a distance
+	# while the lamps are still on, passed as they go out.
+	if player != null and player.forward_speed > 0.0:
+		for zone: Dictionary in _electric_zones:
+			var spd: float = (float(zone.get("start_t", 0.0)) - _ELEC_PREROLL_S * 0.6) \
+				* player.forward_speed
+			if spd > 5.0:
+				_menace.build_signs(spd, tw * 0.5 + 1.9, _path_y_rot_at(spd))
 	const PYLON_SPACING: float = 55.0
 	var pylon_count: int = maxi(4, int(end_z / PYLON_SPACING))
 
@@ -3920,6 +4082,8 @@ func _spawn_electric_environment() -> void:
 				p_inst.rotation_degrees.y = 180.0
 				p_anchor.add_child(p_inst)
 
+				_menace.add_pylon_tip(bz, side,
+					_path_world_pos(bz, float(side) * (pylon_dist - p_reach), p_h))
 				# Colour + pulse the "Tip" glow like the procedural insulators.
 				var tip_mat := StandardMaterial3D.new()
 				tip_mat.albedo_color               = arc_col.lightened(0.20)
@@ -3995,6 +4159,7 @@ func _spawn_electric_environment() -> void:
 			glow.material_override = arc_mat
 			glow.position = _path_world_pos(bz, tip_lat, pylon_h)
 			world_fx_root.add_child(glow)
+			_menace.add_pylon_tip(bz, side, glow.position)
 
 			# ── Ambient light — only every 3rd pylon to keep light count down ─
 			if i % 3 == 0:
@@ -4041,9 +4206,14 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 	# _on_gate_scored. The dark returns the instant it passes.
 	_elec_blind_t = maxf(0.0, _elec_blind_t - delta)
 
-	# The world only goes dark once the front has actually reached him.
+	# The world around him goes dark ON the zone, not before it: the dim starts
+	# just early enough to land fully at the zone's own start time. It used to
+	# key off the front reaching him, which happened a second or more before the
+	# zone — so the dark, the lightning halos and the storm all arrived while he
+	# was still running city gates. The front still runs ahead of him, but it
+	# only takes out lamps that stand inside the zone (_z_blackout).
 	var want: float = 0.0
-	if in_zone and _elec_wave_pd <= pd + 1.0 and _elec_blind_t <= 0.0:
+	if _elec_dim_at(t_s) and _elec_blind_t <= 0.0:
 		want = 1.0
 	_elec_dark = move_toward(_elec_dark, want, delta * _ELEC_DARK_RATE)
 
@@ -4078,15 +4248,38 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 	var hi: float = pd + _deco_window_ahead_m
 	while _ambient_cursor < _ambient_pds.size() and _ambient_pds[_ambient_cursor] < lo:
 		_ambient_cursor += 1
+	if _ambient_tripped.size() != _ambient_lights.size():
+		_ambient_tripped.resize(_ambient_lights.size())
+		_ambient_tripped.fill(0)
+	# Only while the front is still running in. Once it has reached him, lamps
+	# coming into the window are already dead and should not each trip again.
+	var front_running: bool = is_finite(_elec_wave_pd) and _elec_wave_pd > pd + 1.0
+	var flash: float = GameConfig.flash_scale()
 	for i in range(_ambient_cursor, _ambient_lights.size()):
 		if i >= _ambient_pds.size() or _ambient_pds[i] > hi:
 			break
-		var lamp_out: bool = (
-			_elec_blind_t <= 0.0
-			and _z_blackout(_ambient_pds[i])
-			and _ambient_pds[i] >= _elec_wave_pd)
-		_ambient_lights[i].light_energy = 2.2 * (
-			_ELEC_AMBIENT_FLOOR if lamp_out else 1.0)
+		var lpd: float = _ambient_pds[i]
+		var in_dark: bool = _z_blackout(lpd)
+		var passed: bool = in_dark and lpd >= _elec_wave_pd
+		# The breaker trips once, when the front reaches the lamp.
+		if passed and _ambient_tripped[i] == 0:
+			_ambient_tripped[i] = 1
+			if front_running and _menace != null:
+				_menace.breaker(lpd - pd)
+		elif not passed and not in_zone:
+			_ambient_tripped[i] = 0
+		var lamp_out: bool = _elec_blind_t <= 0.0 and passed
+		var e: float = _ELEC_AMBIENT_FLOOR if lamp_out else 1.0
+		# Brownout: the lamps just ahead of the front stutter and sag before it
+		# reaches them, so the power visibly fails instead of switching off.
+		if not lamp_out and in_dark and front_running and _elec_blind_t <= 0.0:
+			var k: float = clampf(1.0 - (_elec_wave_pd - lpd) / _ELEC_BROWN_M, 0.0, 1.0)
+			if k > 0.0:
+				var step: float = floorf(t_s * 17.0) + float(i) * 7.31
+				var n: float = fposmod(sin(step * 12.9898) * 43758.5453, 1.0)
+				var sag: float = 0.12 if n < 0.32 else lerpf(0.45, 1.0, n)
+				e *= lerpf(1.0, sag, k * k * flash)
+		_ambient_lights[i].light_energy = 2.2 * e
 
 
 ## A live rail down both sides of every electric zone, so the gates in there
@@ -4109,6 +4302,7 @@ func _spawn_elec_conduits() -> void:
 	const SEG_LEN: float = 3.2
 	var tw: float = _track_full_width()
 	var lateral: float = tw * 0.5 + 0.22
+	_elec_conduit_lat = lateral
 	var speed: float = player.forward_speed
 	var end_pd: float = _song_end_z()
 
@@ -4430,6 +4624,71 @@ func _play_gate_intro(i: int) -> void:
 	_gate_intro_tw[i] = atw
 
 
+## DEVTOOLS — no-death fall rescue. Back on the track where he is, unless he
+## fell out of a wall-jump climb or off the descent: there is no floor under
+## the path there, so he goes onto the next ledge, or the platform at the top.
+func _dev_rescue() -> void:
+	var pd: float = _player_path_dist
+	var max_lane: int = player.lane_xs.size() - 1
+	var pos: Vector3 = _path_world_pos(pd + 2.0, player.lane_xs[player.target_lane], 1.0)
+	if not _wj_slot_zs.is_empty() and pd >= _wj_slot_zs[0] - 10.0 \
+			and pd < _wj_slide_end_z + 4.0:
+		var n: int = _wj_slot_zs.size()
+		var top_h: float = _wj_slot_heights[n - 1]
+		var placed: bool = false
+		for k in range(1, n):
+			if _wj_slot_zs[k] >= pd:
+				var lane: int = max_lane if _wj_slot_acts[k - 1] == "wall_left" else 0
+				player.target_lane = lane
+				pos = _path_world_pos(_wj_slot_zs[k], player.lane_xs[lane], _wj_slot_heights[k] + 0.6)
+				placed = true
+				break
+		if not placed:
+			# Past the last ledge: the platform at the top, then the ramp lane.
+			var lane2: int = clampi(_wj_ramp_lane, 0, max_lane)
+			player.target_lane = lane2
+			var on_pd: float = clampf(pd + 2.0, _wj_climb_top_z + 1.0, _wj_slide_start_z - 1.0)
+			pos = _path_world_pos(on_pd, player.lane_xs[lane2], top_h + 0.6)
+	player.velocity = Vector3.ZERO
+	player.global_position = pos
+
+
+## Feeds ElecMenace: how close the blackout front is, and how far the next live
+## gate is through its ignite band (for the whine), plus a snap when it lands.
+func _update_menace(delta: float, t_s: float) -> void:
+	var pd: float = _player_path_dist
+	var approach: float = 0.0
+	if is_finite(_elec_wave_pd):
+		approach = clampf(1.0 - (_elec_wave_pd - pd) / _ELEC_WAVE_LEAD_M, 0.0, 1.0)
+
+	# The cursor walks forward with the runner. A restart or a seek backwards
+	# puts it behind again.
+	var n: int = mini(gate_world_zs.size(), gate_is_electric.size())
+	var full_at: float = _ELEC_IGNITE_M - _ELEC_FIZZ_M
+	while _elec_ignite_cursor > 0 and _elec_ignite_cursor - 1 < n \
+			and gate_world_zs[_elec_ignite_cursor - 1] - pd > full_at + 2.0:
+		_elec_ignite_cursor -= 1
+	var in_zone: bool = _is_electric_at(t_s)
+	while _elec_ignite_cursor < n and gate_world_zs[_elec_ignite_cursor] - pd <= full_at:
+		if gate_is_electric[_elec_ignite_cursor] and in_zone \
+				and gate_world_zs[_elec_ignite_cursor] - pd > 0.0:
+			_menace.gate_ignited()
+		_elec_ignite_cursor += 1
+	var ignite: float = 0.0
+	for gi in range(_elec_ignite_cursor, mini(_elec_ignite_cursor + 4, n)):
+		if not gate_is_electric[gi]:
+			continue
+		var ahead: float = gate_world_zs[gi] - pd
+		ignite = clampf((_ELEC_IGNITE_M - ahead) / maxf(_ELEC_FIZZ_M, 0.01), 0.0, 1.0)
+		break
+	_menace.tick(delta, _elec_dark, approach, pd, ignite)
+
+	# Embers at the foot of every live fence post breathe with the zone's pulse.
+	if _looks != null and _looks.ember_mat != null:
+		_looks.ember_mat.emission_energy_multiplier = \
+			lerpf(0.6, 1.6, _elec_pulse_t) * (0.85 + 0.15 * sin(t_s * 2.3))
+
+
 # ── Electric zone helpers ──────────────────────────────────────────────────────
 
 ## Whether the BLACKOUT should be running — the zone's own window, opened early
@@ -4455,14 +4714,25 @@ func _z_is_electric(world_z: float) -> bool:
 	return _is_electric_at(world_z / player.forward_speed)
 
 
-## The same question for the blackout rather than the zone, so a lamp standing
-## in the stretch just before the first gate goes out with the rest. Without
-## this the world dimmed early but the last few lamps stayed on, and the player
-## met that gate with light still on the track.
+## Whether a lamp at this path distance belongs to the blackout. Now the real
+## zone boundary in space: lamps before the zone stay lit however early the
+## front starts running, so the dark begins exactly where the zone does.
 func _z_blackout(world_z: float) -> bool:
-	if player == null or player.forward_speed <= 0.0:
-		return false
-	return _elec_blackout_at(world_z / player.forward_speed)
+	return _z_is_electric(world_z)
+
+
+## How long before a zone's start the world begins dimming, so the dim LANDS on
+## the start time rather than starting at it. A touch over one full ramp.
+const _ELEC_DIM_LEAD_S: float = 1.15 / _ELEC_DARK_RATE
+
+## Whether the world around the runner should be dark at this song time: from
+## just ahead of a zone's start (see _ELEC_DIM_LEAD_S) to its end.
+func _elec_dim_at(t_s: float) -> bool:
+	for zone: Dictionary in _electric_zones:
+		if (t_s >= float(zone.get("start_t", 0.0)) - _ELEC_DIM_LEAD_S
+				and t_s < float(zone.get("end_t", 0.0))):
+			return true
+	return false
 
 
 # ── Section geometry (corridors, elevated paths, ramps) ────────────────────
@@ -4686,6 +4956,12 @@ func _spawn_wj_geometry_on_path() -> void:
 	for i in range(n_jumps - 1):
 		cum_heights.append(cum_heights[cum_heights.size() - 1] + step_height)
 	var total_height: float = cum_heights[cum_heights.size() - 1] + step_height
+	# DEVTOOLS — the climb as the autopilot and the no-death rescue need it:
+	# where each ledge is, which way its jump goes, how high it stands.
+	_wj_slot_zs = active_zs.duplicate()
+	_wj_slot_acts = active_acts.duplicate()
+	_wj_slot_heights = cum_heights.duplicate()
+	_wj_ledge_half_z = clamp(gap_z * 0.425, 3.0, 6.5)
 
 	# ── 2b. Re-map the chart's wall gates onto the 7 slots (scoring) ──────────
 	# Collect this phrase's wall gate_nodes (parallel to runner_plan), Z-sort them, and
@@ -5172,7 +5448,8 @@ func _spawn_floor_segment(z_start: float, length: float, height: float, color: C
 func _add_gate_judge_area(root: Node3D, gate_index: int, action: String, safe_lane: int) -> void:
 	# Wall jump gates are judged continuously by _judge_passed_unhit_gates_by_position
 	# (they need a per-frame check, not a one-shot body_entered signal).
-	if action == "wall_left" or action == "wall_right":
+	# Smash gates are judged by the mash (SmashGate), at the moment of impact.
+	if action == "wall_left" or action == "wall_right" or action == "smash":
 		return
 
 	var area: Area3D = Area3D.new()
@@ -5266,6 +5543,11 @@ func _judge_passed_unhit_gates_by_position() -> void:
 		var entry: Dictionary    = runner_plan[i]
 		var action: String       = gate_actions[i]
 		var safe_lane: int       = int(entry.get("post_lane", 1))
+
+		# Smash gates are judged by the mash at the moment of impact (SmashGate
+		# calls _on_smash_resolved), never by where he is standing.
+		if action == "smash":
+			continue
 
 		# ── Wall jump: land-based scoring ────────────────────────────────────
 		# Hit = player is standing on any surface at or past the gate Z.
@@ -5658,6 +5940,11 @@ func _parse_electric_zones(d: Dictionary) -> void:
 		var legacy: String = String(d.get("theme", "city")).strip_edges()
 		if legacy == "electric":
 			_electric_zones.append({"start_t": 0.0, "end_t": 99999.0})
+	# DEVTOOLS — "whole song electric" from the testing console. Remove with it.
+	# Starts a few seconds in so the blackout's arrival can still be seen.
+	if DevTools.all_electric:
+		_electric_zones.clear()
+		_electric_zones.append({"start_t": 3.0, "end_t": 99999.0})
 
 
 ## Returns true if the given song-time (seconds) falls inside any rap segment.
@@ -5850,7 +6137,7 @@ func _update_charge_tunnel(t_s: float, delta: float) -> void:
 
 	if _charge_building:
 		var pd:       float = _player_path_dist
-		var holding:  bool  = Input.is_action_pressed("runner_grind")
+		var holding:  bool  = player.grind_held()
 		var target_x: float = _gap_curve_x(pd)
 		var aligned:  bool  = absf(player.charge_lateral() - target_x) < _CHARGE_GAP_RADIUS
 
@@ -5980,6 +6267,9 @@ func _finalize_charge(t_s: float) -> void:
 
 func _update_charge_hud() -> void:
 	if _hud == null:
+		return
+	# A smash mash borrows the same meter; leave it alone while one runs.
+	if _smash != null and _smash.is_mashing():
 		return
 	# The OVERDRIVE countdown owns the meter while it is running — it reuses the
 	# same chassis, draining as a timer rather than filling as a charge.
@@ -6772,6 +7062,11 @@ func _on_gate_scored(success: bool) -> void:
 		# warning to go with it; the preview was widened instead.
 		if not in_zone:
 			_health_pct = clamp(_health_pct + 0.05, 0.0, 1.0)
+		elif _menace != null and player != null:
+			# Through clean — but the arc still reached for him.
+			_menace.graze(player)
+			if _hud != null and _hud.has_method("interference_spike"):
+				_hud.interference_spike(0.6, 0.16)
 		_world_vitality = clamp(_world_vitality + 0.25, 0.0, 1.0)
 		_update_hud_score()
 		_update_hud_health(true)   # force the heal-pulse even at full HP — it's the "good hit" cue
@@ -6804,13 +7099,19 @@ func _on_gate_scored(success: bool) -> void:
 			# again, which costs you the night vision you had just earned.
 			_elec_blind_t = _ELEC_BLIND_S
 			_hud_flash_color(Color(0.85, 0.95, 1.00, 0.55), 0.22)
+			# Same damage as before; this is only what it looks and sounds like.
+			if _menace != null and player != null:
+				_menace.shock(player)
+			if _hud != null and _hud.has_method("interference_spike"):
+				_hud.interference_spike(1.0, 0.55)
 		else:
 			_hud_flash_color(Color(1.00, 0.10, 0.10, 0.17), 0.34)   # fires on every miss — must not blind
 		_shake_camera()
 		# Combo label flash red then vanish
 		if _hud != null:
 			_hud.combo_flash(Color(1.0, 0.15, 0.15, 1.0), 0.05, 0.20)
-		if _sfx_miss != null:
+		# In a zone the zap replaces the thunk rather than stacking on it.
+		if _sfx_miss != null and not (miss_in_zone and _menace != null):
 			_sfx_miss.stop()
 			_sfx_miss.play()
 		if _health_pct <= 0.0 and not dev_no_death:
@@ -6952,6 +7253,15 @@ func _unhandled_input(event: InputEvent) -> void:
 			_resume_game()
 		else:
 			_pause_game()
+		return
+
+	# ── Smash gate mash: any other button counts ─────────────────────────────
+	# Not while the autopilot drives (DEVTOOLS: it mashes for itself, and a
+	# stray real press must not count).
+	if _smash != null and _smash.is_mashing() and not _paused \
+			and not bool(player.get("dev_autopilot")):
+		if _smash.press():
+			vp.set_input_as_handled()
 		return
 
 	# ── Pause and death menu navigation ──────────────────────────────────────
@@ -7581,6 +7891,14 @@ func _spawn_halo_ring(note_dur: float = 0.0) -> void:
 	var time_to_cam_pass: float = ((ahead + cam_behind) / maxf(player.forward_speed, 1.0)) + 0.10
 	time_to_cam_pass += maxf(0.0, note_dur)   # sustain for the full note length
 
+	# In the dark of an electric zone the halo is a ring of lightning instead —
+	# same place, same size, same lifetime. Past the halfway point of the fade
+	# so the switch happens while the room is already mostly dark.
+	if _menace != null and _elec_dark > 0.5 and _z_is_electric(ring_pd):
+		_menace.spawn_ring(ring_pos, _path_forward_at(ring_pd),
+			init_col_a, init_col_b, time_to_cam_pass)
+		return
+
 	var spin_speed: float = randf_range(0.4, 1.2)
 	var spin_dir:   float = 1.0 if randf() > 0.5 else -1.0
 	# Counter-rotating inner spin for the B ring (visual candy) — hold notes only.
@@ -7764,6 +8082,9 @@ func _pulse_floor_beat(t_s: float) -> void:
 	else:
 		if _city != null:
 			_city.strike()
+	if _menace != null and player != null:
+		_menace.on_beat(_is_electric_at(t_s), maxf(0.18, _runner_avg_beat_s),
+			_player_path_dist, player.forward_speed, _elec_dark)
 
 	# Spark burst around player
 	_burst_sparks(vit, pulse_color)
@@ -8313,7 +8634,10 @@ func _finalise_score() -> Dictionary:
 		_score = int(float(_score) * 1.5)
 
 	# Save high score and find out if it is a new record
-	var is_new_hs: bool = Save.save_high_score(Run.current_song_key, _score, _max_combo)
+	# DEVTOOLS — dev-assisted runs only reach the save when the console says so.
+	var is_new_hs: bool = false
+	if DevTools.may_save_score():
+		is_new_hs = Save.save_high_score(Run.current_song_key, _score, _max_combo)
 	var hs: Dictionary = Save.get_high_score(Run.current_song_key)
 
 	# Letter grade
@@ -8880,7 +9204,30 @@ func _random_halo_stop_color(idx: int) -> Color:
 ## (own independent random stream, see above); otherwise held static at the
 ## player's own dedicated Halo Color A pick — never derived from anything
 ## gates/floor/rail are showing.
+## Halos inside an electric zone wear the zone's colours instead of the
+## cycle: the arc blue for A, violet for B, flaring toward white on the beat.
+## Blended by _elec_dark, so they cross over with the blackout itself rather
+## than snapping at the zone edge, and come back the same way.
+const _ELEC_HALO_A: Color = Color(0.30, 0.78, 1.00)
+const _ELEC_HALO_B: Color = Color(0.72, 0.38, 1.00)
+
+func _zone_halo(col: Color, is_b: bool) -> Color:
+	if _elec_dark <= 0.001:
+		return col
+	var z: Color = _ELEC_HALO_B if is_b else _ELEC_HALO_A
+	z = z.lerp(Color(0.92, 0.97, 1.0), 0.45 * _elec_pulse_t * GameConfig.flash_scale())
+	return col.lerp(z, _elec_dark)
+
+
 func _current_halo_cycle_color(song_t: float) -> Color:
+	return _zone_halo(_base_halo_color_a(song_t), false)
+
+
+func _current_halo_cycle_color_b(song_t: float) -> Color:
+	return _zone_halo(_base_halo_color_b(song_t), true)
+
+
+func _base_halo_color_a(song_t: float) -> Color:
 	if not color_cycle_enabled or not GameConfig.color_cycle_affects_halos:
 		return GameConfig.halo_color_a
 	var period: float = max(0.05, color_cycle_period_s)
@@ -8899,7 +9246,7 @@ func _current_halo_cycle_color(song_t: float) -> Color:
 ## the dual-colour look into a plain one).
 const _HALO_B_STOP_OFFSET: int = 2
 
-func _current_halo_cycle_color_b(song_t: float) -> Color:
+func _base_halo_color_b(song_t: float) -> Color:
 	if not color_cycle_enabled or not GameConfig.color_cycle_affects_halos:
 		return GameConfig.halo_color_b
 	var period: float = max(0.05, color_cycle_period_s)

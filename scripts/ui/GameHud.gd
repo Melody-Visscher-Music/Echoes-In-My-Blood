@@ -324,14 +324,22 @@ func set_interference(amount: float) -> void:
 
 ## Called from _process so the jitter has motion. Zero interference costs one
 ## comparison and no writes.
-func _update_interference(_delta: float) -> void:
-	if _interference <= 0.001:
+func _update_interference(delta: float) -> void:
+	var spike: float = 0.0
+	if _spike_t > 0.0:
+		_spike_t = maxf(0.0, _spike_t - delta)
+		spike = _spike_amt * (_spike_t / maxf(_spike_dur, 0.001))
+		if _spike_t <= 0.0:
+			set_interference(_interference)   # put the shader back where it was
+	if _interference <= 0.001 and spike <= 0.001:
 		if _jitter_applied:
 			_jitter_applied = false
 			_layout()
 		return
 	_jitter_applied = true
-	var j: float = _interference * 2.6 * _s
+	# A spike throws the plates much further than the steady interference, but
+	# for a fraction of a second: the readouts take the hit, then recover.
+	var j: float = (_interference * 2.6 + spike * 9.0 * GameConfig.flash_scale()) * _s
 	for plate: Control in [_score_group, _hp_group]:
 		if plate == null:
 			continue
@@ -341,6 +349,27 @@ func _update_interference(_delta: float) -> void:
 
 var _interference: float = 0.0
 var _jitter_applied: bool = false
+var _spike_amt: float = 0.0
+var _spike_t: float = 0.0
+var _spike_dur: float = 0.0
+
+
+## A short burst of interference on top of the steady level: the readouts
+## glitch hard when something in the zone arcs near the runner. Purely
+## cosmetic — the numbers underneath do not change.
+func interference_spike(amount: float, duration: float) -> void:
+	_spike_amt = maxf(_spike_amt if _spike_t > 0.0 else 0.0, clampf(amount, 0.0, 1.0))
+	_spike_dur = maxf(duration, 0.01)
+	_spike_t = _spike_dur
+	for plate: ColorRect in [_score_plate, _hp_bar]:
+		if plate == null:
+			continue
+		var m := plate.material as ShaderMaterial
+		if m == null:
+			continue
+		m.set_shader_parameter("scan_amount", 1.0)
+		m.set_shader_parameter("scan_speed", 90.0)
+		m.set_shader_parameter("grid_amount", 1.0)
 
 
 func _build_fps() -> void:

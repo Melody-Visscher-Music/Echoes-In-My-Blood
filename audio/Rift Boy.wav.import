@@ -1,0 +1,24 @@
+[remap]
+
+importer="wav"
+type="AudioStreamWAV"
+uid="uid://b40nce6qbosi3"
+path="res://.godot/imported/Rift Boy.wav-4bd239da0c0b2e45a93b18a60fc15306.sample"
+
+[deps]
+
+source_file="res://audio/Rift Boy.wav"
+dest_files=["res://.godot/imported/Rift Boy.wav-4bd239da0c0b2e45a93b18a60fc15306.sample"]
+
+[params]
+
+force/8_bit=false
+force/mono=false
+force/max_rate=false
+force/max_rate_hz=44100
+edit/trim=false
+edit/normalize=false
+edit/loop_mode=0
+edit/loop_begin=0
+edit/loop_end=-1
+compress/mode=2

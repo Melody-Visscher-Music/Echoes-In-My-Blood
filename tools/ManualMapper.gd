@@ -1050,6 +1050,12 @@ func _build_tools_ui() -> void:
 	top_bar.add_child(btn_elec_zones)
 	btn_elec_zones.pressed.connect(Callable(self, "_open_elec_popup"))
 
+	var btn_smash: Button = Button.new()
+	btn_smash.text = "💥 Smash Gates"
+	btn_smash.tooltip_text = "Set how many presses each smash gate (beat hold) needs"
+	top_bar.add_child(btn_smash)
+	btn_smash.pressed.connect(Callable(self, "_open_smash_popup"))
+
 	var btn_preview: Button = Button.new()
 	btn_preview.text = "▶ Preview"
 	top_bar.add_child(btn_preview)
@@ -1390,6 +1396,198 @@ func _elec_add_seg_row(start_t: float, end_t: float) -> void:
 	)
 
 	_elec_seg_rows.append({"hbox": hb, "start_sb": start_sb, "end_sb": end_sb, "idx_lbl": idx_lbl})
+
+# ── Smash gates popup ─────────────────────────────────────────────────────────
+# Every smash hold in the song (a beat hold — see _is_smash_hold), with how many
+# presses it needs. The count is stored on the hold as "mash_target"; 0 or no
+# field means "use the recommended amount", which the game works out from the
+# hold's length the same way this popup does (SmashGate.MASH_RATE).
+
+## Must match SmashGate.MASH_RATE / MIN_TARGET in scripts/beat3d/SmashGate.gd.
+const SMASH_MASH_RATE: float = 6.0
+const SMASH_MIN_TARGET: int = 4
+
+var _smash_popup: PopupPanel = null
+var _smash_rows_box: VBoxContainer = null
+var _smash_rows: Array[Dictionary] = []   # [{id, sb}]
+
+
+func _smash_recommended(dur: float) -> int:
+	return maxi(SMASH_MIN_TARGET, int(round(dur * SMASH_MASH_RATE)))
+
+
+func _open_smash_popup() -> void:
+	if _smash_popup == null:
+		_build_smash_popup()
+	for row in _smash_rows:
+		var hb: Node = row.get("hbox")
+		if is_instance_valid(hb):
+			hb.queue_free()
+	_smash_rows.clear()
+	var holds: Array[Dictionary] = []
+	for e in events:
+		if _is_smash_hold(e):
+			holds.append(e)
+	holds.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
+		return float(a.get("t", 0.0)) < float(b.get("t", 0.0)))
+	if holds.is_empty():
+		var none := Label.new()
+		none.text = "  No smash gates yet. Draw a hold (H toggles holds) on a beats lane —\n  any lane except lane 1 — at least %.2f s long." % SMASH_MIN_HOLD_S
+		_smash_rows_box.add_child(none)
+		_smash_rows.append({"hbox": none})
+	for e in holds:
+		_smash_add_row(e)
+	# Sized to its contents, then centred — a fixed size let the panel grow to
+	# the window's full height and pin itself over the toolbar.
+	_smash_popup.reset_size()
+	_smash_popup.popup_centered()
+
+
+func _build_smash_popup() -> void:
+	_smash_popup = PopupPanel.new()
+	add_child(_smash_popup)
+	_smash_popup.hide()
+
+	var vb := VBoxContainer.new()
+	vb.custom_minimum_size = Vector2(600, 0)
+	_smash_popup.add_child(vb)
+
+	var title := Label.new()
+	title.text = "💥 Smash Gates"
+	title.add_theme_font_size_override("font_size", 16)
+	vb.add_child(title)
+
+	var desc := Label.new()
+	desc.text = "How many presses each wall needs. More presses than this = no damage, " \
+		+ "exactly this = 2 HP, falling short costs up to 50 HP. " \
+		+ "Recommended is %.0f presses per second of hold. Leave it on the recommended " % SMASH_MASH_RATE \
+		+ "amount and it follows the hold if you change its length."
+	desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	# A wrapping label with no width of its own reports a huge height, and the
+	# panel grew to the full window to fit it.
+	desc.custom_minimum_size = Vector2(600, 0)
+	vb.add_child(desc)
+	vb.add_child(HSeparator.new())
+
+	var hdr := HBoxContainer.new()
+	vb.add_child(hdr)
+	for col: Array in [["  Impact", 110], ["Hold", 80], ["Recommended", 110], ["Presses", 140], ["", 0]]:
+		var hl := Label.new()
+		hl.text = String(col[0])
+		hl.custom_minimum_size = Vector2(float(col[1]), 0)
+		hdr.add_child(hl)
+
+	var scroll := ScrollContainer.new()
+	scroll.custom_minimum_size = Vector2(0, 180)
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	vb.add_child(scroll)
+	_smash_rows_box = VBoxContainer.new()
+	_smash_rows_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(_smash_rows_box)
+
+	vb.add_child(HSeparator.new())
+	var bottom := HBoxContainer.new()
+	vb.add_child(bottom)
+	var btn_all := Button.new()
+	btn_all.text = "All to recommended"
+	bottom.add_child(btn_all)
+	btn_all.pressed.connect(func() -> void:
+		for row in _smash_rows:
+			var sb: SpinBox = row.get("sb") as SpinBox
+			if sb != null:
+				sb.value = float(row.get("rec", sb.value)))
+	var spacer := Control.new()
+	spacer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bottom.add_child(spacer)
+	var btn_cancel := Button.new()
+	btn_cancel.text = "Cancel"
+	bottom.add_child(btn_cancel)
+	btn_cancel.pressed.connect(func() -> void: _smash_popup.hide())
+	var btn_ok := Button.new()
+	btn_ok.text = "OK"
+	bottom.add_child(btn_ok)
+	btn_ok.pressed.connect(_on_smash_popup_ok)
+
+
+func _smash_add_row(e: Dictionary) -> void:
+	var t0: float = float(e.get("t", 0.0))
+	var dur: float = float(e.get("dur", 0.0))
+	var rec: int = _smash_recommended(dur)
+	var cur: int = int(e.get("mash_target", 0))
+
+	var hb := HBoxContainer.new()
+	_smash_rows_box.add_child(hb)
+
+	var t_lbl := Label.new()
+	t_lbl.text = "  %.2f s" % (t0 + dur)
+	t_lbl.custom_minimum_size = Vector2(110, 0)
+	t_lbl.tooltip_text = "Where he hits the wall (the hold's end) — put this on the drop"
+	hb.add_child(t_lbl)
+
+	var d_lbl := Label.new()
+	d_lbl.text = "%.2f s" % dur
+	d_lbl.custom_minimum_size = Vector2(80, 0)
+	hb.add_child(d_lbl)
+
+	var r_lbl := Label.new()
+	r_lbl.text = "%d" % rec
+	r_lbl.custom_minimum_size = Vector2(110, 0)
+	hb.add_child(r_lbl)
+
+	var sb := SpinBox.new()
+	sb.min_value = 1
+	sb.max_value = 200
+	sb.step = 1
+	sb.value = cur if cur > 0 else rec
+	sb.custom_minimum_size = Vector2(140, 0)
+	sb.tooltip_text = "Presses needed. %d is recommended for a %.2f s hold." % [rec, dur]
+	hb.add_child(sb)
+
+	var btn_rec := Button.new()
+	btn_rec.text = "Use %d" % rec
+	btn_rec.tooltip_text = "Set back to the recommended amount"
+	hb.add_child(btn_rec)
+	btn_rec.pressed.connect(func() -> void: sb.value = rec)
+
+	var btn_go := Button.new()
+	btn_go.text = "▶"
+	btn_go.tooltip_text = "Jump the playhead to this hold"
+	hb.add_child(btn_go)
+	btn_go.pressed.connect(func() -> void: _smash_jump_to(t0))
+
+	_smash_rows.append({"hbox": hb, "id": int(e.get("id", 0)), "sb": sb, "rec": rec})
+
+
+func _on_smash_popup_ok() -> void:
+	var changed: bool = false
+	for row in _smash_rows:
+		var sb: SpinBox = row.get("sb") as SpinBox
+		if sb != null:
+			var want: int = int(sb.value)
+			# The recommended amount is stored as "none" so it keeps following
+			# the hold's length if the hold is edited later.
+			if want == int(row.get("rec", 0)):
+				want = 0
+			for e in events:
+				if int(e.get("id", -1)) == int(row.get("id", -2)):
+					if int(e.get("mash_target", 0)) != want:
+						if not changed:
+							_begin_action("Smash presses")
+							changed = true
+						if want > 0:
+							e["mash_target"] = want
+						else:
+							e.erase("mash_target")
+					break
+	if changed:
+		_commit_action()
+		info.text = "Smash gate presses updated."
+	_smash_popup.hide()
+
+
+func _smash_jump_to(t: float) -> void:
+	_seek_abs(maxf(0.0, t - 1.0))   # a second early, so the hold is in view
+
 
 func _elec_renumber_rows() -> void:
 	for i in range(_elec_seg_rows.size()):
@@ -5104,6 +5302,37 @@ func _alloc_event_id() -> int:
 	_next_event_id += 1
 	return id
 
+## A hold on the beats pass, long enough to count: in the game this is a SMASH
+## GATE (scripts/beat3d/SmashGate.gd). The hold is the mash window; its END is
+## the impact — put that on the drop, and start an electric zone there.
+## Mirrors Section_BeatRunner3d._SMASH_MIN_HOLD_S and its pass rules.
+const SMASH_MIN_HOLD_S: float = 0.35
+
+func _is_smash_hold(e: Dictionary) -> bool:
+	if String(e.get("type", "")) != "hold" or float(e.get("dur", 0.0)) < SMASH_MIN_HOLD_S:
+		return false
+	var pass_id: String = String(e.get("capture_pass", ""))
+	if pass_id == "":
+		pass_id = "melody" if int(e.get("lane", 0)) == 1 else "beats"
+	return pass_id == "beats"
+
+
+## The impact line at the end of a smash hold, and its label.
+## `presses` is the authored count, or the recommended one when `custom` is
+## false — shown with a ~ so it is clear nobody has set it.
+func _draw_smash_marker(x0: float, x1: float, y_impact: float, presses: int = 0,
+		custom: bool = false) -> void:
+	var hot := Color(1.0, 0.25, 0.6)
+	draw_rect(Rect2(Vector2(x0 - 4.0, y_impact - 3.0), Vector2((x1 - x0) + 8.0, 6.0)), hot, true)
+	var font: Font = ThemeDB.fallback_font
+	if font != null:
+		var label: String = "SMASH"
+		if presses > 0:
+			label = "SMASH ×%d" % presses if custom else "SMASH ~%d" % presses
+		draw_string(font, Vector2(x0 + 4.0, y_impact - 8.0), label,
+			HORIZONTAL_ALIGNMENT_LEFT, -1.0, 14, hot)
+
+
 func _make_event(lane: int, t: float, kind: String, dur: float) -> Dictionary:
 	return {
 		"id": _alloc_event_id(),
@@ -7460,6 +7689,9 @@ func _draw() -> void:
 			draw_rect(rr, col_n, true)
 			_draw_role_pattern(rr, String(e.get("category","generic")), String(e.get("role","generic")))
 			draw_rect(rr, border, false, 2.0)
+			if _is_smash_hold(e):
+				var mt: int = int(e.get("mash_target", 0))
+				_draw_smash_marker(x0, x1, y1, mt if mt > 0 else _smash_recommended(dur), mt > 0)
 		else:
 			var rr2: Rect2 = Rect2(Vector2(x0, y0 - NOTE_H * 0.5), Vector2(x1 - x0, NOTE_H))
 			draw_rect(rr2, col_n, true)

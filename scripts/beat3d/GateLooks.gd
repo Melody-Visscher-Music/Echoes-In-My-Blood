@@ -37,6 +37,12 @@ var lane_xs: PackedFloat32Array = PackedFloat32Array()
 var arc_lights: Array[OmniLight3D] = []
 var arc_gate_idx: PackedInt32Array = PackedInt32Array()
 
+## Shared by every scorch mark under a live fence post. The section breathes
+## its emission with the zone's pulse — one material, one write per frame.
+var ember_mat: StandardMaterial3D = null
+var _scorch_mesh: PlaneMesh = null
+var _smoke_mesh: QuadMesh = null
+
 ## The gate currently being built, so arcs can tag themselves. -1 between gates.
 var _building_gate: int = -1
 ## 1 x 0.055 x 0.055 unit box, scaled per arc segment.
@@ -453,6 +459,105 @@ func _make_elec_arc(parent: Node3D, from_x: float, to_x: float, y: float,
 	return mat
 
 
+# ── Scorch + smoke on live fence posts ───────────────────────────────────────
+# Cosmetic wear on the gate's own posts: a burnt patch with dying embers at the
+# foot, and a thread of smoke off the cap. Both hang off the post itself, so
+# they sit only where the gate already stands — no new marks on the floor and
+# nothing in a lane that the gate is not already in.
+func _scorch_post(post: Node3D, height: float) -> void:
+	if ember_mat == null:
+		_build_scorch_resources()
+	var base_y: float = -post.position.y
+
+	var scorch := MeshInstance3D.new()
+	scorch.name = "Scorch"
+	scorch.mesh = _scorch_mesh
+	scorch.material_override = ember_mat
+	scorch.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	scorch.position = Vector3(0.0, base_y + 0.014, 0.0)
+	scorch.rotation.y = randf() * TAU
+	# Shared, and driven by the section: the gate colour cycle keeps off it.
+	scorch.set_meta("no_cycle", true)
+	post.add_child(scorch)
+
+	var smoke := CPUParticles3D.new()
+	smoke.name = "PostSmoke"
+	smoke.amount = 5
+	smoke.lifetime = 2.8
+	smoke.preprocess = 2.8
+	smoke.local_coords = false
+	smoke.direction = Vector3.UP
+	smoke.spread = 12.0
+	smoke.initial_velocity_min = 0.25
+	smoke.initial_velocity_max = 0.5
+	smoke.gravity = Vector3(0.15, 0.25, 0.0)
+	smoke.scale_amount_min = 0.5
+	smoke.scale_amount_max = 0.9
+	var grow := Curve.new()
+	grow.add_point(Vector2(0.0, 0.3))
+	grow.add_point(Vector2(1.0, 1.4))
+	smoke.scale_amount_curve = grow
+	var ramp := Gradient.new()
+	ramp.offsets = PackedFloat32Array([0.0, 0.2, 1.0])
+	ramp.colors = PackedColorArray([Color(0.5, 0.55, 0.62, 0.0),
+		Color(0.5, 0.55, 0.62, 0.32), Color(0.35, 0.37, 0.42, 0.0)])
+	smoke.color_ramp = ramp
+	smoke.mesh = _smoke_mesh
+	smoke.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	smoke.position = Vector3(0.0, base_y + height + 0.05, 0.0)
+	post.add_child(smoke)
+
+
+func _build_scorch_resources() -> void:
+	const N: int = 64
+	var alb := Image.create(N, N, false, Image.FORMAT_RGBA8)
+	var emi := Image.create(N, N, false, Image.FORMAT_RGBA8)
+	var noise := FastNoiseLite.new()
+	noise.frequency = 0.12
+	noise.seed = 7
+	for y in N:
+		for x in N:
+			var d: float = Vector2(x - N * 0.5 + 0.5, y - N * 0.5 + 0.5).length() / (N * 0.5)
+			var nv: float = noise.get_noise_2d(x, y) * 0.5 + 0.5
+			var a: float = clampf((1.0 - d) * 1.6 + (nv - 0.5) * 0.8, 0.0, 1.0)
+			alb.set_pixel(x, y, Color(0.03, 0.025, 0.02, a * 0.9))
+			# Embers: bright specks near the middle where the noise peaks.
+			var ember: float = clampf((nv - 0.62) * 5.0, 0.0, 1.0) * clampf(1.0 - d * 1.5, 0.0, 1.0)
+			emi.set_pixel(x, y, Color(1.0, 0.38, 0.06) * ember)
+	ember_mat = StandardMaterial3D.new()
+	ember_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	ember_mat.albedo_texture = ImageTexture.create_from_image(alb)
+	ember_mat.emission_enabled = true
+	ember_mat.emission = Color.WHITE
+	# MULTIPLY, not the default ADD: added to white, the texture is all white
+	# and the whole patch glows instead of just the embers in it.
+	ember_mat.emission_operator = BaseMaterial3D.EMISSION_OP_MULTIPLY
+	ember_mat.emission_texture = ImageTexture.create_from_image(emi)
+	ember_mat.emission_energy_multiplier = 1.0
+	ember_mat.roughness = 1.0
+	_scorch_mesh = PlaneMesh.new()
+	_scorch_mesh.size = Vector2(1.1, 1.1)
+
+	var dot := Image.create(32, 32, false, Image.FORMAT_RGBA8)
+	for y in 32:
+		for x in 32:
+			var d2: float = Vector2(x - 15.5, y - 15.5).length() / 15.5
+			var a2: float = clampf(1.0 - d2, 0.0, 1.0)
+			dot.set_pixel(x, y, Color(1, 1, 1, a2 * a2))
+	var smat := StandardMaterial3D.new()
+	smat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	smat.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
+	smat.vertex_color_use_as_albedo = true
+	smat.albedo_texture = ImageTexture.create_from_image(dot)
+	# Lit by the arcs, with a trace of its own so it never vanishes outright.
+	smat.emission_enabled = true
+	smat.emission = Color(0.2, 0.24, 0.32)
+	smat.emission_energy_multiplier = 0.35
+	_smoke_mesh = QuadMesh.new()
+	_smoke_mesh.size = Vector2(0.45, 0.45)
+	_smoke_mesh.material = smat
+
+
 # ── Electric lane gate (left / right) ────────────────────────────────────────
 # Fence posts on blocked lane edges; arcing electricity spans the blocked span.
 # Safe lane keeps approach marks + floor strip just like the city theme.
@@ -477,6 +582,7 @@ func _vis_elec_lane_gate(root: Node3D, safe_lane: int, tint: Color, _tw: float) 
 			var post := pieces.fence_post(lane_blocker_height)
 			post.position.x = px
 			root.add_child(post)
+			_scorch_post(post, lane_blocker_height)
 
 		# Mid-height arc
 		_make_elec_arc(root, x_left, x_right, lane_blocker_height * 0.52, tint)
@@ -505,6 +611,7 @@ func _vis_elec_jump_gate(root: Node3D, tint: Color, tw: float) -> void:
 		var post := pieces.fence_post(lane_blocker_height)
 		post.position.x = px
 		root.add_child(post)
+		_scorch_post(post, lane_blocker_height)
 
 	# The low arc the player must jump over
 	_make_elec_arc(root, from_x, to_x, jump_hurdle_height * 0.55, tint)
@@ -545,6 +652,7 @@ func _vis_elec_slide_gate(root: Node3D, tint: Color, tw: float) -> void:
 		var post := pieces.fence_post(clearance_y)
 		post.position.x = px
 		root.add_child(post)
+		_scorch_post(post, clearance_y)
 
 	# Solid limbo bar at clearance_y — the hard electric ceiling
 	var bar := pieces.box_mesh(Vector3(tw + 0.10, 0.10, gate_depth + 0.10), bright)
@@ -587,6 +695,7 @@ func _vis_elec_wall_gate(root: Node3D, action: String, tint: Color) -> void:
 	var post := pieces.fence_post(lane_blocker_height * 1.6)
 	post.position.x = face_x
 	root.add_child(post)
+	_scorch_post(post, lane_blocker_height * 1.6)
 
 	# Three stacked horizontal arcs extending inward from wall face
 	var arc_ys: Array[float] = [

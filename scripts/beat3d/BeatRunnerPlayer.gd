@@ -657,7 +657,9 @@ func _physics_process(delta: float) -> void:
 	# ── Charge-tunnel free-slide steer ───────────────────────────────────────
 	# Continuous horizontal steering (no lane snap) while threading the hoop tunnel.
 	if _charge_slide_active and not input_disabled:
-		var steer: float = Input.get_action_strength("runner_left") - Input.get_action_strength("runner_right")
+		var steer: float = 0.0
+		if not dev_autopilot:   # DEVTOOLS — the autopilot steers this itself
+			steer = Input.get_action_strength("runner_left") - Input.get_action_strength("runner_right")
 		_charge_lateral = clampf(_charge_lateral + steer * _charge_slide_speed * delta,
 			-_charge_max_lat, _charge_max_lat)
 
@@ -693,6 +695,28 @@ func _physics_process(delta: float) -> void:
 	_anim_time += delta
 	_update_character_anim(delta)
 
+## DEVTOOLS — set by scripts/dev/AutoPilot.gd while it is driving. Every read
+## of the real keyboard / controller below is skipped, so a stray press cannot
+## knock the autopilot off; it acts through request_action(), the tap signals
+## and dev_grind_hold instead. Pause is handled by the Section, not here, so it
+## still works. Remove both with the testing console.
+var dev_autopilot: bool = false
+var dev_grind_hold: bool = false
+
+
+## The grind button, as gameplay should see it: the autopilot's virtual hold
+## while it drives, the real button otherwise.
+func grind_held() -> bool:
+	if dev_autopilot:
+		return dev_grind_hold
+	return Input.is_action_pressed("runner_grind")
+
+
+## A real button's press edge — never while the autopilot drives.
+func _pressed(action: StringName) -> bool:
+	return not dev_autopilot and Input.is_action_just_pressed(action)
+
+
 func _poll_runner_inputs() -> void:
 	if input_disabled:
 		return
@@ -701,7 +725,7 @@ func _poll_runner_inputs() -> void:
 	# Enter grind = COMMIT: hold the trigger while on the floor near the rail. Once
 	# you're on, there's no getting off — the rail locks you in until it ends.
 	if _grind_rail_available and not _is_grinding:
-		if Input.is_action_pressed("runner_grind") and is_on_floor() and not is_sliding():
+		if grind_held() and is_on_floor() and not is_sliding():
 			_is_grinding  = true
 			_grind_base_y = global_position.y   # floor level the rail rises from
 			# Cancel any buffered wall-jump so it can't fire the moment we land
@@ -716,7 +740,7 @@ func _poll_runner_inputs() -> void:
 			_is_grinding = false
 		else:
 			# Jump button = spark-catch tap; all other actions are blocked.
-			if Input.is_action_just_pressed("runner_jump"):
+			if _pressed(&"runner_jump"):
 				emit_signal("grind_tap_pressed")
 			return   # no lane/jump/slide/wall-jump inputs during grind
 
@@ -729,8 +753,8 @@ func _poll_runner_inputs() -> void:
 	# input still has to reach the movement code or there would be no way to correct
 	# a bad landing — and stepping off the side is already a fall.
 	if _wj_descent:
-		if Input.is_action_pressed("runner_grind") \
-		and Input.is_action_just_pressed("runner_jump"):
+		if grind_held() \
+		and _pressed(&"runner_jump"):
 			emit_signal("descent_tap_pressed")
 
 	# Charge-tunnel free-slide: horizontal steer only (integrated in _physics_process).
@@ -739,17 +763,17 @@ func _poll_runner_inputs() -> void:
 		return
 
 	# ── Normal runner inputs ───────────────────────────────────────────────────
-	if Input.is_action_just_pressed("runner_left"):
+	if _pressed(&"runner_left"):
 		request_action("right")
-	if Input.is_action_just_pressed("runner_right"):
+	if _pressed(&"runner_right"):
 		request_action("left")
-	if Input.is_action_just_pressed("runner_jump"):
+	if _pressed(&"runner_jump"):
 		request_action("jump")
-	if Input.is_action_just_pressed("runner_slide"):
+	if _pressed(&"runner_slide"):
 		request_action("slide")
-	if Input.is_action_just_pressed("runner_lb"):
+	if _pressed(&"runner_lb"):
 		request_action("wall_left")
-	if Input.is_action_just_pressed("runner_rb"):
+	if _pressed(&"runner_rb"):
 		request_action("wall_right")
 
 func request_action(action: String) -> void:
@@ -1144,6 +1168,29 @@ func set_static_charge(amount: float) -> void:
 const _STATIC_LENGTH_GAIN: float = 1.9
 const _STATIC_SCRUFF_GAIN: float = 2.2
 var _static_charge: float = 0.0
+
+## Clipping a live gate: the coat blows out well past the static charge and
+## settles back over most of a second. Cosmetic only.
+const _SHOCK_LENGTH_GAIN: float = 1.7
+const _SHOCK_SCRUFF_GAIN: float = 2.0
+var _shock_tw: Tween = null
+
+
+func electrocute() -> void:
+	if _shock_tw != null and _shock_tw.is_valid():
+		_shock_tw.kill()
+	_shock_tw = create_tween()
+	_shock_tw.tween_method(_apply_shock, 1.0, 0.0, 0.9) \
+		.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_QUAD)
+
+
+func _apply_shock(s: float) -> void:
+	var a: float = _static_charge
+	_set_fur_all(&"length",
+		fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a) * lerpf(1.0, _SHOCK_LENGTH_GAIN, s))
+	_set_fur_all(&"scruffiness",
+		fur_scruffiness * lerpf(1.0, _STATIC_SCRUFF_GAIN, a) * lerpf(1.0, _SHOCK_SCRUFF_GAIN, s))
+	_set_fur_all(&"static_direction_world", Vector3.UP * clampf(a + s, 0.0, 1.0))
 
 
 func _set_fur_all(prop: StringName, val: Variant) -> void:

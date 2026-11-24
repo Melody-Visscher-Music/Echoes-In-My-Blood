@@ -37,6 +37,7 @@ Save="*res://autoload/Save.gd"
 ContentDB="*res://autoload/ContentDB.gd"
 GamepadSetup="*res://autoload/GamepadSetup.gd"
 Preload="*res://autoload/Preload.gd"
+DevTools="*res://autoload/DevTools.gd"
 
 [debug]
 
