@@ -89,9 +89,52 @@ var _fx_sparks: CPUParticles3D = null
 var _fx_burst: CPUParticles3D = null
 var _spark_mat: StandardMaterial3D = null
 var _prev_input_disabled: bool = false
+## Whether the active smash has taken his lane and controls yet. Not until he
+## is on solid track (Section._smash_lane_lock_ok): forcing the middle lane on
+## a wall-jump platform or the descent ramp drops him into the void.
+var _locked: bool = false
 var _prev_lean: float = 0.0
 var _lean_kick: float = 0.0
 var _t: float = 0.0
+
+# ── Charge stages (I sparks, II flame trail + afterimages, III energy shell) ─
+const STAGE_NAMES: PackedStringArray = ["", "CHARGE II", "CHARGE III"]
+var _fx_flame: CPUParticles3D = null
+var _fx_ghost: CPUParticles3D = null
+var _fx_shell: MeshInstance3D = null
+var _shell_mat: ShaderMaterial = null
+var _flame_mat: ShaderMaterial = null
+var _ghost_mat: ShaderMaterial = null
+var _shell_kick: float = 0.0
+var _cur_col: Color = TINT
+var _cur_level: float = 0.0
+
+# ── Footstep cracks: a small pool reused press after press ──────────────────
+const STEP_POOL: int = 20
+var _steps: Array[Dictionary] = []     # {node, mat, life}
+var _step_i: int = 0
+
+# ── Camera moves on long rolls ──────────────────────────────────────────────
+## Shortest roll that gets the camera moves; shorter ones stay behind him.
+const CAM_MOVE_MIN_S: float = 2.0
+const CAM_SWING_DEG: float = 38.0
+var _cam: Camera3D = null
+var _cam_pivot: Node3D = null
+var _cam_base: Transform3D = Transform3D.IDENTITY
+var _cam_low: float = 0.0
+var _cam_swing: float = 0.0
+var _cam_side: float = 1.0
+var _cam_moving: bool = false
+
+# ── Impact aftermath ────────────────────────────────────────────────────────
+var _punch: float = 0.0
+var _shock_pd: float = 0.0
+var _shock_t: float = -1.0
+var _shock_ring: MeshInstance3D = null
+var _shock_mat: ShaderMaterial = null
+const SHOCK_SPEED: float = 70.0
+const SHOCK_RANGE_M: float = 95.0
+var _wreck: Array[Dictionary] = []     # lingering debris beside the track
 
 var _crack_mesh: BoxMesh = null
 var _thump: AudioStreamPlayer = null
@@ -109,6 +152,12 @@ func setup(p_section: Node, p_rainbow: bool, p_beat_s: float) -> void:
 	beat_s = maxf(p_beat_s, 0.15)
 	_crack_mesh = BoxMesh.new()
 	_crack_mesh.size = Vector3(1.0, 0.06, 0.06)
+	var cam: Camera3D = section.get("_camera")
+	if cam != null:
+		_cam = cam
+		_cam_pivot = cam.get_parent() as Node3D
+		if _cam_pivot != null:
+			_cam_base = _cam_pivot.transform
 	# The music is at its busiest during a roll: the press is a soft tick under
 	# it, not a thump on top of it. The big sound is saved for the crash.
 	_thump = _sfx(_gen_tick(), -21.0)
@@ -117,8 +166,10 @@ func setup(p_section: Node, p_rainbow: bool, p_beat_s: float) -> void:
 
 ## `target`: the press count set in the manual mapper (0 = recommended).
 ## `roll`: times of the roll's hits inside the hold.
+## `melody`: times of the melody notes under the hold (they fire the pylons).
 func add(gate_index: int, t0: float, t1: float, target: int = 0,
-		roll: PackedFloat32Array = PackedFloat32Array()) -> void:
+		roll: PackedFloat32Array = PackedFloat32Array(),
+		melody: PackedFloat32Array = PackedFloat32Array()) -> void:
 	var hits: PackedFloat32Array = roll
 	if hits.is_empty():
 		# Nothing to play along to: invent a steady pulse so the wall, the
@@ -133,6 +184,7 @@ func add(gate_index: int, t0: float, t1: float, target: int = 0,
 		"target": target if target > 0 else recommended_target(t1 - t0, roll.size()),
 		"presses": 0, "state": 0, "roll": hits, "roll_i": 0,
 		"prompted": false, "zone_after": false, "vis": {},
+		"melody": melody, "runway": null, "stage": 0,
 	})
 
 
@@ -289,6 +341,13 @@ func build_visual(vis_root: Node3D, gate_index: int, track_width: float,
 		leak.position = Vector3(mid_x, height * 0.5, depth * 0.5 + 1.2)
 		vis_root.add_child(leak)
 
+	# ── The run-up: tunnel, edge light and melody pylons ────────────────────
+	if s["runway"] == null:
+		var rw := SmashRunway.new()
+		rw.build(section, float(s["t0"]), float(s["t1"]), s["melody"], pieces,
+			track_width, height, TINT, beat_s)
+		s["runway"] = rw
+
 	s["vis"] = {"root": vis_root, "blocks": blocks, "block_mats": block_mats,
 		"kick": PackedFloat32Array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).slice(0, lanes),
 		"cracks": cracks, "cracks_shown": 0, "crack_mat": crack_mat,
@@ -302,6 +361,9 @@ func build_visual(vis_root: Node3D, gate_index: int, track_width: float,
 
 func update(t_s: float, delta: float) -> void:
 	_t += delta
+	_update_runways(t_s, delta)
+	_update_camera(t_s, delta)
+	_update_aftermath(t_s, delta)
 	if _active < 0:
 		for i in _smashes.size():
 			var s: Dictionary = _smashes[i]
@@ -384,10 +446,13 @@ func _begin(i: int) -> void:
 	s["roll_i"] = ri
 	var p: Node = section.get("player")
 	_prev_input_disabled = bool(p.get("input_disabled"))
-	p.set("input_disabled", true)
+	# His lane and controls are taken in _hold_player, once it is safe.
+	_locked = false
 	_ensure_fx(p as Node3D)
 	_fx_root.visible = true
 	_fx_sparks.emitting = true
+	s["stage"] = 0
+	_cam_side = 1.0 if i % 2 == 0 else -1.0
 	var model: Node3D = p.get("_char_model") as Node3D
 	if model != null:
 		_prev_lean = model.rotation.x
@@ -424,6 +489,9 @@ func _on_roll_hit(s: Dictionary, idx: int) -> void:
 			shown += maxi(1, (earned - shown) / 2)
 			vis["cracks_shown"] = mini(shown, cracks.size())
 	_lean_kick = 1.0
+	var p: Node = section.get("player")
+	if p.has_method("smash_hit"):
+		p.call("smash_hit")
 	if _fx_burst != null:
 		_fx_burst.restart()
 		_fx_burst.emitting = true
@@ -436,14 +504,29 @@ func _on_roll_hit(s: Dictionary, idx: int) -> void:
 ## into the shoulder charge for the last beat before impact.
 func _hold_player(s: Dictionary, t_s: float, delta: float) -> void:
 	var p: Node = section.get("player")
+	_lean_kick = maxf(0.0, _lean_kick - delta * 9.0)
+	# Only take his lane and controls on solid track. Still on a wall-jump
+	# platform, the descent ramp, a rail or in the air, he keeps full control
+	# (presses still count toward the mash) until he is safely down.
+	if not _locked:
+		if not bool(section.call("_smash_lane_lock_ok")):
+			return
+		_locked = true
+		p.set("input_disabled", true)
 	var lanes: PackedFloat32Array = p.get("lane_xs")
 	@warning_ignore("integer_division")
 	p.set("target_lane", lanes.size() / 2)
-	_lean_kick = maxf(0.0, _lean_kick - delta * 9.0)
+	var to_impact: float = float(s["t1"]) - t_s
+	# The rigged model has its own smash clips (BeatRunnerPlayer.set_smash):
+	# the head-down sprint, then the shoulder charge for the last beat.
+	if bool(p.get("_using_glb_character")) and p.has_method("set_smash"):
+		var sh: float = clampf(1.0 - to_impact / beat_s, 0.0, 1.0)
+		p.call("set_smash", 2 if to_impact < beat_s else 1, _build(s, t_s), sh)
+		return
+	# Fallback rig: just lean him into it.
 	var model: Node3D = p.get("_char_model") as Node3D
 	if model == null:
 		return
-	var to_impact: float = float(s["t1"]) - t_s
 	var lean: float = 12.0 + 7.0 * _lean_kick
 	if to_impact < beat_s:
 		lean = lerpf(lean, 26.0, clampf(1.0 - to_impact / beat_s, 0.0, 1.0))
@@ -457,6 +540,8 @@ func _on_press(s: Dictionary) -> void:
 	var vis: Dictionary = s["vis"]
 	if not vis.is_empty():
 		vis["charge"] = minf(float(vis["charge"]) + 0.35, 4.0)
+	_footstep_crack(_cur_col)
+	_shell_kick = maxf(_shell_kick, 0.45)
 
 
 func _update_wall(s: Dictionary, delta: float, build: float) -> void:
@@ -524,6 +609,7 @@ func _ensure_fx(p: Node3D) -> void:
 	# ...and a burst of them on every roll hit.
 	_fx_burst = _streak_emitter(m, 14, 0.3, true)
 	_fx_root.add_child(_fx_burst)
+	_build_stage_fx()
 
 
 func _streak_emitter(mesh: Mesh, amount: int, life: float, one_shot: bool) -> CPUParticles3D:
@@ -569,8 +655,306 @@ func _update_fx(s: Dictionary, t_s: float, build: float) -> void:
 		_fx_light.light_energy = lerpf(0.4, 2.2, level)
 	_fx_light.light_color = col
 	_spark_mat.emission = col
+	_cur_col = col if rainbow else TINT.lerp(Color(1.0, 0.85, 0.95), level * 0.5)
+	_cur_level = level
+	_update_stage(s, float(s["presses"]) / float(s["target"]), _cur_col)
 	# Faster, denser streaks as the roll speeds up.
 	_fx_sparks.speed_scale = 1.0 + dens * 1.5 + build * 0.5
+
+
+## Charge stages: I is the sparks he always has; II adds a flame trail and
+## afterimages; III wraps him in an energy shell. Each step up is announced.
+func _update_stage(s: Dictionary, prog: float, col: Color) -> void:
+	if _fx_flame == null:
+		return
+	var stage: int = 2 if prog >= 2.0 / 3.0 else (1 if prog >= 1.0 / 3.0 else 0)
+	if stage > int(s["stage"]):
+		s["stage"] = stage
+		_shell_kick = 1.0
+		var hud: Object = section.get("_hud")
+		if hud != null and stage < STAGE_NAMES.size():
+			hud.call("show_callout", STAGE_NAMES[stage], col, 0.40)
+		if _fx_burst != null:
+			_fx_burst.restart()
+			_fx_burst.emitting = true
+	var st: int = int(s["stage"])
+	_fx_flame.emitting = st >= 1
+	_fx_ghost.emitting = st >= 1
+	_fx_shell.visible = st >= 2
+	NeonMat.set_tint(_flame_mat, col)
+	NeonMat.set_tint(_ghost_mat, col)
+	NeonMat.set_tint(_shell_mat, col)
+	_shell_kick = maxf(0.0, _shell_kick - get_process_delta_time() * 4.0)
+	if st >= 2:
+		var over: float = clampf(prog - 1.0, 0.0, 1.0)
+		_fx_shell.scale = Vector3.ONE * (1.0 + 0.16 * _shell_kick + 0.04 * sin(_t * 22.0) + 0.12 * over)
+		NeonMat.set_energy(_shell_mat, (2.2 + 2.5 * _shell_kick + 1.5 * over) * GameConfig.flash_scale())
+
+
+func _build_stage_fx() -> void:
+	# Flame trail: hot blobs streaming up and back off him.
+	var fm := SphereMesh.new()
+	fm.radius = 0.13
+	fm.height = 0.26
+	fm.radial_segments = 8
+	fm.rings = 4
+	_flame_mat = NeonMat.orb(TINT, 7.0)
+	fm.material = _flame_mat
+	_fx_flame = CPUParticles3D.new()
+	_fx_flame.amount = 40
+	_fx_flame.lifetime = 0.38
+	_fx_flame.local_coords = false
+	_fx_flame.mesh = fm
+	_fx_flame.emission_shape = CPUParticles3D.EMISSION_SHAPE_SPHERE
+	_fx_flame.emission_sphere_radius = 0.35
+	_fx_flame.direction = Vector3(0.0, 0.7, -1.0)
+	_fx_flame.spread = 22.0
+	_fx_flame.initial_velocity_min = 1.5
+	_fx_flame.initial_velocity_max = 3.5
+	_fx_flame.gravity = Vector3(0.0, 2.5, 0.0)
+	_fx_flame.scale_amount_curve = _fade_curve()
+	_fx_flame.position = Vector3(0.0, 0.7, -0.2)
+	_fx_flame.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_fx_flame.emitting = false
+	_fx_root.add_child(_fx_flame)
+	# Afterimages: ghosts of him left hanging where he just was.
+	var gm := CapsuleMesh.new()
+	gm.radius = 0.34
+	gm.height = 1.3
+	gm.radial_segments = 12
+	gm.rings = 4
+	_ghost_mat = NeonMat.ring(TINT, 1.6)
+	_ghost_mat.set_shader_parameter("alpha", 0.45)
+	_ghost_mat.set_shader_parameter("band_amount", 0.0)
+	gm.material = _ghost_mat
+	_fx_ghost = CPUParticles3D.new()
+	_fx_ghost.amount = 7
+	_fx_ghost.lifetime = 0.22
+	_fx_ghost.local_coords = false
+	_fx_ghost.mesh = gm
+	_fx_ghost.direction = Vector3(0.0, 0.0, -1.0)
+	_fx_ghost.spread = 0.0
+	_fx_ghost.initial_velocity_min = 0.0
+	_fx_ghost.initial_velocity_max = 0.0
+	_fx_ghost.gravity = Vector3.ZERO
+	_fx_ghost.scale_amount_curve = _fade_curve()
+	_fx_ghost.position = Vector3(0.0, 0.75, 0.0)
+	_fx_ghost.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_fx_ghost.emitting = false
+	_fx_root.add_child(_fx_ghost)
+	# Energy shell round him at stage III.
+	var sm := SphereMesh.new()
+	sm.radius = 1.0
+	sm.height = 2.0
+	sm.radial_segments = 24
+	sm.rings = 12
+	_shell_mat = NeonMat.ring(TINT, 1.4)
+	_shell_mat.set_shader_parameter("alpha", 0.32)
+	_shell_mat.set_shader_parameter("band_amount", 0.6)
+	_fx_shell = MeshInstance3D.new()
+	_fx_shell.mesh = sm
+	_fx_shell.material_override = _shell_mat
+	_fx_shell.set_meta("no_cycle", true)
+	_fx_shell.position = Vector3(0.0, 0.85, 0.0)
+	_fx_shell.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_fx_shell.visible = false
+	_fx_root.add_child(_fx_shell)
+
+
+func _fade_curve() -> Curve:
+	var c := Curve.new()
+	c.add_point(Vector2(0.0, 1.0))
+	c.add_point(Vector2(1.0, 0.0))
+	return c
+
+
+## A press stamps a small crack into the floor under his feet; they trail
+## behind him down the run-up and fade.
+func _footstep_crack(col: Color) -> void:
+	var p: Node3D = section.get("player") as Node3D
+	var world: Node3D = section.get("world_fx_root") as Node3D
+	if p == null or world == null:
+		return
+	if _steps.is_empty():
+		for k in STEP_POOL:
+			var n := Node3D.new()
+			n.visible = false
+			world.add_child(n)
+			var m: ShaderMaterial = NeonMat.tube(col, 0.0)
+			m.set_shader_parameter("box_size", Vector3(1.0, 0.07, 0.07))
+			for b in 3:
+				var bar := MeshInstance3D.new()
+				bar.mesh = _crack_mesh
+				bar.material_override = m
+				bar.set_meta("no_cycle", true)
+				bar.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+				n.add_child(bar)
+			_steps.append({"node": n, "mat": m, "life": 0.0})
+	var st: Dictionary = _steps[_step_i]
+	_step_i = (_step_i + 1) % _steps.size()
+	var node: Node3D = st["node"]
+	var pd: float = float(section.get("_player_path_dist"))
+	var ground: Vector3 = section.call("_path_world_pos", pd, 0.0, 0.0)
+	node.global_position = Vector3(p.global_position.x, ground.y + 0.035, p.global_position.z)
+	node.rotation = Vector3(0.0, randf() * TAU, 0.0)
+	node.visible = true
+	var ang: float = 0.0
+	for bar: MeshInstance3D in node.get_children():
+		var ln: float = randf_range(0.3, 0.75)
+		ang += randf_range(1.6, 2.6)
+		bar.scale = Vector3(ln, 1.0, 1.0)
+		bar.rotation = Vector3(0.0, ang, 0.0)
+		bar.position = Vector3(cos(-ang), 0.0, sin(-ang)) * ln * 0.5
+	NeonMat.set_tint(st["mat"], col)
+	st["life"] = 1.0
+
+
+func _update_runways(t_s: float, delta: float) -> void:
+	for i in _smashes.size():
+		var s: Dictionary = _smashes[i]
+		var rw: SmashRunway = s["runway"]
+		if rw == null:
+			continue
+		if rw.root == null:
+			s["runway"] = null
+			continue
+		if t_s < float(s["t0"]) - 8.0:
+			continue
+		var prog: float = float(s["presses"]) / float(s["target"])
+		var mine: bool = i == _active
+		rw.update(t_s, delta, prog, _cur_col if mine else TINT, _cur_level if mine else 0.0)
+
+
+## Long rolls get camera moves: a low chase at the start, a swing out to the
+## side through the middle, and a snap back behind him for the last beat, so
+## the shoulder charge is seen from where the player always sees him.
+func _update_camera(t_s: float, delta: float) -> void:
+	if _cam_pivot == null or not is_instance_valid(_cam_pivot):
+		var cam: Camera3D = section.get("_camera")
+		if cam == null:
+			return
+		_cam = cam
+		_cam_pivot = cam.get_parent() as Node3D
+		if _cam_pivot == null:
+			return
+		_cam_base = _cam_pivot.transform
+	var low_t: float = 0.0
+	var swing_t: float = 0.0
+	var rate: float = 2.6
+	if _active >= 0:
+		var s: Dictionary = _smashes[_active]
+		var t0: float = float(s["t0"])
+		var t1: float = float(s["t1"])
+		var dur: float = t1 - t0
+		if dur >= CAM_MOVE_MIN_S:
+			var k: float = clampf((t_s - t0) / dur, 0.0, 1.0)
+			if t1 - t_s < beat_s:
+				rate = 14.0   # the snap back
+			else:
+				swing_t = smoothstep(0.22, 0.45, k)
+				low_t = 1.0 - swing_t
+				rate = 3.2
+	var a: float = minf(1.0, delta * rate)
+	_cam_low = lerpf(_cam_low, low_t, a)
+	_cam_swing = lerpf(_cam_swing, swing_t, a)
+	if _cam_low < 0.002 and _cam_swing < 0.002:
+		if _cam_moving:
+			_cam_moving = false
+			_cam_low = 0.0
+			_cam_swing = 0.0
+			_cam_pivot.transform = _cam_base
+		return
+	if not _cam_moving:
+		_cam_moving = true
+		_cam_base = _cam_pivot.transform
+	var o: Vector3 = _cam_base.origin
+	o.y *= lerpf(1.0, 0.5, _cam_low)
+	o.z *= lerpf(1.0, 0.72, _cam_low)
+	var tr := Transform3D(_cam_base.basis, o)
+	tr = Transform3D(Basis(Vector3.UP, deg_to_rad(CAM_SWING_DEG * _cam_side * _cam_swing)),
+		Vector3.ZERO) * tr
+	_cam_pivot.transform = tr
+
+
+## After the break: the camera punch and shake, the shockwave running down
+## the track, footstep cracks fading, and the wreckage tumbling beside the track.
+func _update_aftermath(t_s: float, delta: float) -> void:
+	# Footstep cracks fade.
+	for st: Dictionary in _steps:
+		var life: float = float(st["life"])
+		if life <= 0.0:
+			continue
+		life = maxf(0.0, life - delta * 1.7)
+		st["life"] = life
+		NeonMat.set_energy(st["mat"], 7.0 * life * life * GameConfig.flash_scale() + 0.2 * life)
+		if life <= 0.0:
+			(st["node"] as Node3D).visible = false
+
+	# Punch: FOV kick (the section reads _smash_punch) and a shake.
+	if _punch > 0.0:
+		_punch = maxf(0.0, _punch - delta * 3.2)
+		section.set("_smash_punch", _punch)
+		if _cam != null:
+			var sh: float = _punch * _punch * 0.32 * GameConfig.flash_scale()
+			_cam.h_offset = randf_range(-sh, sh)
+			_cam.v_offset = randf_range(-sh, sh)
+
+	# Shockwave down the track.
+	if _shock_t >= 0.0:
+		var front: float = _shock_pd + (t_s - _shock_t) * SHOCK_SPEED
+		var k: float = (front - _shock_pd) / SHOCK_RANGE_M
+		if k >= 1.0:
+			_shock_t = -1.0
+			section.set("_smash_shock", Vector2(0.0, -1.0))
+			if _shock_ring != null:
+				_shock_ring.visible = false
+		else:
+			section.set("_smash_shock", Vector2(_shock_pd, front))
+			if _shock_ring != null:
+				_shock_ring.visible = true
+				_shock_ring.global_position = section.call("_path_world_pos", front, 0.0, 1.6)
+				_shock_ring.global_rotation = Vector3(0.0, deg_to_rad(float(section.call("_path_y_rot_at", front))), 0.0)
+				_shock_ring.rotate_object_local(Vector3.RIGHT, PI * 0.5)
+				var r: float = lerpf(1.0, 2.2, k)
+				_shock_ring.scale = Vector3(r, 1.0, r)
+				NeonMat.set_energy(_shock_mat, lerpf(9.0, 0.0, k) * GameConfig.flash_scale() + 0.5 * (1.0 - k))
+
+	# Wreckage: simple tumbling physics, then shrink away.
+	var i: int = 0
+	while i < _wreck.size():
+		var w: Dictionary = _wreck[i]
+		var n: Node3D = w["node"]
+		var life: float = float(w["life"]) - delta
+		w["life"] = life
+		if life <= 0.0 or not is_instance_valid(n):
+			if is_instance_valid(n):
+				n.queue_free()
+			_wreck.remove_at(i)
+			continue
+		var wait: float = float(w.get("wait", 0.0))
+		if wait > 0.0:
+			w["wait"] = wait - delta
+			i += 1
+			continue
+		var vel: Vector3 = w["vel"]
+		var spin: Vector3 = w["spin"]
+		vel.y -= 16.0 * delta
+		var pos: Vector3 = n.global_position + vel * delta
+		var floor_y: float = float(w["floor"])
+		if pos.y < floor_y and bool(w["bounce"]):
+			pos.y = floor_y
+			vel.y = absf(vel.y) * 0.38
+			vel.x *= 0.75
+			vel.z *= 0.75
+			spin *= 0.7
+		n.global_position = pos
+		n.rotation += spin * delta
+		w["vel"] = vel
+		w["spin"] = spin
+		var fade_s: float = float(w["fade"])
+		if life < fade_s:
+			n.scale = Vector3.ONE * float(w["size"]) * (life / fade_s)
+		i += 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -598,9 +982,19 @@ func _resolve(s: Dictionary) -> void:
 	var model: Node3D = p.get("_char_model") as Node3D
 	if model != null:
 		model.rotation.x = _prev_lean
+	# Through the hole: the burst clip.
+	if p.has_method("smash_burst"):
+		p.call("smash_burst")
 	if _fx_root != null:
 		_fx_sparks.emitting = false
 		_fx_light.light_energy = 0.0
+		if _fx_flame != null:
+			_fx_flame.emitting = false
+			_fx_ghost.emitting = false
+			_fx_shell.visible = false
+	var rw: SmashRunway = s["runway"]
+	if rw != null:
+		rw.finish()
 	var hud: Object = section.get("_hud")
 	if hud != null:
 		hud.call("set_charge", 0.0, "", false)
@@ -620,13 +1014,17 @@ func _resolve(s: Dictionary) -> void:
 	_shatter(s, over)
 
 
-## The wall comes apart: the facades are thrown outward and forward,
-## tumbling, with a burst of neon debris from where he hit — more and faster
-## with overcharge. The arch stays — the door frame he just came through.
+## The wall comes apart under a white frame and a camera punch: the facades
+## are thrown outward and forward, tumbling, with a burst of neon debris from where he hit — more and
+## faster with overcharge. Shards whip past the lens, a shockwave runs down the
+## track and knocks the lamps into flickering one after another, and chunks of
+## the wall rain down beside the track and keep tumbling for a few seconds.
+## The arch stays — the door frame he just came through.
 func _shatter(s: Dictionary, over: float) -> void:
 	var vis: Dictionary = s["vis"]
 	if vis.is_empty():
 		return
+	var flash: float = GameConfig.flash_scale()
 	var root: Node3D = vis["root"]
 	root.position.x = float(vis["base_x"])
 	for c: Node3D in (vis["cracks"] as Array):
@@ -638,16 +1036,26 @@ func _shatter(s: Dictionary, over: float) -> void:
 	tw.set_parallel(true)
 	if leak != null:
 		# The zone's light floods through the hole, then the zone takes over.
-		leak.light_energy = 9.0 * GameConfig.flash_scale() + 2.0
+		leak.light_energy = 9.0 * flash + 2.0
 		tw.tween_property(leak, "light_energy", 0.0, 0.6)
 	for b: Node3D in blocks:
+		# Thrown clear of the track: the camera comes through this spot about
+		# half a second after the impact, so nothing may still hang in the
+		# lanes by then. The middle block (no side to go to) is the one he hit:
+		# it is punched straight down the track, faster than he runs, so the
+		# camera never catches it up.
 		var side: float = signf(b.position.x)
-		var dir := Vector3(side * randf_range(3.0, 6.0) + randf_range(-1.0, 1.0),
-			randf_range(1.0, 3.0), randf_range(6.0, 12.0)) * force
+		var dir: Vector3
+		if absf(b.position.x) < 0.3:
+			dir = Vector3(randf_range(-1.5, 1.5), randf_range(2.0, 3.5), randf_range(28.0, 34.0)) * force
+		else:
+			dir = Vector3(side * randf_range(6.0, 9.0), randf_range(1.0, 3.0),
+				randf_range(4.0, 9.0)) * force
 		tw.tween_property(b, "position", b.position + dir, 0.75) \
 			.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_QUAD)
 		tw.tween_property(b, "rotation",
-			Vector3(randf_range(-2.5, 2.5), randf_range(-3.0, 3.0), side * randf_range(1.0, 3.0)), 0.75)
+			Vector3(randf_range(-2.5, 2.5), randf_range(-3.0, 3.0), side * randf_range(1.0, 3.0)),
+			0.75)
 		tw.tween_property(b, "scale", Vector3.ONE * 0.15, 0.75).set_delay(0.2)
 	var pieces: GatePieces = vis["pieces"]
 	var h: float = float(vis["height"])
@@ -666,13 +1074,111 @@ func _shatter(s: Dictionary, over: float) -> void:
 		tw.tween_property(bar, "position", bar.position + d, 0.6) \
 			.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_CUBIC)
 		tw.tween_property(bar, "rotation",
-			Vector3(randf_range(-8.0, 8.0), randf_range(-8.0, 8.0), randf_range(-8.0, 8.0)), 0.6)
+			Vector3(randf_range(-8.0, 8.0), randf_range(-8.0, 8.0), randf_range(-8.0, 8.0)),
+			0.6)
 		tw.tween_property(bar, "scale", Vector3.ONE * 0.05, 0.6).set_delay(0.15)
 	tw.chain().tween_callback(func() -> void:
 		for b2: Node3D in blocks:
 			b2.visible = false
 		for d2: Node3D in debris:
 			d2.queue_free())
+
+	# White frame and camera punch.
+	var hud: Object = section.get("_hud")
+	if hud != null:
+		hud.call("flash", Color(1.0, 1.0, 1.0, 0.55 * flash), 0.28)
+	_punch = 1.0 + 0.3 * over
+
+	var v: float = float(section.get("player").get("forward_speed"))
+	var wall_pd: float = float(s["t1"]) * v
+	_launch_shards(pieces, wall_pd, h, debris_col, over)
+	_spawn_wreck(pieces, wall_pd, h, debris_col, over)
+
+	# Shockwave down the track.
+	_shock_pd = wall_pd
+	_shock_t = float(s["t1"])
+	if _shock_ring == null:
+		var tm := TorusMesh.new()
+		tm.inner_radius = 2.9
+		tm.outer_radius = 3.15
+		tm.rings = 48
+		tm.ring_segments = 8
+		_shock_mat = NeonMat.ring(debris_col, 8.0)
+		_shock_ring = MeshInstance3D.new()
+		_shock_ring.mesh = tm
+		_shock_ring.material_override = _shock_mat
+		_shock_ring.set_meta("no_cycle", true)
+		_shock_ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		(section.get("world_fx_root") as Node3D).add_child(_shock_ring)
+	NeonMat.set_tint(_shock_mat, debris_col.lightened(0.3))
+	_shock_ring.visible = false
+
+
+## Shards that come back at the lens: they leave the wall slower than he runs,
+## so the camera overtakes them and they whip past the screen.
+func _launch_shards(pieces: GatePieces, wall_pd: float, h: float, col: Color,
+		over: float) -> void:
+	var fwd: Vector3 = section.call("_path_forward_at", wall_pd)
+	var right: Vector3 = section.call("_path_right_at", wall_pd)
+	var ground: Vector3 = section.call("_path_world_pos", wall_pd, 0.0, 0.0)
+	for k in int(12 + 8 * over):
+		var size := Vector3(randf_range(0.12, 0.3), randf_range(0.04, 0.08), randf_range(0.2, 0.5))
+		var shard: MeshInstance3D = pieces.box_mesh(size,
+			(TINT if k % 2 == 0 else col).lightened(randf_range(0.1, 0.6)), NeonMat.TUBE, 7.0)
+		shard.set_meta("no_cycle", true)
+		shard.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		(section.get("world_fx_root") as Node3D).add_child(shard)
+		# Past the lens, not into it: each one heads out to its own side, so
+		# they whip by the edges of the screen rather than filling it.
+		var sd: float = -1.0 if k % 2 == 0 else 1.0
+		shard.global_position = ground + right * sd * randf_range(0.5, 1.6) \
+			+ Vector3(0.0, randf_range(1.0, h + 0.4), 0.0) + fwd * 0.3
+		var vel: Vector3 = fwd * randf_range(0.0, 6.0) + right * sd * randf_range(3.5, 7.0) \
+			+ Vector3(0.0, randf_range(0.5, 4.0), 0.0)
+		_wreck.append({"node": shard, "vel": vel,
+			"spin": Vector3(randf_range(-14, 14), randf_range(-14, 14), randf_range(-14, 14)),
+			"life": 1.1, "fade": 0.4, "size": 1.0, "floor": ground.y - 50.0,
+			"bounce": false})
+
+
+## Chunks of the wall beside the track: some knocked out to the sides from the
+## wall itself, more raining down ahead of him where the blast threw them.
+## They land, bounce and tumble on for a few seconds, glowing, then shrink away.
+func _spawn_wreck(pieces: GatePieces, wall_pd: float, h: float, col: Color, over: float) -> void:
+	var world: Node3D = section.get("world_fx_root") as Node3D
+	var tw_full: float = float(section.call("_track_full_width"))
+	var n: int = int(12 + 6 * over)
+	for k in n:
+		var ahead: bool = k >= 4
+		var side: float = -1.0 if k % 2 == 0 else 1.0
+		var pd: float = wall_pd + (randf_range(1.0, 3.0) if not ahead else randf_range(6.0, 55.0))
+		var lat: float = side * (tw_full * 0.5 + randf_range(0.5, 3.2))
+		var fwd: Vector3 = section.call("_path_forward_at", pd)
+		var right: Vector3 = section.call("_path_right_at", pd)
+		var ground: Vector3 = section.call("_path_world_pos", pd, lat, 0.0)
+		var sz: float = randf_range(0.45, 1.0)
+		var chunk: MeshInstance3D = pieces.box_mesh(
+			Vector3(randf_range(0.6, 1.3), randf_range(0.4, 1.0), randf_range(0.35, 0.8)) * sz,
+			(TINT if k % 3 != 0 else col).darkened(randf_range(0.0, 0.3)), NeonMat.PANEL, 2.4)
+		chunk.set_meta("no_cycle", true)
+		world.add_child(chunk)
+		var start: Vector3 = ground + Vector3(0.0, randf_range(0.8, h), 0.0)
+		var vel: Vector3
+		var wait: float = 0.0
+		if ahead:
+			# Thrown high by the blast: drops in from above as he gets there.
+			start = ground + Vector3(0.0, randf_range(9.0, 16.0), 0.0)
+			vel = fwd * randf_range(1.0, 5.0) + right * side * randf_range(0.0, 1.5)
+			wait = randf_range(0.0, 0.9)
+		else:
+			vel = fwd * randf_range(3.0, 8.0) + right * side * randf_range(2.0, 5.0) \
+				+ Vector3(0.0, randf_range(3.0, 6.0), 0.0)
+		chunk.global_position = start
+		chunk.rotation = Vector3(randf() * TAU, randf() * TAU, randf() * TAU)
+		_wreck.append({"node": chunk, "vel": vel,
+			"spin": Vector3(randf_range(-6, 6), randf_range(-6, 6), randf_range(-6, 6)),
+			"life": randf_range(3.2, 4.6), "fade": 0.8, "size": 1.0,
+			"floor": ground.y + 0.25 * sz, "bounce": true, "wait": wait})
 
 
 # ══════════════════════════════════════════════════════════════════════════════

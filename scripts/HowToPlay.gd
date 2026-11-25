@@ -184,17 +184,7 @@ func _build_ui() -> void:
 	# ── About ─────────────────────────────────────────────────────────────────
 	_section(vbox, "THE GAME", s)
 	var about := Label.new()
-	about.text = (
-		"Echoes in my Blood is a rhythm runner. You auto-run through procedurally "
-		+ "generated tracks while gates spawn in time with the music. "
-		+ "Hit each gate correctly — in the left, middle or right lane, airborne for jumps, "
-		+ "crouching for slides — to build your combo and keep your health up. "
-		+ "if you encounter wall jumps and you succeed at them you get a X2 bonus of your score. "
-		+ "Wall jumps wont always spawn in a level. "
-		+ "Drain your health or miss too many and it's game over. "
-		+ "Each song gives you 3 attempts. After three wipes a new seed is rolled "
-		+ "and you can try a fresh layout."
-	)
+	about.text = HowToPlayContent.intro()
 	about.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	about.add_theme_font_size_override("font_size", int(16 * s))
 	about.add_theme_color_override("font_color", Color(0.82, 0.82, 0.92, 1.0))
@@ -223,6 +213,7 @@ func _build_ui() -> void:
 	_row(_kb_col, GameConfig.key_name("runner_rb"),    "Wall jump →",        s)
 	_row(_kb_col, GameConfig.key_name("runner_lb"),    "Wall jump ←",        s)
 	_row(_kb_col, GameConfig.key_name("runner_grind"), "Grind rail (hold)",  s)
+	_row(_kb_col, "Any key", "Mash (smash gate)", s)
 	_row(_kb_col, "Escape", "Pause",          s)
 
 	_gp_col = _col(cols, "🎮  GAMEPAD", s)
@@ -233,40 +224,12 @@ func _build_ui() -> void:
 	_row(_gp_col, GameConfig.joy_button_name("runner_jump"),  "Jump",        s)
 	_row(_gp_col, GameConfig.joy_button_name("runner_slide"), "Slide",       s)
 	_row(_gp_col, _grind_gp_label(),                          "Grind rail (hold)", s)
+	_row(_gp_col, "Any button", "Mash (smash gate)", s)
 	_row(_gp_col, "Start",           "Pause",       s)
 
-	# ── Charge Tunnel / Overdrive ────────────────────────────────────────────
-	_section(vbox, "⚡  CHARGE TUNNEL  →  ×100 OVERDRIVE", s)
-	var ct := VBoxContainer.new()
-	ct.add_theme_constant_override("separation", int(7 * s))
-	vbox.add_child(ct)
-	_row(ct, "Hold " + GameConfig.key_name("runner_grind") + " / " + _grind_gp_label(),
-		"Free-slide — steer with Move Left/Right to weave through the hoops", s)
-	_row(ct, "Stay threaded",  "Aligned with the hoop = charge fills; clip the rim = it bleeds", s)
-	_row(ct, "Let go early",   "Charge bleeds away — don't release before the drop",  s)
-	_row(ct, "Release on the drop", "Pops ×100 OVERDRIVE — bigger fill = longer window", s)
-
-	# ── Scoring ───────────────────────────────────────────────────────────────
-	_section(vbox, "SCORING & HEALTH", s)
-
-	var sc := VBoxContainer.new()
-	sc.add_theme_constant_override("separation", int(7 * s))
-	vbox.add_child(sc)
-	_row(sc, "Gate hit",             "+500 pts × combo multiplier",              s)
-	_row(sc, "Combo multiplier",     "×2 at 10 streak  ·  ×3 at 20  ·  ×4 at 30", s)
-	_row(sc, "Health (starts 25 %)", "+1 % per hit    –10 % per miss    → 0 % = fail", s)
-	_row(sc, "Near-miss bonus",      "+25 pts if you were close — keep trying!", s)
-	_row(sc, "Letter grade",         "S / A / B / C / D / F  based on notes hit.", s)
-
-	# ── Song Modes ────────────────────────────────────────────────────────────
-	_section(vbox, "SONG MODES", s)
-
-	var md := VBoxContainer.new()
-	md.add_theme_constant_override("separation", int(7 * s))
-	vbox.add_child(md)
-	_row(md, "Tutorial", "Fixed hand-crafted layout — learn the mechanics",  s)
-	_row(md, "Seeded",   "Same gate layout every run for a given song",      s)
-	_row(md, "Random",   "Fresh layout every attempt — maximum replayability", s)
+	# ── Gates, moves, smash gates, zones, scoring, modes ────────────────────
+	# Shared with the main menu's HOW TO PLAY panel — see HowToPlayContent.
+	HowToPlayContent.build(vbox, s, _section, _row)
 
 	# ── Scroll-gated confirm checkbox ────────────────────────────────────────
 	var sp := Control.new()
@@ -358,7 +321,7 @@ func _row(parent: Node, key: String, desc: String, s: float = 1.0) -> void:
 	row.add_theme_constant_override("separation", int(10 * s))
 	parent.add_child(row)
 	var kl: Label = UiStyle.label(key, UiStyle.caption(1.5), int(13 * s), Color.WHITE)
-	kl.custom_minimum_size = Vector2(185.0 * s, 0)
+	kl.custom_minimum_size = Vector2(215.0 * s, 0)
 	kl.self_modulate = UiStyle.GOLD
 	row.add_child(kl)
 	var dl: Label = UiStyle.label(desc, UiStyle.body(), int(15 * s), Color(0.80, 0.78, 0.92))

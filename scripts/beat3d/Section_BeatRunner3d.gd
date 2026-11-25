@@ -690,6 +690,12 @@ const _CHARGE_MULT_VALUE:   int   = 100    # the locked multiplier
 
 # Active grind segment state
 var _grind_rail_active:  bool      = false
+## The grind's camera work and effects — see GrindCinema.gd. Cosmetic only.
+var _grind_cinema: GrindCinema = null
+## Set by GrindCinema: added to the camera FOV while riding, and a multiplier
+## on the rail's glow (the flow, the beat kicks, the stutter when dropped).
+var _grind_fov: float = 0.0
+var _grind_rail_boost: float = 1.0
 var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
@@ -943,6 +949,12 @@ func _ready() -> void:
 	_camera = get_viewport().get_camera_3d()
 	if _camera != null:
 		_cam_fov_base = _camera.fov
+
+	# Grind cinematics, only for songs that have rap sections (grind rails).
+	if not _rap_segs.is_empty() and _grind_cinema == null:
+		_grind_cinema = GrindCinema.new()
+		add_child(_grind_cinema)
+		_grind_cinema.setup(self)
 	_cam_prev_lane = player.current_lane
 
 	if _loading_layer != null:
@@ -1235,6 +1247,9 @@ func _process(delta: float) -> void:
 
 	# Grind-rail system — spawn/update rail + sparks during rap segments
 	_update_grind_system(t_s)
+	# ...and filmed: rail cam, sparks, letterbox, scrape (GrindCinema.gd)
+	if _grind_cinema != null:
+		_grind_cinema.update(t_s, delta)
 	# Charge tunnel — drop buildups (free-slide hoop threading → ×100 overdrive)
 	_update_charge_tunnel(t_s, delta)
 	# Smash gates — the mash window, the wall's cracks, the impact
@@ -1591,6 +1606,11 @@ var _smash_holds: Array[Dictionary] = []   # {t0, t1, roll, mash_target}
 var _smash: SmashGate = null
 ## 0..1, set by SmashGate as a roll builds: tightens the view into the wall.
 var _smash_squeeze: float = 0.0
+## Set by SmashGate after a wall breaks: the FOV punch (decays from 1), and
+## the shockwave as Vector2(origin path distance, front path distance) —
+## y < 0 when there is none. The lamps the front reaches flicker.
+var _smash_punch: float = 0.0
+var _smash_shock: Vector2 = Vector2(0.0, -1.0)
 
 
 func _extract_smash_holds() -> void:
@@ -1649,6 +1669,26 @@ func _insert_smash_entries() -> void:
 	runner_plan.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 		return float(a.get("t", 0.0)) < float(b.get("t", 0.0)))
 
+	# The first gate after a wall is always in the middle lane. He is locked to
+	# the middle for the whole mash and the wall hides what is behind it, so a
+	# gate there asking for a side lane could only be reacted to, never read.
+	# A lane gate is judged on where he is at its beat, so moving its lane to
+	# the middle makes it a gate he is already lined up for. Wall-jump entries
+	# keep their own placement.
+	for i in runner_plan.size():
+		if String(runner_plan[i].get("action", "")) != "smash":
+			continue
+		var j: int = i + 1
+		while j < runner_plan.size() and String(runner_plan[j].get("action", "")) == "smash":
+			j += 1
+		if j >= runner_plan.size():
+			continue
+		var nxt: Dictionary = runner_plan[j]
+		if String(nxt.get("action", "")).begins_with("wall"):
+			continue
+		nxt["pre_lane"] = mid
+		nxt["post_lane"] = mid
+
 	# From story level 5 on, and always in freeplay, the charge burns echo
 	# energy and Meeko glows rainbow for it.
 	var rainbow: bool = true
@@ -1660,9 +1700,16 @@ func _insert_smash_entries() -> void:
 	_smash.setup(self, rainbow, _runner_avg_beat_s)
 	for i in runner_plan.size():
 		if String(runner_plan[i].get("action", "")) == "smash":
-			_smash.add(i, float(runner_plan[i].get("mash_t0", 0.0)), float(runner_plan[i]["t"]),
-				int(runner_plan[i].get("mash_target", 0)),
-				runner_plan[i].get("roll", PackedFloat32Array()))
+			var m0: float = float(runner_plan[i].get("mash_t0", 0.0))
+			var m1: float = float(runner_plan[i]["t"])
+			# The melody under the hold fires the run-up's pylons.
+			var melody := PackedFloat32Array()
+			for we: Dictionary in world_events:
+				var wt: float = float(we.get("t", 0.0))
+				if String(we.get("capture_pass", "")) == "melody" and wt >= m0 and wt < m1:
+					melody.append(wt)
+			_smash.add(i, m0, m1, int(runner_plan[i].get("mash_target", 0)),
+				runner_plan[i].get("roll", PackedFloat32Array()), melody)
 
 
 ## A zone that starts at a smash's impact (within a fraction of a beat) is the
@@ -2092,6 +2139,51 @@ func _wj_phrase_hits_grind(phrase: Array) -> bool:
 	return false
 
 
+## True when a wall-jump section hosted by this phrase would run into a smash
+## wall. The mash locks him to the middle lane and takes his controls, which
+## on the platforms or the descent ramp drops him into the void — so the whole
+## corridor (same span as _wj_phrase_hits_grind) has to be over, with a margin
+## of running track, before the wall's prompt, and may only start once he is
+## clear of the wall on the other side.
+func _wj_phrase_hits_smash(phrase: Array) -> bool:
+	if _smash_holds.is_empty() or phrase.is_empty():
+		return false
+	const MARGIN_S: float = 1.5
+	var spd: float = 18.0
+	if player != null and player.forward_speed > 0.1:
+		spd = player.forward_speed
+	var wj_start: float = float(phrase[0].get("t", 0.0)) - 8.0 / spd
+	var wj_end: float = float(phrase[phrase.size() - 1].get("t", 0.0)) + 100.0 / spd
+	for h: Dictionary in _smash_holds:
+		var st: float = float(h["t0"]) - _runner_avg_beat_s - MARGIN_S
+		var et: float = float(h["t1"]) + _SMASH_RECOVER_S + MARGIN_S
+		if wj_start < et and st < wj_end:
+			return true
+	return false
+
+
+## Whether a smash may take his lane and controls right now. Never while he is
+## anywhere in a wall-jump section (the platforms, the descent ramp), in the
+## air, or on a rail — locking him to the middle there kills him. The plan
+## keeps wall jumps clear of smash walls (_wj_phrase_hits_smash); this is the
+## safety net if one ever overlaps anyway.
+func _smash_lane_lock_ok() -> bool:
+	if player == null:
+		return false
+	if player.is_airborne() or player.is_grinding():
+		return false
+	if player.has_method("is_wj_descent") and player.is_wj_descent():
+		return false
+	if _wj_slide_engaged:
+		return false
+	if is_finite(_wj_zone_start_z):
+		var pd: float = _player_path_dist
+		var wj_end: float = maxf(_wj_zone_end_z, maxf(_wj_slide_end_z, _wj_ground_resume_z))
+		if pd >= _wj_zone_start_z - 2.0 and pd <= wj_end + 2.0:
+			return false
+	return true
+
+
 func _place_feasible_wall_jump(section_types: Array[String], phrases: Array, analyses: Array[Dictionary]) -> void:
 	const MAX_WJ_BEAT_S: float = 0.74
 	const WJ_PLACE_PROB: float = 0.50   # chance a song gets a WJ at all (set 1.0 = every song)
@@ -2125,6 +2217,8 @@ func _place_feasible_wall_jump(section_types: Array[String], phrases: Array, ana
 			continue
 		if _wj_phrase_hits_grind(phrases[i]):
 			continue   # a rail runs here; the player has no answer to walls on it
+		if _wj_phrase_hits_smash(phrases[i]):
+			continue   # a smash wall would lock him to the middle mid-climb
 		var score: float = _wj_phrase_score(phrases[i], analyses[i])
 		if score <= 0.0:
 			continue   # infeasible spacing
@@ -4331,6 +4425,13 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 				var n: float = fposmod(sin(step * 12.9898) * 43758.5453, 1.0)
 				var sag: float = 0.12 if n < 0.32 else lerpf(0.45, 1.0, n)
 				e *= lerpf(1.0, sag, k * k * flash)
+		# A smash wall's shockwave: lamps the front has just passed stutter,
+		# one after another down the track — even dead ones spit light.
+		if _smash_shock.y >= 0.0 and lpd >= _smash_shock.x and lpd <= _smash_shock.y \
+				and _smash_shock.y - lpd < 24.0:
+			var sk: float = 1.0 - (_smash_shock.y - lpd) / 24.0
+			var sn: float = fposmod(sin((floorf(t_s * 24.0) + float(i) * 3.7) * 12.9898) * 43758.5453, 1.0)
+			e = lerpf(e, 0.05 if sn < 0.45 else lerpf(0.9, 1.7, sn), sk * flash)
 		_ambient_lights[i].light_energy = 2.2 * e
 
 
@@ -6426,6 +6527,15 @@ func _spawn_grind_rail(seg: Dictionary) -> void:
 			_grind_total_this_seg += 1
 
 	_update_grind_hud()
+	if _grind_cinema != null:
+		_grind_cinema.on_rail_spawn(_grind_seg_start_pd, _grind_seg_end_pd)
+
+
+## A point on the rail's centre line (the rail tube's height), for effects
+## that travel along it.
+func _grind_rail_point(pd: float) -> Vector3:
+	var off: Vector2 = _grind_branch_offset(pd)
+	return _path_world_pos(pd, _GRIND_RAIL_LATERAL + off.x, 0.88 + off.y)
 
 
 # Rolls this segment's branch "trick" (how the rail leaves the track) and resets the
@@ -6753,6 +6863,9 @@ func _build_spark_node_at(pd: float, lateral: float, height: float) -> Node3D:
 func _despawn_grind_rail() -> void:
 	_grind_rail_active = false
 	player.set_grind_rail(false, 0.0)
+	if _grind_cinema != null:
+		_grind_cinema.on_rail_end(_grind_engaged_this_seg and _grind_total_this_seg > 0
+			and _grind_caught_this_seg >= _grind_total_this_seg and not _grind_failed)
 
 	# Full-clear bonus + fanfare — every spark caught and never dropped off the rail.
 	if _grind_total_this_seg > 0 and _grind_caught_this_seg >= _grind_total_this_seg and not _grind_failed:
@@ -6862,6 +6975,8 @@ func _catch_spark(idx: int) -> void:
 	if is_instance_valid(_spark_nodes[idx]):
 		var sn: Node3D = _spark_nodes[idx]
 		_spawn_score_popup(sn.global_position, pts, _grind_flow_mult)
+		if _grind_cinema != null:
+			_grind_cinema.on_catch(sn.global_position, _grind_flow_mult)
 		sn.visible = true
 		var tw := create_tween()
 		tw.tween_property(sn, "scale", Vector3(2.8, 2.8, 2.8), 0.07)
@@ -6895,6 +7010,8 @@ func _grind_fail_off() -> void:
 		return
 	_grind_failed = true
 	_show_grind_banner("✕  DROPPED!", Color(1.0, 0.35, 0.30))
+	if _grind_cinema != null:
+		_grind_cinema.on_drop()
 	if _hud != null:
 		_hud.set_flow(0, 0, 1, false)
 
@@ -7334,7 +7451,8 @@ func _update_camera_fx(delta: float) -> void:
 		return
 
 	# FOV breathe on beat — very subtle, just enough to feel alive
-	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5 - _smash_squeeze * 6.0
+	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5 - _smash_squeeze * 6.0 \
+		+ _smash_punch * _smash_punch * 9.0 + _grind_fov
 
 	# Tilt toward new lane — gentle, barely-there weight
 	var cur_lane: int = player.current_lane
@@ -9742,7 +9860,8 @@ func _update_color_cycle(song_t: float, dt: float) -> void:
 		_floor_grid_mat.emission_energy_multiplier = 1.4 * dark_mul
 	for gi in range(mini(_grind_rail_mats.size(), _grind_rail_base_e.size())):
 		if _grind_rail_mats[gi] != null:
-			NeonMat.set_energy(_grind_rail_mats[gi], _grind_rail_base_e[gi] * dark_mul)
+			NeonMat.set_energy(_grind_rail_mats[gi],
+				_grind_rail_base_e[gi] * dark_mul * _grind_rail_boost)
 
 	# Squared beat for a snappier flash that fades fast. Scaled by the
 	# photosensitivity setting: this single value is what every pulsing thing

@@ -91,8 +91,12 @@ func _physics_process(_delta: float) -> void:
 	var smash: Node = section.get("_smash")
 	if smash != null and bool(smash.call("is_mashing")):
 		_mash(smash, _delta)
-		return
-	_mash_acc = 0.0
+		# Until the smash has taken his lane (he may still be finishing a wall
+		# jump or the ramp), keep playing everything else as well.
+		if bool(smash.get("_locked")):
+			return
+	else:
+		_mash_acc = 0.0
 	if bool(p.get("input_disabled")):
 		return
 

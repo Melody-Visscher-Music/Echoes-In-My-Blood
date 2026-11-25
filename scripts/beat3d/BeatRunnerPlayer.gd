@@ -289,6 +289,19 @@ var _forward_speed_base: float = -1.0   # scene-authored forward_speed, captured
 ## scale, read all over the level, and must not wobble with the correction.
 var sync_speed_scale: float = 1.0
 var _char_root_base_y: float = 0.0
+
+# ── Smash gates (driven by SmashGate every frame while he mashes) ────────────
+## 0 = none, 1 = charging (SmashCharge), 2 = shoulder charge (SmashShoulder).
+var _smash_state: int = 0
+var _smash_build: float = 0.0      # 0..1, how far into the roll
+var _smash_kick: float = 0.0       # lunge per roll hit, decays
+var _smash_shoulder: float = 0.0   # 0..1, eased in over the last beat
+var _smash_burst_timer: float = 0.0
+const SMASH_BURST_LEN: float = 0.45
+## Body yaw at full shoulder charge — he turns side-on behind the right
+## shoulder. Matches the spine twist in CharacterPoses.smash_shoulder_frames.
+const SMASH_SHOULDER_YAW: float = -30.0
+
 # Corner bank — raw -1..1 arc value set each frame by Section_BeatRunner3d
 var _arc_bank_raw: float = 0.0
 var _arc_bank:     float = 0.0   # smoothed, applied to _char_root.rotation_degrees.z
@@ -994,7 +1007,8 @@ func _build_character() -> void:
 							 "WallJumpA", "WallJumpB",
 							 "Roll", "JumpRise", "JumpAir", "JumpLand",
 							 "RollElec", "JumpRiseElec", "JumpAirElec", "JumpLandElec",
-							 "Descent", "DescentPump"]:
+							 "Descent", "DescentPump",
+						 "SmashCharge", "SmashShoulder", "SmashBurst"]:
 					_char_clip_owned[clip] = _char_anim_player.has_animation(clip)
 
 				if _char_clip_owned["Run"]:
@@ -1085,6 +1099,10 @@ func _generate_missing_clips() -> void:
 	# tempo); the pump is a one-shot per caught spark.
 	wanted["Descent"]     = [CharacterPoses.descent_frames(),      0.60, true]
 	wanted["DescentPump"] = [CharacterPoses.descent_pump_frames(), 0.16, false]
+	# Smash gates: the charge, the shoulder for the last beat, the burst through.
+	wanted["SmashCharge"]   = [CharacterPoses.smash_charge_frames(),   0.40, true]
+	wanted["SmashShoulder"] = [CharacterPoses.smash_shoulder_frames(), 0.26, true]
+	wanted["SmashBurst"]    = [CharacterPoses.smash_burst_frames(),    0.45, false]
 
 	for name: String in wanted:
 		# Never clobber a real authored clip — the moment one of these is made in
@@ -1608,9 +1626,38 @@ func set_look_lateral(v: float) -> void:
 	_look_lateral = clampf(v, -1.0, 1.0)
 
 
+## SmashGate, every frame of a mash. `state`: 1 charging, 2 shoulder charge
+## (the last beat); `build` 0..1 how far into the roll; `shoulder` 0..1 how far
+## into the last beat.
+func set_smash(state: int, build: float, shoulder: float) -> void:
+	_smash_state = state
+	_smash_build = build
+	_smash_shoulder = shoulder
+
+
+## A roll hit: a lunge into the next stride.
+func smash_hit() -> void:
+	_smash_kick = 1.0
+
+
+## The wall broke: the burst through the hole.
+func smash_burst() -> void:
+	_smash_state = 0
+	_smash_burst_timer = SMASH_BURST_LEN
+
+
+func smash_end() -> void:
+	_smash_state = 0
+	_smash_kick = 0.0
+	_smash_shoulder = 0.0
+
+
 func _update_character_anim(_delta: float) -> void:
 	if _char_root == null:
 		return
+	_smash_kick = maxf(0.0, _smash_kick - _delta * 7.0)
+	if _smash_burst_timer > 0.0:
+		_smash_burst_timer = maxf(0.0, _smash_burst_timer - _delta)
 
 	# Run the launch clock even when the fallback rig is in use, so the state
 	# never sticks on.
@@ -1697,7 +1744,35 @@ func _update_character_anim_glb(_delta: float) -> void:
 	# grind. It is a one-shot that has to be allowed to finish: without this it
 	# would be replaced by "Jump" on the very next frame, because the launch puts
 	# the player airborne instantly, and the whole move would never be seen.
-	if _wall_jump_timer > 0.0 and not _is_grinding:
+	if _smash_state > 0 and _char_clip_owned.get("SmashCharge", false):
+		# The mash. Charging: the head-down sprint, timed to his ground speed
+		# like Run and quickening as the roll builds, a little lower each beat,
+		# lunging into the stride on every roll hit. The last beat: side-on
+		# behind the shoulder, low, braced.
+		var stride: float = clampf(_run_anim_length * forward_speed
+			/ maxf(0.5, run_stride_m), 0.25, 4.0)
+		if _smash_state == 2 and _char_clip_owned.get("SmashShoulder", false):
+			target_anim  = "SmashShoulder"
+			target_speed = 1.3
+		else:
+			target_anim  = "SmashCharge"
+			target_speed = stride * (0.40 / maxf(0.1, _run_anim_length)) \
+				* lerpf(1.0, 1.45, _smash_build)
+		var sh: float = _smash_shoulder * _smash_shoulder * (3.0 - 2.0 * _smash_shoulder)
+		_char_root.position.y = _char_root_base_y - 0.06 * _smash_build - 0.08 * sh \
+			- 0.05 * _smash_kick
+		_char_root.position.z = 0.14 * _smash_kick + 0.10 * sh
+		_char_root.rotation_degrees.x = 3.0 + 4.0 * _smash_build + 7.0 * _smash_kick + 6.0 * sh
+		_char_root.rotation_degrees.y = character_yaw_offset_deg + SMASH_SHOULDER_YAW * sh
+	elif _smash_burst_timer > 0.0 and _char_clip_owned.get("SmashBurst", false):
+		# Through the hole: a hop as he bursts out, unwinding from the shoulder.
+		target_anim = "SmashBurst"
+		var bp: float = 1.0 - _smash_burst_timer / SMASH_BURST_LEN
+		_char_root.position.y = _char_root_base_y + 0.22 * sin(clampf(bp / 0.6, 0.0, 1.0) * PI)
+		_char_root.rotation_degrees.x = -6.0 * sin(clampf(bp / 0.5, 0.0, 1.0) * PI)
+		_char_root.rotation_degrees.y = character_yaw_offset_deg \
+			+ SMASH_SHOULDER_YAW * maxf(0.0, 1.0 - bp / 0.3)
+	elif _wall_jump_timer > 0.0 and not _is_grinding:
 		target_anim = _wall_jump_clip
 		_char_root.position.y         = _char_root_base_y
 		_char_root.rotation_degrees.x = 0.0
@@ -1781,6 +1856,10 @@ func _update_character_anim_glb(_delta: float) -> void:
 		elif target_anim.begins_with("JumpAir"):
 			# Electric blends faster still — in a zone, hesitation is the tell.
 			blend = 0.06 if _electric else 0.10
+		elif target_anim == "SmashShoulder":
+			blend = 0.10   # the last beat is short; the turn has to land in it
+		elif target_anim == "SmashBurst":
+			blend = 0.04   # the impact frame — no easing into it
 		elif target_anim == "DescentPump":
 			blend = 0.04   # the pump IS the beat — it cannot ease in
 		elif target_anim == "Descent":

@@ -928,6 +928,13 @@ func _build_howtoplay_panel() -> Control:
 	vbox.add_child(ttl)
 	vbox.add_child(_rule(s))
 
+	var intro := Label.new()
+	intro.text = HowToPlayContent.intro()
+	intro.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	intro.add_theme_font_size_override("font_size", int(16 * s))
+	intro.add_theme_color_override("font_color", Color(0.82, 0.82, 0.92, 1.0))
+	vbox.add_child(intro)
+
 	# Controls — both columns always visible
 	_htp_section(vbox, "CONTROLS", s)
 
@@ -944,6 +951,7 @@ func _build_howtoplay_panel() -> Control:
 		"Wall jump section", s)
 	_htp_row(kb, GameConfig.key_name("runner_grind"), "Grind rail (hold)",            s)
 	_htp_row(kb, "↑ ↓  +  Enter",    "Navigate & confirm menus",          s)
+	_htp_row(kb, "Any key",           "Mash (smash gate)",                 s)
 	_htp_row(kb, "Escape",            "Pause / back",                      s)
 
 	var gp := _htp_col(cols, "🎮  GAMEPAD", s)
@@ -953,28 +961,12 @@ func _build_howtoplay_panel() -> Control:
 	_htp_row(gp, GameConfig.joy_button_name("runner_jump"), "Confirm / Jump",         s)
 	_htp_row(gp, GameConfig.joy_button_name("runner_slide"), "Back / Slide",          s)
 	_htp_row(gp, _grind_gp_label(),                        "Grind rail (hold)",       s)
+	_htp_row(gp, "Any button",    "Mash (smash gate)",       s)
 	_htp_row(gp, "D-pad",         "Navigate menus  |  LB/RB change mode", s)
 
-	# Charge Tunnel / Overdrive
-	_htp_section(vbox, "⚡  CHARGE TUNNEL  →  ×100 OVERDRIVE", s)
-	var ct := VBoxContainer.new()
-	ct.add_theme_constant_override("separation", int(7 * s))
-	vbox.add_child(ct)
-	_htp_row(ct, "Hold " + GameConfig.key_name("runner_grind") + " / " + _grind_gp_label(),
-		"Free-slide — steer with Move Left/Right to weave through the hoops", s)
-	_htp_row(ct, "Stay threaded",  "Aligned with the hoop = charge fills; clip the rim = it bleeds", s)
-	_htp_row(ct, "Let go early",   "Charge bleeds away — don't release before the drop",  s)
-	_htp_row(ct, "Release on the drop", "Pops ×100 OVERDRIVE — bigger fill = longer window", s)
-
-	# Scoring
-	_htp_section(vbox, "SCORING & HEALTH", s)
-	var sc := VBoxContainer.new()
-	sc.add_theme_constant_override("separation", int(7 * s))
-	vbox.add_child(sc)
-	_htp_row(sc, "Gate hit",             "+500 pts × combo multiplier  (+1000 in electric zones)", s)
-	_htp_row(sc, "Combo multiplier",     "×2 at 10 streak  ·  ×3 at 20  ·  ×4 at 30", s)
-	_htp_row(sc, "Health (starts 25 %)", "+1 % per hit    –10 % per miss    → 0 % = fail", s)
-	_htp_row(sc, "Letter grade",         "S / A / B / C / D / F  based on accuracy %", s)
+	# Gates, moves, smash gates, zones, scoring, modes — shared with the
+	# tutorial screen (scripts/HowToPlay.gd), see HowToPlayContent.
+	HowToPlayContent.build(vbox, s, _htp_section, _htp_row)
 
 	# Back button
 	var sp := Control.new()

@@ -24888,6 +24888,20 @@
 			"src": "capture",
 			"t": 129.753039027567,
 			"type": "lane"
+		},
+		{
+			"auto_kind": "beats",
+			"capture_pass": "beats",
+			"category": "generic",
+			"dur": 3.05373685058592,
+			"id": 2037.0,
+			"judgement": "hold",
+			"lane": 0.0,
+			"mash_target": 15,
+			"role": "generic",
+			"src": "capture",
+			"t": 129.34914965745,
+			"type": "hold"
 		}
 	],
 	"lane_schema": [

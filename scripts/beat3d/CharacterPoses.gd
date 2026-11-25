@@ -641,6 +641,126 @@ static func descent_pump_frames() -> Array:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# SMASH GATE
+# ═════════════════════════════════════════════════════════════════════════════
+# Three clips for the mash run-up and the wall: a head-down sprint while he
+# charges, a shoulder charge for the last beat, and a burst through the hole.
+# BeatRunnerPlayer layers a lunge per roll hit and the yaw that leads with the
+# shoulder on _char_root; the bones here only make the shapes.
+
+## SMASH CHARGE — the sprint at the wall. Lower and longer-striding than Run,
+## chest down over the knees, arms pumping hard and high with elbows locked
+## at 90°, chin up so his eyes stay on the wall. Loops; the player times it
+## to his ground speed like Run and speeds it up as the roll builds.
+static func smash_charge_frames() -> Array:
+	var a: Dictionary = {
+		"thigh.L": Vector3(-62, 0, 0), "shin.L": Vector3(34, 0, 0), "foot.L": Vector3(-8, 0, 0),
+		"thigh.R": Vector3(30, 0, 0),  "shin.R": Vector3(70, 0, 0), "foot.R": Vector3(-30, 0, 0),
+		"spine":   Vector3(30, 8, 0),
+		"neck":    Vector3(-22, -4, 0), "head": Vector3(-10, -3, 0),
+		# Arms opposite the legs: R forward and up, L driven back. +Y swings R
+		# forward and L back (the two mirror in rest; measured off Run).
+		"upper_arm.R": Vector3(-58, 62, 0), "forearm.R": Vector3(0, 0, 92),
+		"upper_arm.L": Vector3(-70, 50, 0), "forearm.L": Vector3(0, 0, -70),
+	}
+	var b: Dictionary = {
+		"thigh.L": Vector3(-14, 0, 0), "shin.L": Vector3(18, 0, 0), "foot.L": Vector3(-10, 0, 0),
+		"thigh.R": Vector3(-20, 0, 0), "shin.R": Vector3(96, 0, 0), "foot.R": Vector3(-14, 0, 0),
+		"spine":   Vector3(34, 0, 0),
+		"neck":    Vector3(-25, 0, 0), "head": Vector3(-11, 0, 0),
+		"upper_arm.R": Vector3(-72, 6, 0),  "forearm.R": Vector3(0, 0, 88),
+		"upper_arm.L": Vector3(-72, 6, 0),  "forearm.L": Vector3(0, 0, -88),
+	}
+	var c: Dictionary = {
+		"thigh.R": Vector3(-62, 0, 0), "shin.R": Vector3(34, 0, 0), "foot.R": Vector3(-8, 0, 0),
+		"thigh.L": Vector3(30, 0, 0),  "shin.L": Vector3(70, 0, 0), "foot.L": Vector3(-30, 0, 0),
+		"spine":   Vector3(30, -8, 0),
+		"neck":    Vector3(-22, 4, 0), "head": Vector3(-10, 3, 0),
+		"upper_arm.L": Vector3(-58, -62, 0), "forearm.L": Vector3(0, 0, -92),
+		"upper_arm.R": Vector3(-70, -50, 0), "forearm.R": Vector3(0, 0, 70),
+	}
+	var d: Dictionary = {
+		"thigh.R": Vector3(-14, 0, 0), "shin.R": Vector3(18, 0, 0), "foot.R": Vector3(-10, 0, 0),
+		"thigh.L": Vector3(-20, 0, 0), "shin.L": Vector3(96, 0, 0), "foot.L": Vector3(-14, 0, 0),
+		"spine":   Vector3(34, 0, 0),
+		"neck":    Vector3(-25, 0, 0), "head": Vector3(-11, 0, 0),
+		"upper_arm.R": Vector3(-72, 6, 0),  "forearm.R": Vector3(0, 0, 88),
+		"upper_arm.L": Vector3(-72, 6, 0),  "forearm.L": Vector3(0, 0, -88),
+	}
+	return [[0.00, a], [0.10, b], [0.20, c], [0.30, d], [0.40, a]]
+
+
+## SMASH SHOULDER — the last beat. He turns side-on behind his right shoulder
+## (the player script adds the body yaw), drops low, tucks the right arm across
+## his chest with the fist at his collarbone and throws the left arm back for
+## drive. Short choppy steps — he is bracing, not striding. Loops quickly.
+static func smash_shoulder_frames() -> Array:
+	var tuck: Dictionary = {
+		"spine": Vector3(26, -24, 6),
+		"neck":  Vector3(-18, 20, 0), "head": Vector3(-8, 14, 0),
+		"upper_arm.R": Vector3(-48, 48, 0), "forearm.R": Vector3(0, 0, 118),
+		"upper_arm.L": Vector3(-64, 58, 0), "forearm.L": Vector3(0, 0, -30),
+	}
+	return [
+		[0.00, _merge([tuck, {
+			"thigh.L": Vector3(-48, 0, 0), "shin.L": Vector3(62, 0, 0), "foot.L": Vector3(-10, 0, 0),
+			"thigh.R": Vector3(-8, 0, 0),  "shin.R": Vector3(54, 0, 0), "foot.R": Vector3(-22, 0, 0),
+		}])],
+		[0.13, _merge([tuck, {
+			"spine": Vector3(30, -26, 6),
+			"thigh.R": Vector3(-48, 0, 0), "shin.R": Vector3(62, 0, 0), "foot.R": Vector3(-10, 0, 0),
+			"thigh.L": Vector3(-8, 0, 0),  "shin.L": Vector3(54, 0, 0), "foot.L": Vector3(-22, 0, 0),
+		}])],
+		[0.26, _merge([tuck, {
+			"thigh.L": Vector3(-48, 0, 0), "shin.L": Vector3(62, 0, 0), "foot.L": Vector3(-10, 0, 0),
+			"thigh.R": Vector3(-8, 0, 0),  "shin.R": Vector3(54, 0, 0), "foot.R": Vector3(-22, 0, 0),
+		}])],
+	]
+
+
+## SMASH BURST — through the hole. The shoulder unwinds, the chest opens and
+## both arms fling out wide as he bursts out the far side, one knee driven up
+## like he is leaping through, then back to a running shape Run can take over.
+static func smash_burst_frames() -> Array:
+	return [
+		# ── IMPACT — still in the charge, the shoulder driving in
+		[0.00, {
+			"spine": Vector3(28, -24, 6),
+			"neck":  Vector3(-18, 18, 0), "head": Vector3(-8, 12, 0),
+			"thigh.L": Vector3(-40, 0, 0), "shin.L": Vector3(58, 0, 0),
+			"thigh.R": Vector3(-6, 0, 0),  "shin.R": Vector3(50, 0, 0),
+			"upper_arm.R": Vector3(-48, 48, 0), "forearm.R": Vector3(0, 0, 118),
+			"upper_arm.L": Vector3(-64, 58, 0), "forearm.L": Vector3(0, 0, -30),
+		}],
+		# ── BURST — chest thrown open, arms flung wide and back, knee up
+		[0.12, {
+			"spine": Vector3(-16, 6, 0),
+			"neck":  Vector3(-20, 0, 0), "head": Vector3(-10, 0, 0),
+			"thigh.L": Vector3(-78, 0, 0), "shin.L": Vector3(84, 0, 0), "foot.L": Vector3(-20, 0, 0),
+			"thigh.R": Vector3(22, 0, 0),  "shin.R": Vector3(26, 0, 0), "foot.R": Vector3(-36, 0, 0),
+			"upper_arm.L": Vector3(20, 30, 0), "forearm.L": Vector3(0, 0, -14),
+			"upper_arm.R": Vector3(20, -30, 0), "forearm.R": Vector3(0, 0, 14),
+		}],
+		# ── FLOAT — still open, legs swapping, arms starting to come down
+		[0.28, {
+			"spine": Vector3(-4, 0, 0),
+			"neck":  Vector3(-8, 0, 0), "head": Vector3(-4, 0, 0),
+			"thigh.L": Vector3(-30, 0, 0), "shin.L": Vector3(40, 0, 0), "foot.L": Vector3(-14, 0, 0),
+			"thigh.R": Vector3(-36, 0, 0), "shin.R": Vector3(66, 0, 0), "foot.R": Vector3(-16, 0, 0),
+			"upper_arm.L": Vector3(-30, 10, 0), "forearm.L": Vector3(0, 0, -40),
+			"upper_arm.R": Vector3(-30, -10, 0), "forearm.R": Vector3(0, 0, 40),
+		}],
+		# ── CATCH — a running shape to hand back to Run
+		[0.45, _merge([ARMS_DOWN, {
+			"spine": Vector3(8, 0, 0),
+			"thigh.L": Vector3(-20, 0, 0), "shin.L": Vector3(30, 0, 0),
+			"thigh.R": Vector3(10, 0, 0),  "shin.R": Vector3(40, 0, 0),
+			"neck":  Vector3(0, 0, 0), "head": Vector3(0, 0, 0),
+		}])],
+	]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
 
