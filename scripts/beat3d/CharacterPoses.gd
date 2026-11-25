@@ -110,38 +110,72 @@ static func idle_frames() -> Array:
 	]
 
 
-## GRIND — crouched low over the rail, outside arm flung out for balance, inside
-## arm tucked, knees deep and absorbing. Loops with a slow wobble so it reads as
-## "holding a line at speed" rather than a frozen statue. The rail's pitch and
-## roll are still applied on top at the root by the player script.
+## GRIND — a real rail stance. The player script turns his body side-on to the
+## rail (GRIND_YAW in BeatRunnerPlayer); the bones then do what a rider does
+## there: feet spread wide ALONG the rail (thigh Z is the sideways swing on this
+## rig — negative takes the left leg out, positive the right), knees deep and
+## soaking up the rail, chest low, arms out along the rail for balance, and the
+## head and shoulders turned back to look where he is going. Loops with a slow
+## weight shift so it reads as balancing at speed, not a statue.
+##
+## `s` = +1 for the regular stance, −1 for switch (the mirror he lands in after
+## a switch trick): the look-back turn and the shoulder twist flip with it.
+static func _grind_pose(s: float, k: float) -> Dictionary:
+	# k 0..1: the weight shift between the two ends of the loop.
+	return {
+		"thigh.L": Vector3(-30 - 6 * k, 0, -17), "shin.L": Vector3(56 + 10 * k, 0, 0), "foot.L": Vector3(-14, 0, 0),
+		"thigh.R": Vector3(-36 + 6 * k, 0, 17),  "shin.R": Vector3(66 - 10 * k, 0, 0), "foot.R": Vector3(-14, 0, 0),
+		"spine":   Vector3(16 + 4 * k, -16 * s, 4 * s * (1.0 - 2.0 * k)),
+		# Head turned back toward the direction of travel.
+		"neck":    Vector3(-12, -32 * s, 0), "head": Vector3(-6, -30 * s, 0),
+		# Arms out along the rail, one a little higher — balancing, adjusting.
+		"upper_arm.L": Vector3(-14 - 12 * k, 8, 0),  "forearm.L": Vector3(0, 0, -28),
+		"upper_arm.R": Vector3(-26 + 12 * k, 8, 0),  "forearm.R": Vector3(0, 0, 28),
+	}
+
+
 static func grind_frames() -> Array:
-	return [
-		[0.00, {
-			"thigh.L": Vector3(-32, 0, 0), "shin.L": Vector3(58, 0, 0), "foot.L": Vector3(-14, 0, 0),
-			"thigh.R": Vector3(-18, 0, 0), "shin.R": Vector3(44, 0, 0), "foot.R": Vector3(-8, 0, 0),
-			"spine":   Vector3(20, -8, 0),
-			"neck":    Vector3(-14, 6, 0), "head": Vector3(-6, 4, 0),
-			# Outside (R) arm thrown out and back; inside (L) arm tucked across.
-			"upper_arm.R": Vector3(-18, -34, 0), "forearm.R": Vector3(0, 0, 22),
-			"upper_arm.L": Vector3(-62, 30, 0),  "forearm.L": Vector3(0, 0, -74),
-		}],
-		[0.45, {
-			"thigh.L": Vector3(-27, 0, 0), "shin.L": Vector3(52, 0, 0), "foot.L": Vector3(-11, 0, 0),
-			"thigh.R": Vector3(-23, 0, 0), "shin.R": Vector3(50, 0, 0), "foot.R": Vector3(-11, 0, 0),
-			"spine":   Vector3(24, -4, 0),
-			"neck":    Vector3(-17, 3, 0), "head": Vector3(-4, 2, 0),
-			"upper_arm.R": Vector3(-12, -28, 0), "forearm.R": Vector3(0, 0, 16),
-			"upper_arm.L": Vector3(-66, 26, 0),  "forearm.L": Vector3(0, 0, -68),
-		}],
-		[0.90, {
-			"thigh.L": Vector3(-32, 0, 0), "shin.L": Vector3(58, 0, 0), "foot.L": Vector3(-14, 0, 0),
-			"thigh.R": Vector3(-18, 0, 0), "shin.R": Vector3(44, 0, 0), "foot.R": Vector3(-8, 0, 0),
-			"spine":   Vector3(20, -8, 0),
-			"neck":    Vector3(-14, 6, 0), "head": Vector3(-6, 4, 0),
-			"upper_arm.R": Vector3(-18, -34, 0), "forearm.R": Vector3(0, 0, 22),
-			"upper_arm.L": Vector3(-62, 30, 0),  "forearm.L": Vector3(0, 0, -74),
-		}],
-	]
+	return [[0.00, _grind_pose(1.0, 0.0)], [0.45, _grind_pose(1.0, 1.0)], [0.90, _grind_pose(1.0, 0.0)]]
+
+
+## The switch stance — same loop, mirrored look-back.
+static func grind_switch_frames() -> Array:
+	return [[0.00, _grind_pose(-1.0, 0.0)], [0.45, _grind_pose(-1.0, 1.0)], [0.90, _grind_pose(-1.0, 0.0)]]
+
+
+## GRIND GRAB — dropping into a deep crouch and reaching down to grab the rail
+## beside his feet, the other arm thrown up. One-shot; starts and ends in the
+## stance so it blends straight back.
+static func grind_grab_frames(s: float) -> Array:
+	var grab: Dictionary = {
+		"thigh.L": Vector3(-74, 0, -12), "shin.L": Vector3(114, 0, 0), "foot.L": Vector3(-20, 0, 0),
+		"thigh.R": Vector3(-70, 0, 12),  "shin.R": Vector3(110, 0, 0), "foot.R": Vector3(-20, 0, 0),
+		"spine":   Vector3(38, -10 * s, 0),
+		"neck":    Vector3(-24, -34 * s, 0), "head": Vector3(-8, -26 * s, 0),
+		# R hand down by the feet, L arm thrown up.
+		"upper_arm.R": Vector3(-84, 38, 0), "forearm.R": Vector3(0, 0, 10),
+		"upper_arm.L": Vector3(38, -10, 0), "forearm.L": Vector3(0, 0, -12),
+	}
+	return [[0.00, _grind_pose(s, 0.0)], [0.11, grab], [0.30, grab], [0.46, _grind_pose(s, 0.0)]]
+
+
+## GRIND KICK — one leg kicked out wide off the rail, back arched, both arms
+## flung up and out. One-shot.
+static func grind_kick_frames(s: float) -> Array:
+	var kick: Dictionary = {
+		"thigh.L": Vector3(-46, 0, -8),  "shin.L": Vector3(88, 0, 0), "foot.L": Vector3(-16, 0, 0),
+		"thigh.R": Vector3(-18, 0, 50),  "shin.R": Vector3(6, 0, 0),  "foot.R": Vector3(-36, 0, 0),
+		"spine":   Vector3(-8, -12 * s, 0),
+		"neck":    Vector3(-16, -30 * s, 0), "head": Vector3(-10, -24 * s, 0),
+		"upper_arm.L": Vector3(32, 0, 0), "forearm.L": Vector3(0, 0, -14),
+		"upper_arm.R": Vector3(32, 0, 0), "forearm.R": Vector3(0, 0, 14),
+	}
+	return [[0.00, _grind_pose(s, 0.0)], [0.10, kick], [0.28, kick], [0.46, _grind_pose(s, 0.0)]]
+
+
+## Test hooks for the pose viewer (static funcs with arguments can't be named).
+static func grind_grab_a() -> Array: return grind_grab_frames(1.0)
+static func grind_kick_a() -> Array: return grind_kick_frames(1.0)
 
 
 ## WALL JUMP — the headline. Deliberately nothing like the ordinary Jump, which

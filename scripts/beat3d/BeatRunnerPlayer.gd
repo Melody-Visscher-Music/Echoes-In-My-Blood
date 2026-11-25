@@ -388,6 +388,29 @@ var _grind_rail_pitch:     float = 0.0    # body pitch (radians) — loops flip 
 var _grind_base_y:         float = 0.0    # floor Y captured when the player mounts the rail
 var _grind_saved_mask:     int   = -1     # collision_mask saved while grinding (-1 = not grinding)
 
+# ── Grind look (cosmetic only — the body, its height and the timing are untouched)
+## The body's physics origin rides at floor level + the rail's rise, but the rail
+## tube itself sits this far above that (Section._build_grind_rail_mesh RAIL_H +
+## its radius). The model is lifted by this so his feet are ON the rail instead of
+## the rail running past his hips. Less the few centimetres the bent knees lift
+## the feet by.
+const GRIND_LIFT: float = 0.81
+## Side-on to the rail, like a real rider: the body turns this far and the stance
+## clip turns the head back to look down the line.
+const GRIND_YAW: float = 70.0
+## A trick every this many sparks caught in a row.
+const GRIND_TRICK_EVERY: int = 8
+const GRIND_TRICKS: PackedStringArray = ["grab", "spin", "kick", "switch"]
+var _grind_stance: float = 1.0          # +1 regular, −1 switch
+var _grind_yaw_now: float = 0.0         # eased body yaw (degrees, before tricks)
+var _grind_trick: String = ""
+var _grind_trick_t: float = 0.0
+var _grind_trick_len: float = 0.46
+var _grind_trick_i: int = 0
+var _grind_pump_t: float = 0.0
+var _grind_mount_k: float = 0.0
+var _grind_foot_fix: float = 0.0
+
 # ── WJ descent slide — jump locked while sliding down ───────────────────────
 var _jump_locked: bool = false   # set by Section; prevents jumping off the WJ slide ramp
 var _wj_descent:  bool = false   # riding the ramp: spark taps are live
@@ -748,6 +771,11 @@ func _poll_runner_inputs() -> void:
 	# Locked while grinding: releasing the trigger does NOT drop you. The grind ends
 	# only when the Section marks the rail unavailable — segment end, or a fail
 	# (too many missed sparks → dropped off the rail).
+	if not _is_grinding and _grind_mount_k > 0.0:
+		_grind_mount_k = 0.0
+		_grind_yaw_now = 0.0
+		_grind_trick = ""
+		_grind_stance = 1.0
 	if _is_grinding:
 		if not _grind_rail_available:
 			_is_grinding = false
@@ -1008,7 +1036,8 @@ func _build_character() -> void:
 							 "Roll", "JumpRise", "JumpAir", "JumpLand",
 							 "RollElec", "JumpRiseElec", "JumpAirElec", "JumpLandElec",
 							 "Descent", "DescentPump",
-						 "SmashCharge", "SmashShoulder", "SmashBurst"]:
+						 "SmashCharge", "SmashShoulder", "SmashBurst",
+						 "GrindSwitch", "GrindGrabA", "GrindGrabB", "GrindKickA", "GrindKickB"]:
 					_char_clip_owned[clip] = _char_anim_player.has_animation(clip)
 
 				if _char_clip_owned["Run"]:
@@ -1103,6 +1132,12 @@ func _generate_missing_clips() -> void:
 	wanted["SmashCharge"]   = [CharacterPoses.smash_charge_frames(),   0.40, true]
 	wanted["SmashShoulder"] = [CharacterPoses.smash_shoulder_frames(), 0.26, true]
 	wanted["SmashBurst"]    = [CharacterPoses.smash_burst_frames(),    0.45, false]
+	# Grind: the switch stance and the two pose tricks, both ways round.
+	wanted["GrindSwitch"] = [CharacterPoses.grind_switch_frames(),    0.90, true]
+	wanted["GrindGrabA"]  = [CharacterPoses.grind_grab_frames(1.0),   0.46, false]
+	wanted["GrindGrabB"]  = [CharacterPoses.grind_grab_frames(-1.0),  0.46, false]
+	wanted["GrindKickA"]  = [CharacterPoses.grind_kick_frames(1.0),   0.46, false]
+	wanted["GrindKickB"]  = [CharacterPoses.grind_kick_frames(-1.0),  0.46, false]
 
 	for name: String in wanted:
 		# Never clobber a real authored clip — the moment one of these is made in
@@ -1626,6 +1661,17 @@ func set_look_lateral(v: float) -> void:
 	_look_lateral = clampf(v, -1.0, 1.0)
 
 
+## Section, on every spark caught while grinding: a knee pump into the rail,
+## and every GRIND_TRICK_EVERY in a row, a trick. Cosmetic only.
+func grind_catch(streak: int) -> void:
+	_grind_pump_t = 0.16
+	if _grind_trick == "" and streak > 0 and streak % GRIND_TRICK_EVERY == 0:
+		_grind_trick = GRIND_TRICKS[_grind_trick_i % GRIND_TRICKS.size()]
+		_grind_trick_i += 1 + (randi() % 2)
+		_grind_trick_t = 0.0
+		_grind_trick_len = 0.46 if _grind_trick in ["grab", "kick"] else 0.42
+
+
 ## SmashGate, every frame of a mash. `state`: 1 charging, 2 shoulder charge
 ## (the last beat); `build` 0..1 how far into the roll; `shoulder` 0..1 how far
 ## into the last beat.
@@ -1716,6 +1762,7 @@ func _update_character_anim_glb(_delta: float) -> void:
 	# Neutral every frame; the branches below opt back in. The roll needs Z and
 	# the airborne twist needs Y, and nothing here used to touch either, so
 	# without this reset a move could leave the body permanently offset.
+	_char_root.position.x         = 0.0   # the grind's lag catch-up offsets it
 	_char_root.position.z         = 0.0
 	_char_root.rotation_degrees.y = character_yaw_offset_deg
 
@@ -1791,17 +1838,8 @@ func _update_character_anim_glb(_delta: float) -> void:
 			_char_root.position.y         = _char_root_base_y - 0.50
 			_char_root.rotation_degrees.x = -10.0
 	elif _is_grinding:
-		target_anim = "Grind"
-		var tg: float = _anim_time * _run_freq * TAU
-		var g_owned: bool = _char_clip_owned.get("Grind", false)
-		_char_root.position.y         = _char_root_base_y \
-			+ (0.0 if g_owned else abs(sin(tg)) * -0.04)
-		# Trick pitch/roll stay code-driven ALWAYS (they follow the rail);
-		# only the static −3° base lean yields to an authored clip.
-		_char_root.rotation_degrees.x = (0.0 if g_owned else -3.0) + rad_to_deg(_grind_rail_pitch)
-		# +Z lean = into the track (inside). Rail is on the outside; lean away from it
-		# for balance while the outside arm reaches out to grip it.
-		_char_root.rotation_degrees.z = rad_to_deg(_grind_rail_roll)   # 0 normally; only corkscrews roll
+		_apply_grind_pose(_delta)
+		target_anim = _grind_clip()
 	elif not on_floor:
 		_char_root.position.y = _char_root_base_y
 		if restyle_jump and _char_clip_owned.get("JumpAir", false):
@@ -1856,6 +1894,10 @@ func _update_character_anim_glb(_delta: float) -> void:
 		elif target_anim.begins_with("JumpAir"):
 			# Electric blends faster still — in a zone, hesitation is the tell.
 			blend = 0.06 if _electric else 0.10
+		elif target_anim.begins_with("GrindGrab") or target_anim.begins_with("GrindKick"):
+			blend = 0.06
+		elif target_anim == "GrindSwitch" or target_anim == "Grind":
+			blend = 0.10
 		elif target_anim == "SmashShoulder":
 			blend = 0.10   # the last beat is short; the turn has to land in it
 		elif target_anim == "SmashBurst":
@@ -1868,6 +1910,90 @@ func _update_character_anim_glb(_delta: float) -> void:
 			blend = 0.08   # same reason — the roll is 0.30 s, not 0.92 s
 		_char_anim_player.play(target_anim, blend)
 	_char_anim_player.speed_scale = target_speed
+
+
+## Which clip the grind wants this frame: the stance (regular or switch), or a
+## pose trick while one runs.
+func _grind_clip() -> String:
+	var side: String = "A" if _grind_stance > 0.0 else "B"
+	if _grind_trick == "grab" and _char_clip_owned.get("GrindGrab" + side, false):
+		return "GrindGrab" + side
+	if _grind_trick == "kick" and _char_clip_owned.get("GrindKick" + side, false):
+		return "GrindKick" + side
+	if _grind_stance < 0.0 and _char_clip_owned.get("GrindSwitch", false):
+		return "GrindSwitch"
+	return "Grind"
+
+
+## Places and turns him on the rail. The physics body is untouched: the model is
+## lifted onto the rail (GRIND_LIFT), turned side-on (GRIND_YAW), and the rail's
+## own pitch (loops) and roll (corkscrews, lean) are applied around his FEET,
+## which now sit on the rail — so he swings round the rail rather than round a
+## point below it. Order matters: the stance yaw is applied to the model first,
+## then the rail's pitch and roll in track space, or a corkscrew would roll him
+## around the way he is facing instead of around the rail.
+##
+## Tricks ride on top: spin (a hopped 360), switch (a hopped half-turn into the
+## mirrored stance), and the two pose tricks (grab, kick) which are clips with a
+## small hop. Every caught spark also pumps the knees into the rail.
+func _apply_grind_pose(delta: float) -> void:
+	_grind_mount_k = minf(1.0, _grind_mount_k + delta * 5.0)
+	var target_yaw: float = GRIND_YAW * _grind_stance
+	_grind_yaw_now = lerpf(_grind_yaw_now, target_yaw * _grind_mount_k, minf(1.0, delta * 12.0))
+	var yaw: float = _grind_yaw_now
+	var hop: float = 0.0
+	if _grind_trick != "":
+		_grind_trick_t += delta
+		var p: float = clampf(_grind_trick_t / _grind_trick_len, 0.0, 1.0)
+		var e: float = p * p * (3.0 - 2.0 * p)
+		match _grind_trick:
+			"spin":
+				yaw += 360.0 * e
+				hop = 0.55 * sin(p * PI)
+			"switch":
+				# Half-turn through the front into the mirrored stance.
+				yaw = lerpf(GRIND_YAW * _grind_stance, -GRIND_YAW * _grind_stance, e)
+				hop = 0.42 * sin(p * PI)
+			_:
+				hop = 0.30 * sin(p * PI)
+		if p >= 1.0:
+			if _grind_trick == "switch":
+				_grind_stance = -_grind_stance
+				_grind_yaw_now = GRIND_YAW * _grind_stance
+			_grind_trick = ""
+	var pump: float = 0.0
+	if _grind_pump_t > 0.0:
+		_grind_pump_t = maxf(0.0, _grind_pump_t - delta)
+		pump = sin((1.0 - _grind_pump_t / 0.16) * PI) * 0.07
+	# The body chases the rail (velocity toward its height and lateral), so on a
+	# steep or swinging rail it trails a little behind it. The model makes up the
+	# difference so his feet stay on the rail itself — visual only.
+	var lag := Vector3.ZERO
+	if _grind_mount_k >= 1.0:
+		var cur_lat: float = (global_position - _track_center).dot(right_dir)
+		var world_off: Vector3 = right_dir * (_grind_rail_x - cur_lat) \
+			+ Vector3(0.0, (_grind_base_y + _grind_rail_height) - global_position.y, 0.0)
+		lag = global_transform.basis.inverse() * world_off
+	# Keep his FEET centred over the rail, not his pivot. The stance's feet do not
+	# sit exactly under the model's origin, and turning him side-on (either way
+	# round, and through the spin) swings that offset out sideways. Measured off
+	# the skeleton each frame (one frame behind, smoothed) and taken out sideways.
+	if _char_skeleton != null and _grind_mount_k >= 1.0:
+		var bl: int = _char_skeleton.find_bone("foot.L")
+		var br: int = _char_skeleton.find_bone("foot.R")
+		if bl >= 0 and br >= 0:
+			var sk_xf: Transform3D = _char_skeleton.global_transform
+			var mid_w: Vector3 = (sk_xf * _char_skeleton.get_bone_global_pose(bl).origin
+				+ sk_xf * _char_skeleton.get_bone_global_pose(br).origin) * 0.5
+			var off_x: float = to_local(mid_w).x - _char_root.position.x
+			_grind_foot_fix = lerpf(_grind_foot_fix, -off_x, minf(1.0, delta * 14.0))
+	else:
+		_grind_foot_fix = 0.0
+	_char_root.position = Vector3(lag.x + _grind_foot_fix,
+		_char_root_base_y + GRIND_LIFT * _grind_mount_k + hop - pump + lag.y, lag.z)
+	_char_root.transform.basis = Basis(Vector3.BACK, _grind_rail_roll) \
+		* Basis(Vector3.RIGHT, _grind_rail_pitch) \
+		* Basis(Vector3.UP, deg_to_rad(character_yaw_offset_deg + yaw))
 
 
 ## The roll's revolution. The generated Slide clip only makes the ball shape —

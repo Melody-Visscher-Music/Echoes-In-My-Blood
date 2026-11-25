@@ -421,6 +421,10 @@ func _update_fx(riding: bool, flow: int, f: float, flash: float) -> void:
 		return
 	var dropped: bool = bool(section.get("_grind_failed"))
 	var on: bool = riding and not dropped
+	# His feet are up on the rail while he rides (BeatRunnerPlayer.GRIND_LIFT),
+	# so the shower comes off the rail, not off the floor below it.
+	_fx.position.y = (float(_player.get("GRIND_LIFT")) if _player.get("GRIND_LIFT") != null else 0.81) \
+		if riding else 0.0
 	_sparks.emitting = on
 	_sparks_hot.emitting = on and flow >= 4
 	_streaks.emitting = on and flow >= 3

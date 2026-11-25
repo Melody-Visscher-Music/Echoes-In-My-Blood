@@ -6984,6 +6984,10 @@ func _catch_spark(idx: int) -> void:
 		tw.tween_callback(sn.queue_free)
 		_spark_nodes[idx] = null   # prevent double-free
 
+	# Meeko pumps into the rail on the catch, and does a trick every few in a row.
+	if player.has_method("grind_catch") and player.is_grinding():
+		player.grind_catch(_grind_flow_streak)
+
 	# Combo flash
 	if _hud != null and _combo >= 2:
 		_hud.combo_flash(Color(1.5, 1.5, 0.3, 1.0), 0.05, 0.12)
