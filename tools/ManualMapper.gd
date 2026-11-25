@@ -1403,7 +1403,9 @@ func _elec_add_seg_row(start_t: float, end_t: float) -> void:
 # field means "use the recommended amount", which the game works out from the
 # hold's length the same way this popup does (SmashGate.MASH_RATE).
 
-## Must match SmashGate.MASH_RATE / MIN_TARGET in scripts/beat3d/SmashGate.gd.
+## Must match the constants in scripts/beat3d/SmashGate.gd (recommended_target).
+const SMASH_ROLL_FACTOR: float = 0.7
+const SMASH_MAX_RATE: float = 10.0
 const SMASH_MASH_RATE: float = 6.0
 const SMASH_MIN_TARGET: int = 4
 
@@ -1412,8 +1414,130 @@ var _smash_rows_box: VBoxContainer = null
 var _smash_rows: Array[Dictionary] = []   # [{id, sb}]
 
 
-func _smash_recommended(dur: float) -> int:
-	return maxi(SMASH_MIN_TARGET, int(round(dur * SMASH_MASH_RATE)))
+## Recommended presses for a smash hold: a share of the roll it covers (the
+## beat hits inside it), capped at what a hand can mash in the time. Same
+## formula as SmashGate.recommended_target, so the number here is the game's.
+func _smash_recommended(dur: float, hits: int = 0) -> int:
+	var d: float = maxf(dur, 0.1)
+	var cap: int = maxi(SMASH_MIN_TARGET, int(round(d * SMASH_MAX_RATE)))
+	if hits <= 0:
+		return maxi(SMASH_MIN_TARGET, int(round(d * SMASH_MASH_RATE)))
+	return clampi(int(round(float(hits) * SMASH_ROLL_FACTOR)), SMASH_MIN_TARGET, cap)
+
+
+func _is_beats_pass(e: Dictionary) -> bool:
+	var pass_id: String = String(e.get("capture_pass", ""))
+	if pass_id == "":
+		pass_id = "melody" if int(e.get("lane", 0)) == 1 else "beats"
+	return pass_id == "beats"
+
+
+## Beat hits inside a hold's window — the roll it stands in for.
+func _smash_roll_hits(hold: Dictionary) -> int:
+	var t0: float = float(hold.get("t", 0.0))
+	var t1: float = t0 + float(hold.get("dur", 0.0))
+	var n: int = 0
+	for e in events:
+		if String(e.get("type", "")) == "hold" or not _is_beats_pass(e):
+			continue
+		var t: float = float(e.get("t", 0.0))
+		if t >= t0 and t < t1:
+			n += 1
+	return n
+
+
+func _smash_recommended_for(hold: Dictionary) -> int:
+	return _smash_recommended(float(hold.get("dur", 0.0)), _smash_roll_hits(hold))
+
+
+# ── Too fast to tap ──────────────────────────────────────────────────────────
+# The game drops beats that come closer together than 48% of the song's
+# average beat gap (Section_BeatRunner3d._thin_beats) — those stretches cannot
+# be played note for note, which is exactly where a smash gate belongs. These
+# find them the same way, so what is highlighted here is what the game thins.
+
+const TOO_FAST_MIN_HITS: int = 5   # shorter runs are a flam, not a roll
+
+var _too_fast_cache: Array[Vector2] = []
+var _too_fast_at: int = -100000
+var _too_fast_n: int = -1   # event count the cache was built from
+
+
+func _beats_hits_sorted() -> PackedFloat32Array:
+	var out := PackedFloat32Array()
+	for e in events:
+		if String(e.get("type", "")) != "hold" and _is_beats_pass(e):
+			out.append(float(e.get("t", 0.0)))
+	out.sort()
+	return out
+
+
+## Stretches of beats too close to tap, as Vector2(start, end) in seconds.
+## Stretches already covered by a smash hold are left out.
+func _too_fast_stretches() -> Array[Vector2]:
+	# Rebuilt at most twice a second while drawing, and at once whenever the
+	# chart gains or loses notes (a load, an edit, a new smash hold).
+	var now: int = Time.get_ticks_msec()
+	if now - _too_fast_at < 500 and events.size() == _too_fast_n:
+		return _too_fast_cache
+	_too_fast_at = now
+	_too_fast_n = events.size()
+	_too_fast_cache = []
+	var ts: PackedFloat32Array = _beats_hits_sorted()
+	if ts.size() < TOO_FAST_MIN_HITS:
+		return _too_fast_cache
+	# Same average as the game: gaps between 0.05 and 2 s.
+	var sum_dt: float = 0.0
+	var cnt: int = 0
+	for i in range(1, ts.size()):
+		var dt: float = ts[i] - ts[i - 1]
+		if dt > 0.05 and dt < 2.0:
+			sum_dt += dt
+			cnt += 1
+	var avg: float = (sum_dt / float(cnt)) if cnt > 0 else 0.5
+	var min_gap: float = maxf(0.06, avg * 0.48)
+	var holds: Array[Vector2] = []
+	for e in events:
+		if _is_smash_hold(e):
+			var h0: float = float(e.get("t", 0.0))
+			holds.append(Vector2(h0, h0 + float(e.get("dur", 0.0))))
+	var i0: int = 0
+	while i0 < ts.size() - 1:
+		if ts[i0 + 1] - ts[i0] >= min_gap:
+			i0 += 1
+			continue
+		var i1: int = i0 + 1
+		while i1 < ts.size() - 1 and ts[i1 + 1] - ts[i1] < min_gap:
+			i1 += 1
+		if i1 - i0 + 1 >= TOO_FAST_MIN_HITS:
+			var st := Vector2(ts[i0], ts[i1])
+			var covered: bool = false
+			for h: Vector2 in holds:
+				if st.x >= h.x - 0.05 and st.y <= h.y + 0.05:
+					covered = true
+					break
+			if not covered:
+				_too_fast_cache.append(st)
+		i0 = i1 + 1
+	return _too_fast_cache
+
+
+## Turns a too-fast stretch into a smash hold: from its first hit to the next
+## beat after its last (the impact, where the drop usually lands). Lane 0 is a
+## beats lane.
+func _make_smash_from_stretch(st: Vector2) -> void:
+	var beat: float = beat_duration()
+	var off: float = float(offset_ms) / 1000.0
+	var end_t: float = off + ceil((st.y + 0.05 - off) / beat) * beat
+	if end_t - st.x < SMASH_MIN_HOLD_S:
+		end_t = st.x + SMASH_MIN_HOLD_S
+	_begin_action("Make smash gate")
+	var e: Dictionary = _make_event(0, st.x, "hold", end_t - st.x)
+	e["capture_pass"] = "beats"
+	events.append(e)
+	_commit_action()
+	_too_fast_at = -100000
+	info.text = "Smash gate made: %.2f s, impact at %.2f s" % [end_t - st.x, end_t]
 
 
 func _open_smash_popup() -> void:
@@ -1430,15 +1554,43 @@ func _open_smash_popup() -> void:
 			holds.append(e)
 	holds.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 		return float(a.get("t", 0.0)) < float(b.get("t", 0.0)))
-	if holds.is_empty():
+	if holds.is_empty() and _too_fast_stretches().is_empty():
 		var none := Label.new()
 		none.text = "  No smash gates yet. Draw a hold (H toggles holds) on a beats lane —\n  any lane except lane 1 — at least %.2f s long." % SMASH_MIN_HOLD_S
 		_smash_rows_box.add_child(none)
 		_smash_rows.append({"hbox": none})
 	for e in holds:
 		_smash_add_row(e)
-	# Sized to its contents, then centred — a fixed size let the panel grow to
-	# the window's full height and pin itself over the toolbar.
+	# Stretches the game would thin out, offered as new smash gates.
+	var fast: Array[Vector2] = _too_fast_stretches()
+	if not fast.is_empty():
+		var sep := HSeparator.new()
+		_smash_rows_box.add_child(sep)
+		_smash_rows.append({"hbox": sep})
+		var hdr := Label.new()
+		hdr.text = "  Too fast to tap (the game drops beats here):"
+		_smash_rows_box.add_child(hdr)
+		_smash_rows.append({"hbox": hdr})
+		for st: Vector2 in fast:
+			var hb := HBoxContainer.new()
+			_smash_rows_box.add_child(hb)
+			var lbl := Label.new()
+			lbl.text = "  %.2f – %.2f s" % [st.x, st.y]
+			lbl.custom_minimum_size = Vector2(300, 0)
+			hb.add_child(lbl)
+			var mk := Button.new()
+			mk.text = "Make smash gate"
+			mk.tooltip_text = "A beat hold from the first hit to the next beat after the last"
+			hb.add_child(mk)
+			mk.pressed.connect(func() -> void:
+				_make_smash_from_stretch(st)
+				_open_smash_popup())
+			var go := Button.new()
+			go.text = "▶"
+			go.tooltip_text = "Jump the playhead here"
+			hb.add_child(go)
+			go.pressed.connect(func() -> void: _smash_jump_to(st.x))
+			_smash_rows.append({"hbox": hb})
 	_smash_popup.reset_size()
 	_smash_popup.popup_centered()
 
@@ -1458,10 +1610,12 @@ func _build_smash_popup() -> void:
 	vb.add_child(title)
 
 	var desc := Label.new()
-	desc.text = "How many presses each wall needs. More presses than this = no damage, " \
-		+ "exactly this = 2 HP, falling short costs up to 50 HP. " \
-		+ "Recommended is %.0f presses per second of hold. Leave it on the recommended " % SMASH_MASH_RATE \
-		+ "amount and it follows the hold if you change its length."
+	desc.text = ("How many presses each wall needs. More presses than this = no damage "
+		+ "(and every extra press is overcharge), exactly this = 2 HP, falling short "
+		+ "costs up to 50 HP (less on long rolls). Recommended = %.0f%% of the roll's "
+		% (SMASH_ROLL_FACTOR * 100.0)
+		+ "hits inside the hold, at most %.0f presses a second. Leave it on " % SMASH_MAX_RATE
+		+ "the recommended amount and it follows the hold if you change it.")
 	desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	# A wrapping label with no width of its own reports a huge height, and the
 	# panel grew to the full window to fit it.
@@ -1512,7 +1666,8 @@ func _build_smash_popup() -> void:
 func _smash_add_row(e: Dictionary) -> void:
 	var t0: float = float(e.get("t", 0.0))
 	var dur: float = float(e.get("dur", 0.0))
-	var rec: int = _smash_recommended(dur)
+	var hits: int = _smash_roll_hits(e)
+	var rec: int = _smash_recommended(dur, hits)
 	var cur: int = int(e.get("mash_target", 0))
 
 	var hb := HBoxContainer.new()
@@ -1530,7 +1685,9 @@ func _smash_add_row(e: Dictionary) -> void:
 	hb.add_child(d_lbl)
 
 	var r_lbl := Label.new()
-	r_lbl.text = "%d" % rec
+	r_lbl.text = "%d  (%d hits)" % [rec, hits] if hits > 0 else "%d" % rec
+	r_lbl.tooltip_text = "%.0f%% of the roll's hits, at most %.0f presses a second" % [
+		SMASH_ROLL_FACTOR * 100.0, SMASH_MAX_RATE]
 	r_lbl.custom_minimum_size = Vector2(110, 0)
 	hb.add_child(r_lbl)
 
@@ -1540,7 +1697,7 @@ func _smash_add_row(e: Dictionary) -> void:
 	sb.step = 1
 	sb.value = cur if cur > 0 else rec
 	sb.custom_minimum_size = Vector2(140, 0)
-	sb.tooltip_text = "Presses needed. %d is recommended for a %.2f s hold." % [rec, dur]
+	sb.tooltip_text = "Presses needed. %d is recommended for this %.2f s roll." % [rec, dur]
 	hb.add_child(sb)
 
 	var btn_rec := Button.new()
@@ -5318,6 +5475,32 @@ func _is_smash_hold(e: Dictionary) -> bool:
 
 
 ## The impact line at the end of a smash hold, and its label.
+func _draw_too_fast(track_r: Rect2, lane_w: float, tbase: float) -> void:
+	var fast: Array[Vector2] = _too_fast_stretches()
+	if fast.is_empty():
+		return
+	var band := Color(1.0, 0.55, 0.1, 0.16)
+	var edge := Color(1.0, 0.6, 0.15, 0.85)
+	var font: Font = ThemeDB.fallback_font
+	for st: Vector2 in fast:
+		var ya: float = _note_y_for_time(st.x, tbase)
+		var yb: float = _note_y_for_time(st.y, tbase)
+		var y_top: float = minf(ya, yb)
+		var h: float = maxf(6.0, absf(yb - ya))
+		if y_top > track_r.position.y + track_r.size.y or y_top + h < track_r.position.y:
+			continue
+		for ln in lane_count:
+			if ln == 1:
+				continue   # lane 1 is the melody lane
+			var r := Rect2(Vector2(track_r.position.x + float(ln) * lane_w, y_top),
+				Vector2(lane_w, h))
+			draw_rect(r, band, true)
+			draw_rect(r, edge, false, 1.0)
+		if font != null:
+			draw_string(font, Vector2(track_r.position.x + 4.0, y_top + h + 14.0),
+				"TOO FAST — smash gate?", HORIZONTAL_ALIGNMENT_LEFT, -1.0, 13, edge)
+
+
 ## `presses` is the authored count, or the recommended one when `custom` is
 ## false — shown with a ~ so it is clear nobody has set it.
 func _draw_smash_marker(x0: float, x1: float, y_impact: float, presses: int = 0,
@@ -7662,6 +7845,10 @@ func _draw() -> void:
 			t_line += beat
 			bar_n += 1
 
+	# Too-fast stretches: an orange band across the beats lanes where the game
+	# would thin the beats out — candidates for a smash gate (💥 Smash Gates).
+	_draw_too_fast(track_r, lane_w, tbase)
+
 	# Draw visible events only (perf)
 	var time_range: Array[float] = _visible_time_range(track_r, tbase, 1.0)
 	var vis: Array[Dictionary] = _get_events_in_time_range(time_range[0], time_range[1])
@@ -7691,7 +7878,7 @@ func _draw() -> void:
 			draw_rect(rr, border, false, 2.0)
 			if _is_smash_hold(e):
 				var mt: int = int(e.get("mash_target", 0))
-				_draw_smash_marker(x0, x1, y1, mt if mt > 0 else _smash_recommended(dur), mt > 0)
+				_draw_smash_marker(x0, x1, y1, mt if mt > 0 else _smash_recommended_for(e), mt > 0)
 		else:
 			var rr2: Rect2 = Rect2(Vector2(x0, y0 - NOTE_H * 0.5), Vector2(x1 - x0, NOTE_H))
 			draw_rect(rr2, col_n, true)

@@ -1572,6 +1572,7 @@ func _load_chart_and_build_plan() -> void:
 	_insert_smash_entries()
 	_parse_drop_buildups(d)
 	_parse_electric_zones(d)
+	_link_smash_zones()
 	_parse_lyrics(d)
 	_apply_beatmap_lyric_font(d)
 
@@ -1586,8 +1587,10 @@ const _SMASH_MIN_HOLD_S: float = 0.35
 ## (authored) electric zone does not arrive in the same breath as the wall.
 const _SMASH_RECOVER_S: float = 0.35
 
-var _smash_holds: Array[Dictionary] = []   # {t0, t1}
+var _smash_holds: Array[Dictionary] = []   # {t0, t1, roll, mash_target}
 var _smash: SmashGate = null
+## 0..1, set by SmashGate as a roll builds: tightens the view into the wall.
+var _smash_squeeze: float = 0.0
 
 
 func _extract_smash_holds() -> void:
@@ -1599,8 +1602,16 @@ func _extract_smash_holds() -> void:
 		if dur < _SMASH_MIN_HOLD_S:
 			continue
 		var t0: float = float(e.get("t", 0.0))
+		# The roll the hold covers: every beat hit inside it. These are what
+		# the player would be tapping if they could; the mash stands in for
+		# them, and the target and the wall's reactions are built from them.
+		var roll := PackedFloat32Array()
+		for e2 in gameplay_events:
+			var t2: float = float(e2.get("t", 0.0))
+			if String(e2.get("type", "")) != "hold" and t2 >= t0 and t2 < t0 + dur:
+				roll.append(t2)
 		# Presses the mapper set for this wall; 0 = the recommended amount.
-		_smash_holds.append({"t0": t0, "t1": t0 + dur,
+		_smash_holds.append({"t0": t0, "t1": t0 + dur, "roll": roll,
 			"mash_target": int(e.get("mash_target", 0))})
 	if _smash_holds.is_empty():
 		return
@@ -1633,6 +1644,7 @@ func _insert_smash_entries() -> void:
 			"phrase_index": -1,
 			"mash_t0":      float(h["t0"]),
 			"mash_target":  int(h.get("mash_target", 0)),
+			"roll":         h.get("roll", PackedFloat32Array()),
 		})
 	runner_plan.sort_custom(func(a: Dictionary, b: Dictionary) -> bool:
 		return float(a.get("t", 0.0)) < float(b.get("t", 0.0)))
@@ -1645,15 +1657,50 @@ func _insert_smash_entries() -> void:
 		rainbow = data != null and data.order.find(Run.story_node_id) >= 4
 	_smash = SmashGate.new()
 	add_child(_smash)
-	_smash.setup(self, rainbow)
+	_smash.setup(self, rainbow, _runner_avg_beat_s)
 	for i in runner_plan.size():
 		if String(runner_plan[i].get("action", "")) == "smash":
 			_smash.add(i, float(runner_plan[i].get("mash_t0", 0.0)), float(runner_plan[i]["t"]),
-				int(runner_plan[i].get("mash_target", 0)))
+				int(runner_plan[i].get("mash_target", 0)),
+				runner_plan[i].get("roll", PackedFloat32Array()))
+
+
+## A zone that starts at a smash's impact (within a fraction of a beat) is the
+## zone behind that wall: its blackout runs from the start of the hold, so the
+## dark is visibly waiting on the far side while the player mashes, and the
+## wall lets its light through the cracks. Called once the zones are parsed.
+func _link_smash_zones() -> void:
+	if _smash == null or _smash_holds.is_empty():
+		return
+	for h: Dictionary in _smash_holds:
+		var t1: float = float(h["t1"])
+		for zone: Dictionary in _electric_zones:
+			if absf(float(zone.get("start_t", 0.0)) - t1) <= 0.3:
+				zone["smash_t0"] = float(h["t0"])
+				_smash.set_zone_after(t1)
+				break
+
+
+## The world's pulse on each hit of a smash roll. Lighter than a full beat
+## pulse (_pulse_floor_beat): a quick floor flash and the skyline, so a 16th
+## roll reads as a roll and not a strobe. SmashGate thins it further under
+## reduced flashing.
+func _smash_roll_pulse() -> void:
+	_beat_phase = 1.0
+	if _city != null and not _is_electric_at(_song_time()):
+		_city.strike()
+	if _floor_material != null:
+		var peak: float = lerpf(0.10, 0.55, _world_vitality) * GameConfig.flash_scale()
+		_floor_material.emission_enabled = true
+		_floor_material.emission_energy_multiplier = maxf(
+			_floor_material.emission_energy_multiplier, peak)
+		var tw: Tween = create_tween()
+		tw.tween_property(_floor_material, "emission_energy_multiplier", 0.02, 0.09)
 
 
 ## Called by SmashGate when a wall breaks: score it, charge the health.
-func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float) -> void:
+func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float,
+		heal_hp: float = 0.0) -> void:
 	if gi >= 0 and gi < gate_judged.size():
 		gate_judged[gi] = true
 		gate_success[gi] = true
@@ -1664,6 +1711,9 @@ func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float) -> v
 	_score += int(1000.0 * ratio) * _score_multiplier()
 	if hp_cost > 0.0 and not dev_no_death:
 		_health_pct = clampf(_health_pct - hp_cost / 100.0, 0.0, 1.0)
+	# Overcharge: pressing past the target gives a little health back.
+	if heal_hp > 0.0:
+		_health_pct = clampf(_health_pct + heal_hp / 100.0, 0.0, 1.0)
 	_update_hud_score()
 	_update_hud_health()
 	_hud_flash_color(Color(1.0, 0.85, 0.95, 0.45), 0.30)
@@ -1673,6 +1723,8 @@ func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float) -> v
 		_hud.combo_flash(Color(1.5, 1.3, 0.4, 1.0), 0.05, 0.16)
 	var verdict: String = "SMASH!  no damage" if hp_cost <= 0.0 \
 		else "SMASH!  −%d HP" % int(round(hp_cost))
+	if heal_hp >= 1.0:
+		verdict = "OVERCHARGE!  +%d HP" % int(round(heal_hp))
 	_show_grind_banner(verdict, Color(1.0, 0.45, 0.75) if hp_cost > 10.0 else Color(0.5, 1.0, 0.7))
 	if _health_pct <= 0.0 and not dev_no_death:
 		_trigger_death()
@@ -4696,8 +4748,13 @@ func _update_menace(delta: float, t_s: float) -> void:
 ## _is_electric_at() and the real bounds; only the lights come on early.
 func _elec_blackout_at(t_s: float) -> bool:
 	for zone: Dictionary in _electric_zones:
-		if (t_s >= float(zone.get("start_t", 0.0)) - _ELEC_PREROLL_S
-				and t_s < float(zone.get("end_t", 0.0))):
+		var st: float = float(zone.get("start_t", 0.0))
+		# The zone behind a smash wall arms when the mash starts, however long
+		# the roll — the dark is waiting on the far side the whole time.
+		var lead: float = _ELEC_PREROLL_S
+		if zone.has("smash_t0"):
+			lead = maxf(lead, st - float(zone["smash_t0"]))
+		if t_s >= st - lead and t_s < float(zone.get("end_t", 0.0)):
 			return true
 	return false
 
@@ -7277,7 +7334,7 @@ func _update_camera_fx(delta: float) -> void:
 		return
 
 	# FOV breathe on beat — very subtle, just enough to feel alive
-	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5
+	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5 - _smash_squeeze * 6.0
 
 	# Tilt toward new lane — gentle, barely-there weight
 	var cur_lane: int = player.current_lane
