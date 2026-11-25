@@ -696,6 +696,11 @@ var _grind_cinema: GrindCinema = null
 ## on the rail's glow (the flow, the beat kicks, the stutter when dropped).
 var _grind_fov: float = 0.0
 var _grind_rail_boost: float = 1.0
+## The running sections' extra visuals — see RunnerFlair.gd. Cosmetic only.
+var _flair: RunnerFlair = null
+## Set by RunnerFlair from the combo: city window glow and laser brightness.
+var _flair_city_glow: float = 1.0
+var _flair_laser_k: float = 1.0
 var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
@@ -950,6 +955,10 @@ func _ready() -> void:
 	if _camera != null:
 		_cam_fov_base = _camera.fov
 
+	_flair = RunnerFlair.new()
+	add_child(_flair)
+	_flair.setup(self)
+
 	# Grind cinematics, only for songs that have rap sections (grind rails).
 	if not _rap_segs.is_empty() and _grind_cinema == null:
 		_grind_cinema = GrindCinema.new()
@@ -1099,7 +1108,7 @@ func _process(delta: float) -> void:
 		if _city != null:
 			_city.pulse(dt_pulse, _world_vitality, _runner_avg_beat_s,
 				_player_path_dist, _DECO_WINDOW_BEHIND_M, _deco_window_ahead_m,
-				lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark))
+				lerpf(1.0, _ELEC_WORLD_GLOW, _elec_dark) * _flair_city_glow)
 		_update_electric_dark(dt_pulse, t_s)
 		_update_electric_pulse(dt_pulse, t_s)
 
@@ -1250,6 +1259,9 @@ func _process(delta: float) -> void:
 	# ...and filmed: rail cam, sparks, letterbox, scrape (GrindCinema.gd)
 	if _grind_cinema != null:
 		_grind_cinema.update(t_s, delta)
+	# Running sections: gate shards, trail, city heat, sky, trackside (RunnerFlair.gd)
+	if _flair != null:
+		_flair.update(t_s, delta)
 	# Charge tunnel — drop buildups (free-slide hoop threading → ×100 overdrive)
 	_update_charge_tunnel(t_s, delta)
 	# Smash gates — the mash window, the wall's cracks, the impact
@@ -4378,7 +4390,7 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 	# reaches the beams, and hiding the rig takes the lens flares with it.
 	if _laser_rig != null:
 		var lit: float = 1.0 - _elec_dark
-		_laser_rig.set_intensity(lit)
+		_laser_rig.set_intensity(lit * _flair_laser_k)
 		_laser_rig.visible = lit > 0.02
 
 	# The two things that are not the world: his coat, and the readouts.
@@ -5849,6 +5861,8 @@ func _award_near_miss(_idx: int) -> void:
 	# Award a flat 25-point bonus (intentionally small, not multiplier-scaled)
 	_score += 50
 	_update_hud_score()
+	if _flair != null:
+		_flair.on_near_miss(_idx)
 
 	# Reuse the same HUD root that streak milestones use
 	if _hud_flash == null:
@@ -7297,6 +7311,8 @@ func _on_gate_scored(success: bool) -> void:
 
 
 func _show_streak_milestone(combo: int) -> void:
+	if _flair != null:
+		_flair.on_milestone(combo)
 	if _hud == null:
 		return
 	# How big a deal this banner is, on a log curve from the first milestone to
@@ -7561,6 +7577,13 @@ func _setup_world_environment() -> void:
 	# the brightest neon glowing while dropping the merely-lit stuff out of it.
 	env.glow_hdr_threshold  = 0.85
 	env.glow_hdr_scale      = 2.50
+	# ── GLARE TAMING (trial) ──────────────────────────────────────────────────
+	# Pulls the bloom back so the neon reads as neon instead of a white haze, and
+	# so the newer effects stay readable. Delete this block to go back to the
+	# look above.
+	env.glow_intensity      = 1.0
+	env.glow_hdr_threshold  = 1.0
+	# ── end glare taming ──────────────────────────────────────────────────────
 
 	# The halo itself. Godot only enables blur levels 3 and 5 by default, which
 	# gives a tight glow that hugs the surface — the neon ends up bright but
@@ -7840,6 +7863,9 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 	# On a clean hit: ghost echo at the player's lane in the gate's own colour
 	if success:
 		_spawn_gate_echo(gate.global_position, gate_color)
+	# Shards on a hit, the screen glitch on a miss (RunnerFlair).
+	if _flair != null:
+		_flair.on_gate(idx, success, gate_color)
 
 ## Slot pool for the hit echo.
 ##
