@@ -438,12 +438,17 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 	else:
 		mat_a.set_shader_parameter("use_tex", false)
 		NeonMat.set_tint(mat_a, col_a)
-	NeonMat.set_energy(mat_a, 4.0)
+	# Reduced flashing: halos come in dimmer and slower, so a run of melody
+	# notes swells rather than popping.
+	var fs: float = GameConfig.flash_scale()
+	var he: float = 4.0 * lerpf(0.45, 1.0, fs)
+	var fade_in: float = 0.15 if fs >= 1.0 else 0.32
+	NeonMat.set_energy(mat_a, he)
 	mat_a.set_shader_parameter("alpha", 0.0)
 
 	if mat_b != null:
 		NeonMat.set_tint(mat_b, col_b)
-		NeonMat.set_energy(mat_b, 4.0)
+		NeonMat.set_energy(mat_b, he)
 		mat_b.set_shader_parameter("alpha", 0.0)
 
 	var pivot: Node3D = _halo_pivots[i]
@@ -453,9 +458,9 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 	_halo_busy[i] = true
 
 	var tw_in: Tween = _new_tween()
-	_tw_param(tw_in, mat_a, "alpha", 0.0, 0.80, 0.15, false)
+	_tw_param(tw_in, mat_a, "alpha", 0.0, 0.80, fade_in, false)
 	if mat_b != null:
-		_tw_param(tw_in, mat_b, "alpha", 0.0, 0.70, 0.15)
+		_tw_param(tw_in, mat_b, "alpha", 0.0, 0.70, fade_in)
 
 	var spin: Tween = _new_tween()
 	spin.tween_property(pivot, "rotation_degrees:z", spin_deg, spin_s)
@@ -467,10 +472,10 @@ func spawn_halo(pos: Vector3, y_rot_deg: float, col_a: Color, col_b: Color,
 	var tw_out: Tween = _new_tween()
 	tw_out.tween_interval(life_s)
 	_tw_param(tw_out, mat_a, "alpha",  0.80, 0.0, 0.18, false)
-	_tw_param(tw_out, mat_a, "energy", 4.0,  0.0, 0.18)
+	_tw_param(tw_out, mat_a, "energy", he,  0.0, 0.18)
 	if mat_b != null:
 		_tw_param(tw_out, mat_b, "alpha",  0.70, 0.0, 0.22)
-		_tw_param(tw_out, mat_b, "energy", 4.0,  0.0, 0.22)
+		_tw_param(tw_out, mat_b, "energy", he,  0.0, 0.22)
 	tw_out.tween_callback(func() -> void:
 		pivot.visible = false
 		_halo_busy[i] = false

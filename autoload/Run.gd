@@ -31,6 +31,11 @@ var shards = 0
 var current_song_key: String = "stuck_in_a_game"
 var song_lives: int = 3        # lives remaining for the current song attempt (per-song, not meta)
 
+## Practice mode for the next level load: {song, t0, t1, speed, loop, label}.
+## Empty = a normal run. Set by song select, cleared whenever a level is left
+## for anything but a restart of the same part.
+var practice: Dictionary = {}
+
 # ── Story Mode context ───────────────────────────────────────────────────────
 ## The story-map node whose level is currently loaded, or "" when the level was
 ## started from Freeplay. StoryMap sets it on the way in and clears it on the

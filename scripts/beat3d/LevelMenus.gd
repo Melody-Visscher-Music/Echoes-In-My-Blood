@@ -421,7 +421,8 @@ func open_results(host: Control, ctx: Dictionary) -> void:
 
 	# Backdrop
 	var overlay := ColorRect.new()
-	overlay.color = Color(0.015, 0.008, 0.045, 0.94)
+	# Lighter when the run's best moment is replaying behind it (ReplayMoments).
+	overlay.color = Color(0.015, 0.008, 0.045, 0.62 if bool(ctx.get("replay", false)) else 0.94)
 	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	overlay.modulate.a   = 0.0
@@ -433,6 +434,11 @@ func open_results(host: Control, ctx: Dictionary) -> void:
 	card.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	card.grow_vertical   = Control.GROW_DIRECTION_BOTH
 	card.custom_minimum_size = Vector2(840 * s, 0)
+	# With the replay behind it, the card stands to the right and leaves the left
+	# of the screen to the moment playing back (ReplayMoments frames him there).
+	if bool(ctx.get("replay", false)):
+		card.offset_left += 250.0 * s
+		card.offset_right += 250.0 * s
 	card.modulate.a = 0.0
 	hud_root.add_child(card)
 
@@ -495,7 +501,13 @@ func open_results(host: Control, ctx: Dictionary) -> void:
 		gtw.tween_property(grade_lbl, "modulate", Color(1.0, 1.0, 1.0), 0.60)
 
 	# Record line
-	if is_new_hs:
+	var practice: bool = bool(result.get("practice", false))
+	if practice:
+		var pr_lbl: Label = UiStyle.label("PRACTICE  ·  NOTHING SAVED", UiStyle.caption(5.0), int(14 * s), Color.WHITE)
+		pr_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		pr_lbl.self_modulate = UiStyle.CYAN
+		vbox.add_child(pr_lbl)
+	elif is_new_hs:
 		var hs_lbl: Label = UiStyle.label("\u2605  NEW HIGH SCORE  \u2605", UiStyle.caption(5.0), int(17 * s), Color.WHITE)
 		hs_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		hs_lbl.self_modulate = Color(1.00, 0.38, 0.68)
@@ -541,6 +553,30 @@ func open_results(host: Control, ctx: Dictionary) -> void:
 		col.add_child(key)
 		stat_row.add_child(col)
 
+	# Timing grades and the per-section breakdown.
+	var timing: PackedInt32Array = result.get("timing", PackedInt32Array()) as PackedInt32Array
+	if timing.size() == 3 and timing[0] + timing[1] + timing[2] > 0:
+		var trow := HBoxContainer.new()
+		trow.alignment = BoxContainer.ALIGNMENT_CENTER
+		trow.add_theme_constant_override("separation", int(34 * s))
+		trow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		vbox.add_child(trow)
+		var tcols: Array[Color] = [Color(0.55, 1.0, 1.0), Color(0.55, 1.0, 0.55), Color(1.0, 0.82, 0.45)]
+		var tnames: PackedStringArray = ["PERFECT", "GREAT", "GOOD"]
+		for k in 3:
+			var tl: Label = UiStyle.label("%s  %d" % [tnames[k], timing[k]], UiStyle.display(700), int(15 * s), Color.WHITE)
+			tl.self_modulate = tcols[k]
+			trow.add_child(tl)
+	var sections: Array = result.get("sections", []) as Array
+	if not sections.is_empty():
+		var srow := HBoxContainer.new()
+		srow.alignment = BoxContainer.ALIGNMENT_CENTER
+		srow.add_theme_constant_override("separation", int(10 * s))
+		srow.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		vbox.add_child(srow)
+		for sec in sections:
+			srow.add_child(_section_card(sec as Dictionary, s))
+
 	vbox.add_child(_rule(s))
 
 	# Navigation
@@ -585,6 +621,50 @@ func open_results(host: Control, ctx: Dictionary) -> void:
 
 ## Thin signature-band rule. Replaces HSeparator, whose theme colour is one flat
 ## line with no way to carry the palette.
+
+
+## One section of the results breakdown: name, letter, percentage, what it
+## counted, and a NEW BEST star when it beat this song's best for the section.
+func _section_card(sec: Dictionary, s: float) -> Control:
+	var letter: String = String(sec.get("letter", "F"))
+	var col: Color
+	match letter:
+		"S": col = Color(1.00, 0.88, 0.20)
+		"A": col = Color(0.30, 0.90, 1.00)
+		"B": col = Color(0.35, 1.00, 0.50)
+		"C": col = Color(1.00, 0.85, 0.25)
+		"D": col = Color(1.00, 0.55, 0.20)
+		_:   col = Color(1.00, 0.30, 0.30)
+	var card := PlatePanel.create(int(8 * s), col, 12.0 * s)
+	card.custom_minimum_size = Vector2(148 * s, 0)
+	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var box := VBoxContainer.new()
+	box.add_theme_constant_override("separation", 0)
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	card.content.add_child(box)
+	var nm: Label = UiStyle.label(String(sec.get("name", "")), UiStyle.caption(2.5), int(10 * s), Color.WHITE)
+	nm.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	nm.self_modulate = Color(0.70, 0.64, 0.88)
+	box.add_child(nm)
+	var lt: Label = UiStyle.label("%s  %d%%" % [letter, roundi(float(sec.get("pct", 0.0)) * 100.0)],
+		UiStyle.display(900), int(26 * s), Color.WHITE)
+	lt.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lt.self_modulate = col
+	box.add_child(lt)
+	var dt: Label = UiStyle.label(String(sec.get("detail", "")), UiStyle.caption(2.0), int(10 * s), Color.WHITE)
+	dt.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	dt.self_modulate = Color(0.62, 0.57, 0.80, 0.9)
+	box.add_child(dt)
+	var nb: bool = bool(sec.get("new_best", false))
+	var best_v: float = float(sec.get("best", -1.0))
+	if not nb and best_v < 0.0:
+		return card   # never played before and nothing saved this time: no best line
+	var bl: Label = UiStyle.label("★ NEW BEST" if nb else "BEST %d%%" % roundi(float(sec.get("best", 0.0)) * 100.0),
+		UiStyle.caption(2.5), int(10 * s), Color.WHITE)
+	bl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	bl.self_modulate = Color(1.00, 0.45, 0.75) if nb else Color(0.50, 0.46, 0.66, 0.8)
+	box.add_child(bl)
+	return card
 
 
 func _light_results() -> void:

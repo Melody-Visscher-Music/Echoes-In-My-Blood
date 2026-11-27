@@ -250,6 +250,17 @@ func save_high_score(song_key: String, score: int, combo: int) -> bool:
 	return record
 
 
+## Best 0..1 result for one results-screen section (gates, grind, climb,
+## charge, smash) on one song; -1 when it has never been played.
+func get_section_best(song_key: String, section: String) -> float:
+	return float(_cfg.get_value(P_SCORE + song_key, "sec_" + section, -1.0))
+
+
+func set_section_best(song_key: String, section: String, pct: float) -> void:
+	_cfg.set_value(P_SCORE + song_key, "sec_" + section, clampf(pct, 0.0, 1.0))
+	_write()
+
+
 ## True if any song has a record. Gates the first-launch tutorial: once a record
 ## exists the player has played before.
 func has_any_high_score() -> bool:

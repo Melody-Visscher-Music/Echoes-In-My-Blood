@@ -34,6 +34,9 @@ var color_cycle_affects_rail:    bool  = true   # grind-rail gameplay hazard
 
 # ── Gameplay ───────────────────────────────────────────────────────────────────
 var wall_jumps_enabled:  bool  = true
+## Gamepad rumble on the beat, hits, catches, smash impacts and the overdrive
+## drop. Has no effect without a controller.
+var controller_rumble:   bool  = true
 var lives_per_song:      int   = 3
 
 ## Laser fixtures in the trackside rig. -1 means AUTO: follow the graphics
@@ -92,6 +95,15 @@ const REDUCED_FLASH_SCALE: float = 0.22
 
 func flash_scale() -> float:
 	return REDUCED_FLASH_SCALE if reduced_flashing else 1.0
+
+
+## Rumble every connected gamepad. weak = the high-frequency motor, strong = the
+## low thump (0..1 each). Does nothing when the option is off or no pad is in.
+func rumble(weak: float, strong: float, duration: float) -> void:
+	if not controller_rumble:
+		return
+	for dev: int in Input.get_connected_joypads():
+		Input.start_joy_vibration(dev, clampf(weak, 0.0, 1.0), clampf(strong, 0.0, 1.0), duration)
 var max_fps:       int   = 120     # 0 = unlimited
 
 
@@ -458,6 +470,7 @@ func save() -> void:
 	cfg.set_value("level",      "cycle_affects_world",      color_cycle_affects_world)
 	cfg.set_value("level",      "cycle_affects_rail",       color_cycle_affects_rail)
 	cfg.set_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
+	cfg.set_value("gameplay",   "controller_rumble",    controller_rumble)
 	cfg.set_value("gameplay",   "lives_per_song",       lives_per_song)
 	cfg.set_value("display",    "laser_count",          laser_count)
 	cfg.set_value("display",    "fullscreen",           fullscreen)
@@ -505,6 +518,7 @@ func load_from_disk() -> void:
 	color_cycle_affects_world    = cfg.get_value("level", "cycle_affects_world",      color_cycle_affects_world)
 	color_cycle_affects_rail     = cfg.get_value("level", "cycle_affects_rail",       color_cycle_affects_rail)
 	wall_jumps_enabled  = cfg.get_value("gameplay",   "wall_jumps",           wall_jumps_enabled)
+	controller_rumble   = bool(cfg.get_value("gameplay", "controller_rumble", controller_rumble))
 	lives_per_song      = cfg.get_value("gameplay",   "lives_per_song",       lives_per_song)
 	advanced_lighting   = bool(cfg.get_value("display", "advanced_lighting", advanced_lighting))
 	fullscreen          = bool(cfg.get_value("display", "fullscreen", fullscreen))
@@ -544,6 +558,7 @@ func reset_defaults() -> void:
 	color_cycle_affects_world    = true
 	color_cycle_affects_rail     = true
 	wall_jumps_enabled  = true
+	controller_rumble   = true
 	lives_per_song      = 3
 	laser_count         = LASER_COUNT_AUTO
 	advanced_lighting   = false

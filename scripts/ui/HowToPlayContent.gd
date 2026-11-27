@@ -83,14 +83,22 @@ static func build(vbox: VBoxContainer, s: float, section: Callable, row: Callabl
 
 	g = _group(vbox, s, section, "SCORING & HEALTH")
 	row.call(g, "Gate hit",             "+500 pts × multiplier  (+1,000 in electric zones)", s)
+	row.call(g, "Timing",               "PERFECT +50 %  ·  GREAT +20 %  ·  GOOD  —  be at the top of your jump, "
+		+ "mid-slide or in the lane right as the beat hits", s)
 	row.call(g, "Multiplier",           "+1 every 10 combo, up to ×20  ·  ×2 on a wall-jump climb  ·  "
 		+ "×100 in OVERDRIVE", s)
 	row.call(g, "Health",               "Starts at 25 %  ·  +5 % per gate (not in zones)  ·  –10 % per miss (–7.5 % in "
 		+ "zones)  ·  0 % = wipe", s)
+	row.call(g, "FEVER",                "PERFECTs fill the FEVER meter (a miss halves it)  ·  when it's full: "
+		+ "7 seconds of ×2 score and golden gates", s)
+	row.call(g, "Shields",              "Pick up the floating hex before a hard stretch  ·  it takes one miss: "
+		+ "combo and health survive  ·  hold up to 2", s)
 	row.call(g, "Near miss",            "+50 pts when you only just missed", s)
 	row.call(g, "Lives",                "%d per song — when they're gone, a new layout is rolled"
 		% GameConfig.lives_per_song, s)
 	row.call(g, "Letter grade",         "S = no misses  ·  A 90 %+  ·  B 75 %+  ·  C 60 %+  ·  then D and F", s)
+	row.call(g, "Results",              "Each section — gates, rails, wall jumps, charge, smash — gets its own "
+		+ "grade and remembers your best  ·  your best moment replays behind it", s)
 
 	g = _group(vbox, s, section, "MODES")
 	row.call(g, "Story Mode", "Travel the city map — clearing a level reveals the next rift", s)
@@ -98,6 +106,8 @@ static func build(vbox: VBoxContainer, s: float, section: Callable, row: Callabl
 	row.call(g, "Tutorial",   "A fixed, hand-made layout — learn the mechanics", s)
 	row.call(g, "Seeded",     "The same gate layout every time for a song", s)
 	row.call(g, "Random",     "A fresh layout every attempt", s)
+	row.call(g, "Practice",   "P / Y in the song list  ·  pick a part, slow it down, loop it  ·  "
+		+ "nothing is saved and you can't fail", s)
 
 
 static func _group(vbox: VBoxContainer, s: float, section: Callable, title: String) -> VBoxContainer:

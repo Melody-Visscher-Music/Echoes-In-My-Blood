@@ -85,6 +85,7 @@ ui_accept={
 [physics]
 
 3d/run_on_separate_thread=true
+common/max_physics_steps_per_frame=16
 2d/physics_engine="GodotPhysics2D"
 
 [rendering]

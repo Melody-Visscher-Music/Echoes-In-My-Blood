@@ -84,6 +84,7 @@ var _bar_k: float = 0.0
 var _scrape: AudioStreamPlayer = null
 var _chime: AudioStreamPlayer = null
 var _clank: AudioStreamPlayer = null
+var _last_mult: int = 1   # flow level seen at the last catch, for the level-up flares
 const SR: int = 22050
 
 
@@ -117,6 +118,19 @@ func on_rail_spawn(start_pd: float, end_pd: float) -> void:
 
 
 func on_catch(pos: Vector3, mult: int) -> void:
+	GameConfig.rumble(0.3, 0.0, 0.05)
+	# The flow levelling up: a flare off the rail — a warm punch of the view,
+	# a few arcs of light leaping off the spark, a quick dome and a shimmer
+	# that climbs with each level.
+	if mult > _last_mult and mult >= 2:
+		var col: Color = GameConfig.level_color_rail.lerp(RAIL_COL_HOT, clampf(float(mult - 1) / 7.0, 0.0, 1.0))
+		var fx: ImpactFx = ImpactFx.for_section(section)
+		fx.frame(ImpactFx.STYLE_GLOW, col, 0.35 + 0.06 * float(mult), 0.3)
+		fx.bolts(pos, col, 6, 3.0 + 0.3 * float(mult), 0.3)
+		fx.dome(pos, col, 2.5 + 0.4 * float(mult), 0.35)
+		fx.shimmer(lerpf(0.9, 1.6, clampf(float(mult - 2) / 6.0, 0.0, 1.0)))
+		GameConfig.rumble(0.4, 0.3, 0.12)
+	_last_mult = mult
 	_spawn_ring(pos, mult)
 	_kick = 1.0
 	if _chime != null:
@@ -128,6 +142,7 @@ func on_catch(pos: Vector3, mult: int) -> void:
 
 
 func on_drop() -> void:
+	_last_mult = 1
 	_flicker = 0.55
 	_jolt = 1.0
 	if _sparks != null:
@@ -145,6 +160,28 @@ func on_rail_end(perfect: bool) -> void:
 	if perfect and _player != null:
 		_fireworks(_player.global_position + Vector3(0.0, 1.0, 0.0))
 		_kick = 1.6
+		# The finale: every spark caught. Gold everywhere — the view blooms,
+		# lightning leaps off him, a column of light goes up from the end of
+		# the rail, a dome swells and the sub-boom lands under the fanfare.
+		var gold := Color(1.0, 0.82, 0.3)
+		var p: Vector3 = _player.global_position + Vector3(0.0, 1.0, 0.0)
+		var fx: ImpactFx = ImpactFx.for_section(section)
+		fx.frame(ImpactFx.STYLE_GLOW, gold, 0.75, 0.55)
+		fx.bolts(p, gold, 10, 7.0, 0.45)
+		fx.pillar(_player.global_position, gold, 40.0, 0.9)
+		fx.dome(p, gold, 9.0, 0.6)
+		fx.flash(p, gold, 9.0, 0.5)
+		fx.boom(1.25)
+		fx.shimmer(1.8)
+		GameConfig.rumble(0.7, 0.9, 0.45)
+	elif _player != null and _last_mult > 1:
+		# Off the end with a flow going: a smaller send-off.
+		var c2: Color = GameConfig.level_color_rail
+		var fx2: ImpactFx = ImpactFx.for_section(section)
+		fx2.dome(_player.global_position + Vector3(0.0, 1.0, 0.0), c2, 5.0, 0.45)
+		fx2.flash(_player.global_position + Vector3(0.0, 1.0, 0.0), c2, 10.0, 0.4)
+		fx2.shimmer(1.2)
+	_last_mult = 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -186,7 +223,8 @@ func update(t_s: float, delta: float) -> void:
 	if _flicker > 0.0:
 		_flicker = maxf(0.0, _flicker - delta)
 		var n: float = fposmod(sin(floorf(_t * 30.0) * 12.9898) * 43758.5453, 1.0)
-		boost = 0.08 if n < 0.55 else 0.6
+		# Reduced flashing: the rail dims instead of stuttering.
+		boost = (0.08 if n < 0.55 else 0.6) if not GameConfig.reduced_flashing else 0.3
 	section.set("_grind_rail_boost", boost)
 	var rmats: Array = section.get("_grind_rail_mats")
 	for m: Material in rmats:
@@ -202,7 +240,18 @@ func update(t_s: float, delta: float) -> void:
 
 
 func _on_mount() -> void:
-	_kick = 1.2
+	GameConfig.rumble(0.45, 0.7, 0.2)
+	_kick = 1.4
+	_last_mult = 1
+	# The slam onto the rail: a warm punch, light off his feet, a dome of
+	# sparks' light and the clank — he has arrived on it.
+	var col: Color = GameConfig.level_color_rail
+	var feet: Vector3 = _player.global_position + Vector3(0.0, 0.2, 0.0)
+	var fx: ImpactFx = ImpactFx.for_section(section)
+	fx.frame(ImpactFx.STYLE_GLOW, col, 0.55, 0.32)
+	fx.flash(feet, col, 6.0, 0.3)
+	fx.dome(feet, col, 3.5, 0.35)
+	fx.bolts(feet, col.lerp(Color.WHITE, 0.4), 6, 2.5, 0.25)
 	if _clank != null:
 		_clank.pitch_scale = 1.0
 		_clank.play()

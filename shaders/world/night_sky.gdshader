@@ -30,6 +30,10 @@ uniform float star_scale    = 92.0;
 uniform float star_cut      : hint_range(0.90, 0.999) = 0.978;
 uniform float beat          : hint_range(0.0, 1.0) = 0.0;
 uniform int   detail        : hint_range(0, 2) = 2;
+// Time of day (SkyClock): a sun disc with a wide halo. Off at night.
+uniform vec3  sun_dir    = vec3(0.0, 0.3, -1.0);
+uniform vec3  sun_col    : source_color = vec3(1.0, 0.8, 0.6);
+uniform float sun_amount : hint_range(0.0, 2.0) = 0.0;
 
 float hash13(vec3 p) {
 	p = fract(p * 0.1031);
@@ -76,6 +80,15 @@ void sky() {
 			col += star_col * star * pow(mag, 2.0) * 1.7 * tw
 				 * smoothstep(0.0, 0.26, h) * star_amount;
 		}
+	}
+
+	// ── sun ─────────────────────────────────────────────────────────────────
+	if (sun_amount > 0.001) {
+		float sd = max(dot(dir, normalize(sun_dir)), 0.0);
+		// A crisp disc and a tight halo — a broad one bloomed the whole sky
+		// white whenever the track turned toward the sun.
+		col += sun_col * (smoothstep(0.9993, 0.9997, sd) * 1.6
+			+ pow(sd, 60.0) * 0.30 + pow(sd, 12.0) * 0.06) * sun_amount;
 	}
 
 	COLOR = col;

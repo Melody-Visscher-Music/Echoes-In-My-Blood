@@ -96,6 +96,22 @@ var _board_side: float = 1.0
 var _glitch: ColorRect = null
 var _glitch_mat: ShaderMaterial = null
 var _glitch_t: float = 0.0
+var _short: ElecShortOut = null
+var _tells: GateTells = null
+
+# footprints
+const STEP_POOL: int = 18
+const STEP_LIFE: float = 0.75
+var _steps: Array[Dictionary] = []     # {node, mat, t}
+var _step_i: int = 0
+var _feet: Array[Dictionary] = []      # {bone, low, up}
+var _step_col: Color = Color(0.6, 0.9, 1.0)
+var _skel: Skeleton3D = null
+
+# speed ramp
+var _speed_k: float = 0.0
+var _blur: ColorRect = null
+var _blur_mat: ShaderMaterial = null
 const GLITCH_S: float = 0.32
 
 
@@ -113,6 +129,13 @@ func setup(p_section: Node) -> void:
 	_build_jump_fx()
 	_build_sky()
 	_build_beams()
+	_build_steps()
+	_tells = GateTells.new()
+	add_child(_tells)
+	_tells.setup(section)
+	_short = ElecShortOut.new()
+	add_child(_short)
+	_short.setup(section, player, world)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,10 +154,18 @@ func on_gate(idx: int, success: bool, col: Color) -> void:
 	# A pass leaves the gate standing (the section already turns it green). A
 	# miss breaks it — he went straight through it — with the screen glitch.
 	if success:
+		_step_col = col.lerp(Color.WHITE, 0.15)
 		return
-	if not bool(section.call("_is_electric_at", float(section.call("_song_time")))):
+	# Same test the section uses for the miss's damage and zap, so a gate right
+	# on the edge of a zone never shocks him and also breaks like a city gate.
+	var live: bool = bool(section.call("_is_electric_at", float(section.call("_song_time"))))
+	if not live:
 		_start_glitch()
 	if action in GATE_KINDS and gate != null and is_instance_valid(gate):
+		# A live gate does not break, it shorts out — into him.
+		if live:
+			_short.fire(gate, idx)
+			return
 		_shatter(gate, col)
 		var vis: Node3D = gate.get_node_or_null("VisRoot") as Node3D
 		if vis != null:
@@ -191,6 +222,10 @@ func update(t_s: float, delta: float) -> void:
 	_update_sky(t_s, delta, pd, beat)
 	_update_trackside(t_s, delta, pd, beat)
 	_update_glitch(delta)
+	_short.update(delta)
+	_update_steps(delta)
+	_tells.update(t_s)
+	_update_speed(delta, mult)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -299,8 +334,21 @@ func _update_gates(t_s: float, pd: float, beat: float) -> void:
 		var action: String = String(acts[i]) if i < acts.size() else ""
 		if not action in GATE_KINDS:
 			continue
-		gate.scale = Vector3.ONE * (1.0 + 0.045 * b2)
+		# Reduced flashing: no breathing and no early flash on the gates — they
+		# are the biggest things on screen and pass on every beat.
+		if GameConfig.reduced_flashing:
+			continue
+		# The beat breath, and the bigger one a hard run draws (GateTells).
+		var inh: float = _tells.inhale(i, t_s)
+		gate.scale = Vector3.ONE * (1.0 + 0.045 * b2) * inh
 		_breathed[i] = true
+		if inh > 1.002 and i < mats_all.size() and not _locked.has(i):
+			for m2: Material in (mats_all[i] as Array):
+				if m2 == null:
+					continue
+				if not m2.has_meta("flair_e"):
+					m2.set_meta("flair_e", NeonMat.get_energy(m2))
+				NeonMat.set_energy(m2, float(m2.get_meta("flair_e")) * _tells.glow(i, t_s))
 		# One beat before it arrives: a bright flash, once — "here it comes".
 		if not _locked.has(i) and i < plan.size():
 			var dt: float = float(plan[i].get("t", 0.0)) - t_s
@@ -615,6 +663,25 @@ func _build_sky() -> void:
 	disc.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	disc.set_meta("no_cycle", true)
 	_moon.add_child(disc)
+	# A solid core inside the glow. The glow and the ring are both see-through
+	# and neither writes depth, so the ring's far half used to show straight
+	# through the moon. This hides the arc that passes behind the disc; the glow
+	# is drawn over it, so the moon itself looks the same.
+	var core := MeshInstance3D.new()
+	var cm := SphereMesh.new()
+	cm.radius = 23.5
+	cm.height = 47.0
+	cm.radial_segments = 32
+	cm.rings = 16
+	core.mesh = cm
+	var core_mat := StandardMaterial3D.new()
+	core_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	core_mat.albedo_color = Color(0.30, 0.12, 0.26)
+	core_mat.disable_fog = true
+	core.material_override = core_mat
+	core.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	core.set_meta("no_cycle", true)
+	_moon.add_child(core)
 	_moon_ring = MeshInstance3D.new()
 	var tm := TorusMesh.new()
 	tm.inner_radius = 36.0
@@ -1008,13 +1075,14 @@ shader_type canvas_item;
 uniform sampler2D screen_tex : hint_screen_texture, filter_linear;
 uniform float amount = 0.0;
 uniform float seed = 0.0;
+uniform float tear = 1.0;   // 0 under reduced flashing: no bands, no fringing
 float h(float n) { return fract(sin(n) * 43758.5453); }
 void fragment() {
 	vec2 uv = SCREEN_UV;
 	float band = floor(uv.y * 26.0 + seed * 7.0);
 	float r = h(band * 1.37 + seed);
-	float shift = (r > 0.62 ? (r - 0.62) * 0.09 : 0.0) * amount * (h(band + 3.1) > 0.5 ? 1.0 : -1.0);
-	float ca = 0.005 * amount;
+	float shift = (r > 0.62 ? (r - 0.62) * 0.09 : 0.0) * amount * tear * (h(band + 3.1) > 0.5 ? 1.0 : -1.0);
+	float ca = 0.005 * amount * tear;
 	vec2 o = vec2(shift, 0.0);
 	vec3 c = vec3(texture(screen_tex, uv + o + vec2(ca, 0.0)).r,
 		texture(screen_tex, uv + o).g,
@@ -1061,10 +1129,198 @@ func _update_glitch(delta: float) -> void:
 	_glitch_t = maxf(0.0, _glitch_t - delta)
 	var k: float = _glitch_t / GLITCH_S
 	_glitch.visible = true
-	_glitch_mat.set_shader_parameter("amount", k * k * _flash)
+	# Reduced flashing: a gentle colour drain only — no tearing, no flicker.
+	var calm: bool = GameConfig.reduced_flashing
+	_glitch_mat.set_shader_parameter("tear", 0.0 if calm else 1.0)
+	_glitch_mat.set_shader_parameter("amount", k * (0.45 if calm else k))
 	# Re-roll the tear a few times across its life.
-	if fposmod(_t, 0.06) < delta:
+	if not calm and fposmod(_t, 0.06) < delta:
 		_glitch_mat.set_shader_parameter("seed", randf() * 100.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Footprints — a glowing paw print where each foot lands, in the colour of the
+#  last gate he cleared, so his rhythm is left on the track behind him.
+# ══════════════════════════════════════════════════════════════════════════════
+
+func _build_steps() -> void:
+	var qm := QuadMesh.new()
+	qm.size = Vector2(0.26, 0.30)
+	qm.orientation = PlaneMesh.FACE_Y
+	var tex: ImageTexture = _paw_tex()
+	for k in STEP_POOL:
+		var m := StandardMaterial3D.new()
+		m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+		m.blend_mode = BaseMaterial3D.BLEND_MODE_ADD
+		m.albedo_texture = tex
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		m.depth_draw_mode = BaseMaterial3D.DEPTH_DRAW_DISABLED
+		var n := MeshInstance3D.new()
+		n.mesh = qm
+		n.material_override = m
+		n.set_meta("no_cycle", true)
+		n.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		n.visible = false
+		world.add_child(n)
+		_steps.append({"node": n, "mat": m, "t": -1.0})
+	_skel = player.get("_char_skeleton") as Skeleton3D
+	if _skel != null:
+		for bn: String in ["foot.L", "foot.R"]:
+			var b: int = _skel.find_bone(bn)
+			if b >= 0:
+				_feet.append({"bone": b, "low": INF, "up": true})
+
+
+func _update_steps(delta: float) -> void:
+	for st: Dictionary in _steps:
+		var t: float = float(st["t"])
+		if t < 0.0:
+			continue
+		t += delta
+		st["t"] = t
+		var node: MeshInstance3D = st["node"]
+		if t >= STEP_LIFE:
+			st["t"] = -1.0
+			node.visible = false
+			continue
+		var k: float = t / STEP_LIFE
+		var c: Color = (st["col"] as Color)
+		c.a = (1.0 - k) * (1.0 - k) * 0.9 * _lit_floor()
+		(st["mat"] as StandardMaterial3D).albedo_color = c
+	if _skel == null or _feet.is_empty():
+		return
+	var on_floor: bool = bool(player.call("is_on_floor"))
+	var busy: bool = bool(player.call("is_grinding")) or bool(player.call("is_charge_sliding")) 		or bool(player.call("is_sliding"))
+	var py: float = player.global_position.y
+	for f: Dictionary in _feet:
+		var gp: Vector3 = (_skel.global_transform * _skel.get_bone_global_pose(int(f["bone"]))).origin
+		var h: float = gp.y - py
+		# The lowest this foot gets, tracked slowly, is where it is planted.
+		f["low"] = minf(float(f["low"]) + delta * 0.05, h)
+		var low: float = float(f["low"])
+		if h > low + 0.10:
+			f["up"] = true
+		elif bool(f["up"]) and h < low + 0.035:
+			f["up"] = false
+			if on_floor and not busy:
+				_plant(gp)
+
+
+func _plant(foot: Vector3) -> void:
+	var st: Dictionary = _steps[_step_i]
+	_step_i = (_step_i + 1) % _steps.size()
+	var node: MeshInstance3D = st["node"]
+	var floor_y: float = player.global_position.y
+	for i in player.get_slide_collision_count():
+		var c: KinematicCollision3D = player.get_slide_collision(i)
+		if c.get_normal().y > 0.7:
+			floor_y = c.get_position().y
+			break
+	node.global_position = Vector3(foot.x, floor_y + 0.02, foot.z)
+	var fwd: Vector3 = player.get("_visual_fwd")
+	# + PI: the texture's toes are at its top edge, which a FACE_Y quad lays
+	# down pointing backwards along this yaw.
+	node.rotation = Vector3(0.0, atan2(fwd.x, fwd.z) + PI, 0.0)
+	node.visible = true
+	st["t"] = 0.0
+	st["col"] = _step_col
+
+
+## The prints dim with the blackout but never vanish: they are his.
+func _lit_floor() -> float:
+	return lerpf(0.55, 1.0, _lit)
+
+
+static var _paw: ImageTexture = null
+static func _paw_tex() -> ImageTexture:
+	if _paw != null:
+		return _paw
+	var w: int = 48
+	var img := Image.create(w, w, false, Image.FORMAT_RGBA8)
+	var pads: Array = [[Vector2(0.0, 0.25), 0.36, 0.30],   # main pad
+		[Vector2(-0.48, -0.22), 0.15, 0.17], [Vector2(-0.17, -0.48), 0.15, 0.17],
+		[Vector2(0.17, -0.48), 0.15, 0.17], [Vector2(0.48, -0.22), 0.15, 0.17]]
+	for y in w:
+		for x in w:
+			var u: float = (float(x) + 0.5) / float(w) * 2.0 - 1.0
+			var v: float = (float(y) + 0.5) / float(w) * 2.0 - 1.0
+			var a: float = 0.0
+			for pd: Array in pads:
+				var c: Vector2 = pd[0]
+				var d: float = Vector2((u - c.x) / float(pd[1]), (v - c.y) / float(pd[2])).length()
+				a = maxf(a, clampf((1.0 - d) * 3.0, 0.0, 1.0))
+			img.set_pixel(x, y, Color(1, 1, 1, a))
+	_paw = ImageTexture.create_from_image(img)
+	return _paw
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Speed ramp — the camera widens and a radial speed blur grows as the combo
+#  multiplier climbs, so ×20 feels faster than ×1. The blur leaves the middle of
+#  the frame alone: that is where the gates are read.
+# ══════════════════════════════════════════════════════════════════════════════
+
+const SPEED_SHADER: String = """
+shader_type canvas_item;
+uniform sampler2D screen_tex : hint_screen_texture, filter_linear;
+uniform float amount = 0.0;
+uniform vec2 centre = vec2(0.5, 0.45);
+void fragment() {
+	vec2 uv = SCREEN_UV;
+	vec2 d = uv - centre;
+	float r = length(d * vec2(1.6, 1.0));
+	float m = smoothstep(0.22, 0.75, r) * amount;
+	vec3 c = vec3(0.0);
+	for (int i = 0; i < 6; i++) {
+		c += texture(screen_tex, uv - d * m * float(i) / 5.0).rgb;
+	}
+	COLOR = vec4(c / 6.0, 1.0);
+}
+"""
+
+
+## The screen-space overlays off for good (the results replay owns the frame).
+func hide_overlays() -> void:
+	_overlays_off = true
+	for c: CanvasItem in [_blur, _glitch]:
+		if c != null:
+			c.visible = false
+
+
+var _overlays_off: bool = false
+
+
+func _update_speed(delta: float, mult: int) -> void:
+	if _overlays_off:
+		return
+	var busy: bool = bool(player.call("is_grinding")) or bool(player.call("is_charge_sliding"))
+	var want: float = 0.0 if busy else clampf(float(mult - 1) / 19.0, 0.0, 1.0)
+	_speed_k = move_toward(_speed_k, want, delta * (0.5 if want > _speed_k else 1.5))
+	var e: float = pow(_speed_k, 0.8)
+	section.set("_speed_fov", 7.0 * e)
+	var amt: float = 0.05 * e * lerpf(0.5, 1.0, _flash)
+	if _blur == null:
+		if amt <= 0.001:
+			return
+		var hud: Object = section.get("_hud")
+		if hud == null:
+			return
+		var root: Control = hud.call("overlay_root") as Control
+		if root == null:
+			return
+		_blur = ColorRect.new()
+		_blur.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_blur.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		var sh := Shader.new()
+		sh.code = SPEED_SHADER
+		_blur_mat = ShaderMaterial.new()
+		_blur_mat.shader = sh
+		_blur.material = _blur_mat
+		root.add_child(_blur)
+		root.move_child(_blur, 0)
+	_blur.visible = amt > 0.001
+	_blur_mat.set_shader_parameter("amount", amt)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

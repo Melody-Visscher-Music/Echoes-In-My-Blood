@@ -33,6 +33,7 @@ var _confirm_panel: Control = null
 
 
 func _ready() -> void:
+	Run.practice = {}   # back at the menu: whatever comes next is a normal run
 	Save.sync_to_run()
 	GameConfig.load_from_disk()
 	# Reaching the main menu ends any story run that was in progress. Without
@@ -682,6 +683,12 @@ func _build_gameplay_panel() -> Control:
 	_opt_section(vbox, "GAMEPLAY", s)
 	_opt_toggle(vbox, "Wall Jumps", GameConfig.wall_jumps_enabled,
 		func(on: bool) -> void: GameConfig.wall_jumps_enabled = on; _mark_dirty(), s)
+	_opt_toggle(vbox, "Controller Rumble", GameConfig.controller_rumble,
+		func(on: bool) -> void:
+			GameConfig.controller_rumble = on
+			if on:
+				GameConfig.rumble(0.5, 0.3, 0.15)   # a taste, so you know it is on
+			_mark_dirty(), s)
 
 	var lives_val := Label.new()
 	lives_val.text = "%d" % GameConfig.lives_per_song

@@ -378,6 +378,9 @@ signal grind_tap_pressed
 ## grind_tap_pressed so the Section can judge the two against their own spark
 ## lists without either handler having to know about the other's state.
 signal descent_tap_pressed
+## A wall-jump launch has just fired ("wall_left" / "wall_right"). Presentation
+## only — WallJumpCinema listens for it.
+signal wall_jumped(action: String)
 
 var _is_grinding:          bool  = false
 var _grind_rail_available: bool  = false   # set each frame by Section_BeatRunner3d
@@ -1211,10 +1214,13 @@ func set_static_charge(amount: float) -> void:
 	if absf(a - _static_charge) < 0.004:
 		return
 	_static_charge = a
-	_set_fur_all(&"length", fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a))
-	_set_fur_all(&"normal_strength", fur_normal_strength * lerpf(1.0, 0.25, a))
-	_set_fur_all(&"static_direction_world", Vector3.UP * a)
-	_set_fur_all(&"scruffiness", fur_scruffiness * lerpf(1.0, _STATIC_SCRUFF_GAIN, a))
+	# A shock in progress owns the coat until it settles, and folds the charge in.
+	if _shock_tw != null and _shock_tw.is_valid() and _shock_tw.is_running():
+		return
+	_set_fur_growth(fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a),
+		fur_normal_strength * lerpf(1.0, 0.25, a),
+		Vector3.UP * a,
+		fur_scruffiness * lerpf(1.0, _STATIC_SCRUFF_GAIN, a))
 
 
 ## How much longer and wilder the coat gets at full charge.
@@ -1235,15 +1241,64 @@ func electrocute() -> void:
 	_shock_tw = create_tween()
 	_shock_tw.tween_method(_apply_shock, 1.0, 0.0, 0.9) \
 		.set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_QUAD)
+	# The jolt: the current goes through him and his whole body seizes and
+	# rattles for a moment. Only the model moves — his body, lane and timing
+	# are untouched, so it costs nothing but the look.
+	if _jolt_tw != null and _jolt_tw.is_valid():
+		_jolt_tw.kill()
+	_jolt_tw = create_tween()
+	_jolt_tw.tween_method(_apply_jolt, 1.0, 0.0, 0.5) \
+		.set_ease(Tween.EASE_IN).set_trans(Tween.TRANS_QUAD)
+
+
+var _jolt_tw: Tween = null
+
+
+func _apply_jolt(s: float) -> void:
+	if _char_model == null or not is_instance_valid(_char_model):
+		return
+	var base: Vector3 = Vector3(0.0, character_y_offset, 0.0)
+	if s <= 0.001:
+		_char_model.position = base
+		_char_model.rotation = Vector3.ZERO
+		_char_model.scale = Vector3.ONE * character_scale
+		return
+	# Rattling, not swaying: a fresh offset every frame, as big as the shock.
+	_char_model.position = base + Vector3(randf_range(-1, 1), randf_range(-0.5, 1), randf_range(-1, 1)) * 0.055 * s
+	_char_model.rotation = Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) \
+		* deg_to_rad(9.0) * s
+	# Stiffened: drawn up a touch, as if every muscle locked at once.
+	_char_model.scale = Vector3(1.0 - 0.04 * s, 1.0 + 0.07 * s, 1.0 - 0.04 * s) * character_scale
 
 
 func _apply_shock(s: float) -> void:
 	var a: float = _static_charge
-	_set_fur_all(&"length",
-		fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a) * lerpf(1.0, _SHOCK_LENGTH_GAIN, s))
-	_set_fur_all(&"scruffiness",
+	_set_fur_growth(
+		fur_length * lerpf(1.0, _STATIC_LENGTH_GAIN, a) * lerpf(1.0, _SHOCK_LENGTH_GAIN, s),
+		fur_normal_strength * lerpf(1.0, 0.25, a),
+		Vector3.UP * clampf(a + s, 0.0, 1.0),
 		fur_scruffiness * lerpf(1.0, _STATIC_SCRUFF_GAIN, a) * lerpf(1.0, _SHOCK_SCRUFF_GAIN, s))
-	_set_fur_all(&"static_direction_world", Vector3.UP * clampf(a + s, 0.0, 1.0))
+
+
+## The animated part of the coat — length, how far it stands off the skin, the
+## direction it stands in, how wild — in one call per fur node. Going through
+## _set_fur_all for these re-sent every shader parameter of every shell for
+## each property, which at 60+ shells a node was enough to drop frames.
+func _set_fur_growth(p_length: float, p_normal: float, p_dir: Vector3, p_scruff: float) -> void:
+	var nodes: Array[Node] = []
+	if _so_fluffy_node and is_instance_valid(_so_fluffy_node):
+		nodes.append(_so_fluffy_node)
+	for _n: Node in _so_fluffy_accent_nodes:
+		if is_instance_valid(_n):
+			nodes.append(_n)
+	for n: Node in nodes:
+		if n.has_method("set_growth"):
+			n.call("set_growth", p_length, p_normal, p_dir, p_scruff)
+		else:
+			n.set(&"length", p_length)
+			n.set(&"normal_strength", p_normal)
+			n.set(&"static_direction_world", p_dir)
+			n.set(&"scruffiness", p_scruff)
 
 
 func _set_fur_all(prop: StringName, val: Variant) -> void:
@@ -1581,6 +1636,7 @@ func _build_character_procedural() -> void:
 ## If the mirroring ever reads backwards in game, swap the two clip names here —
 ## that is the only place the direction is decided.
 func _play_wall_jump(action: String) -> void:
+	wall_jumped.emit(action)
 	if _wall_jump_anim_length <= 0.0:
 		return
 	_wall_jump_clip  = "WallJumpA" if action == "wall_left" else "WallJumpB"

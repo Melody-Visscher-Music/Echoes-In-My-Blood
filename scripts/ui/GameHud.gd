@@ -103,6 +103,13 @@ var _hp_critical:  bool  = false
 
 # Charge / overdrive
 var _charge_group: Control   = null
+# Fever meter + shield pips, under the combo plate.
+var _fever_group: Control   = null
+var _fever_cap:   Label     = null
+var _fever_bar:   ColorRect = null
+var _fever_shield_pips: Array[ColorRect] = []
+var _fever_pct: float = 0.0
+var _fever_on: bool = false
 var _charge_plate: ColorRect = null
 var _charge_cap:   Label     = null
 var _charge_bar:   ColorRect = null
@@ -290,6 +297,7 @@ func _build() -> void:
 	_root.add_child(flash_rect)
 
 	_build_charge()
+	_build_fever()
 	_build_flow()
 	_build_wall_jump()
 	_build_lyrics()
@@ -555,6 +563,69 @@ func _build_charge() -> void:
 	_charge_group.add_child(_charge_pct)
 
 
+func _build_fever() -> void:
+	_fever_group = Control.new()
+	_fever_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_fever_group.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_root.add_child(_fever_group)
+	_fever_cap = UiStyle.label("FEVER", UiStyle.caption(3.0), 11, Color.WHITE)
+	_fever_cap.self_modulate = Color(1.0, 0.85, 0.45, 0.85)
+	_anchor_tl(_fever_cap)
+	_fever_group.add_child(_fever_cap)
+	_fever_bar = _make_bar(6.0, 7.0, 0.0)
+	_fever_bar.material.set_shader_parameter("fill_color",  Color(1.0, 0.55, 0.85))
+	_fever_bar.material.set_shader_parameter("fill_color2", UiStyle.GOLD)
+	_fever_bar.material.set_shader_parameter("edge_color",  UiStyle.GOLD)
+	_fever_bar.material.set_shader_parameter("ghost_color", Color(0, 0, 0, 0))
+	_fever_bar.material.set_shader_parameter("fill_pct", 0.0)
+	_anchor_tl(_fever_bar)
+	_fever_group.add_child(_fever_bar)
+	# Shield pips: little diamonds, lit while held.
+	for k in 2:
+		var pip := ColorRect.new()
+		pip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		pip.color = Color(0.45, 0.95, 1.0, 0.18)
+		pip.rotation_degrees = 45.0
+		_anchor_tl(pip)
+		_fever_group.add_child(pip)
+		_fever_shield_pips.append(pip)
+
+
+## The FEVER meter: filling (pink to gold) from PERFECTs, then draining as a
+## countdown while it runs. `ready` flashes it the moment it fills.
+func set_fever(pct: float, active: bool, _seconds_left: float, ready: float) -> void:
+	if _fever_bar == null:
+		return
+	_fever_pct = clampf(pct, 0.0, 1.0)
+	_fever_on = active
+	var mat := _fever_bar.material as ShaderMaterial
+	mat.set_shader_parameter("fill_pct", _fever_pct)
+	mat.set_shader_parameter("ghost_pct", _fever_pct)
+	var full: Color = UiStyle.GOLD.lerp(Color.WHITE, 0.35 * ready)
+	mat.set_shader_parameter("fill_color", Color(1.0, 0.55, 0.85).lerp(full, _fever_pct if not active else 1.0))
+	_fever_cap.text = "FEVER ×2" if active else ("FEVER READY" if _fever_pct >= 1.0 else "FEVER")
+	_fever_cap.self_modulate = UiStyle.GOLD if active or _fever_pct >= 1.0 		else Color(1.0, 0.85, 0.45, 0.85)
+
+
+## Fades the play readouts (score, combo, health, fever) out or back in — the
+## results replay wants the frame to itself.
+func set_readouts_visible(on: bool) -> void:
+	for c: CanvasItem in [_score_group, _hp_group, _fever_group, _charge_group, _flow_group]:
+		if c == null:
+			continue
+		var tw: Tween = c.create_tween()
+		if on:
+			c.visible = true
+		tw.tween_property(c, "modulate:a", 1.0 if on else 0.0, 0.35)
+		if not on:
+			tw.tween_callback(c.hide)
+
+
+func set_shields(n: int, _max_n: int) -> void:
+	for k in _fever_shield_pips.size():
+		_fever_shield_pips[k].color = Color(0.45, 0.95, 1.0, 0.95 if k < n else 0.18)
+
+
 func _build_flow() -> void:
 	_flow_group = Control.new()
 	_flow_group.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -681,6 +752,14 @@ func _layout() -> void:
 	# The tier strip lives on its own line at the very bottom; it used to run
 	# straight through the baseline of the text above it.
 	_set_rect(_combo_tier,  cx + 16.0 * s, cy + ch - 9.0 * s, cw - 32.0 * s, 4.0 * s)
+
+	# ── Fever + shields, under the combo plate ──────────────────────────────
+	var fvy: float = cy + ch + 8.0 * s
+	_set_rect(_fever_cap, cx + 4.0 * s, fvy, 130.0 * s, 14.0 * s)
+	_set_rect(_fever_bar, cx + 4.0 * s, fvy + 16.0 * s, cw - 56.0 * s, 10.0 * s)
+	for k in _fever_shield_pips.size():
+		var d: float = 11.0 * s
+		_set_rect(_fever_shield_pips[k], cx + cw - 40.0 * s + float(k) * 20.0 * s, fvy + 14.0 * s, d, d)
 
 	# ── Health, top left ─────────────────────────────────────────────────────
 	var bw: float = 300.0 * s
@@ -951,6 +1030,59 @@ func score_bump() -> void:
 	_score_idle_tw = create_tween()
 	_score_idle_tw.tween_interval(_IDLE_FADE_DELAY)
 	_score_idle_tw.tween_property(_score_group, "modulate:a", _IDLE_FADE_ALPHA, 0.5)
+
+
+## Small corner tag while a practice part is running.
+var _practice_tag: Label = null
+
+func set_practice_tag(text: String) -> void:
+	if _root == null:
+		return
+	if _practice_tag == null:
+		_practice_tag = UiStyle.label("", UiStyle.caption(3.0), int(12 * _s), Color.WHITE, int(3 * _s))
+		_practice_tag.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+		_practice_tag.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_practice_tag.self_modulate = UiStyle.CYAN
+		_anchor_tl(_practice_tag)
+		_root.add_child(_practice_tag)
+	var w: float = 520.0 * _s
+	_set_rect(_practice_tag, _vp.x - w - 22.0 * _s, _vp.y - 40.0 * _s, w, 24.0 * _s)
+	_practice_tag.text = text
+	_practice_tag.visible = text != ""
+
+
+## Timing grade for a hit gate (0 PERFECT, 1 GREAT, 2 GOOD): a short word above
+## Meeko that pops and fades. One label, reused — gates come several a second.
+const _JUDGE_TEXT: PackedStringArray = ["PERFECT", "GREAT", "GOOD"]
+const _JUDGE_COL: Array[Color] = [Color(0.55, 1.0, 1.0), Color(0.55, 1.0, 0.55), Color(1.0, 0.82, 0.45)]
+var _judge_lbl: Label = null
+var _judge_tw: Tween = null
+
+func show_judgement(grade: int) -> void:
+	if grade < 0 or grade > 2 or _root == null:
+		return
+	var s: float = _s
+	if _judge_lbl == null:
+		_judge_lbl = UiStyle.label("", UiStyle.display(900, 3.0), int(24 * s), Color.WHITE, int(5 * s))
+		_judge_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		_judge_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_anchor_tl(_judge_lbl)
+		_root.add_child(_judge_lbl)
+	var w: float = 320.0 * s
+	var h: float = 36.0 * s
+	_set_rect(_judge_lbl, (_vp.x - w) * 0.5, _vp.y * 0.36, w, h)
+	_judge_lbl.pivot_offset = Vector2(w * 0.5, h * 0.5)
+	_judge_lbl.text = _JUDGE_TEXT[grade]
+	_judge_lbl.self_modulate = _JUDGE_COL[grade]
+	if _judge_tw != null and _judge_tw.is_valid():
+		_judge_tw.kill()
+	var pop: float = (1.25 if grade == 0 else 1.12) if GameConfig.flash_scale() >= 1.0 else 1.04
+	_judge_lbl.scale = Vector2(pop, pop)
+	_judge_lbl.modulate.a = 1.0
+	_judge_tw = _judge_lbl.create_tween()
+	_judge_tw.tween_property(_judge_lbl, "scale", Vector2.ONE, 0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+	_judge_tw.tween_interval(0.18)
+	_judge_tw.tween_property(_judge_lbl, "modulate:a", 0.0, 0.22)
 
 
 ## Floating "+N" that rises out of the score plate and fades — so a big hit
@@ -1247,7 +1379,8 @@ func show_callout(text: String, col: Color, hold: float = 0.70,
 	if _callout_card != null and is_instance_valid(_callout_card):
 		_callout_card.queue_free()
 	var s: float = _s
-	var i: float = clampf(intensity, 0.0, 1.0)
+	# Reduced flashing calms the big banners too: fewer rings, less shake.
+	var i: float = clampf(intensity * GameConfig.flash_scale(), 0.0, 1.0)
 	_callout_intensity = i
 	_callout_hue       = 0.0
 	_callout_shake     = _CALLOUT_SHAKE_S * i

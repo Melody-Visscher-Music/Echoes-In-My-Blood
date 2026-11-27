@@ -68,6 +68,12 @@ const OVER_HEAL_HP: float = 5.0
 const GRACE_S: float = 0.2
 
 const CRACKS: int = 18
+## How far down the track the wall's body stands from its gate. The wall
+## breaks on the beat (t1), and on the beat his body is right at the gate —
+## with the wall centred there he had already run half a metre into it, plus
+## the reach of his shoulder, before it gave. Standing it this far on puts its
+## front face at his shoulder on the beat: he touches it, and it goes.
+const WALL_SHIFT: float = 1.0
 ## The smash gate's own colour. Like every other gate it goes through the
 ## neon kit, so the colour cycle can still take it over when that is on.
 const TINT: Color = Color(1.0, 0.22, 0.62)
@@ -162,6 +168,7 @@ func setup(p_section: Node, p_rainbow: bool, p_beat_s: float) -> void:
 	# it, not a thump on top of it. The big sound is saved for the crash.
 	_thump = _sfx(_gen_tick(), -21.0)
 	_crash = _sfx(_gen_crash(), -2.0)
+	_boom = _sfx(_gen_boom(), -1.0)
 
 
 ## `target`: the press count set in the manual mapper (0 = recommended).
@@ -261,6 +268,20 @@ func build_visual(vis_root: Node3D, gate_index: int, track_width: float,
 	var lanes: int = maxi(lane_xs.size(), 1)
 	var cell_w: float = track_width / float(lanes)
 	var gap: float = 0.08
+	# Everything that is the wall lives in a body shifted down the track (see
+	# WALL_SHIFT); the runway marks stay on the gate.
+	var gate_root: Node3D = vis_root
+	vis_root = Node3D.new()
+	vis_root.name = "WallBody"
+	vis_root.position.z = WALL_SHIFT
+	# Processing on its own, whatever the gate does. A gate inside an electric
+	# zone starts with its VisRoot DISABLED (Section._build_gate_node) and only
+	# electric gates are switched back on — and a smash that opens a zone has
+	# its impact right on the zone's start, so it counted as inside it. Its
+	# shatter tween never ran: the wall stood there whole and the camera drove
+	# straight through it.
+	vis_root.process_mode = Node.PROCESS_MODE_PAUSABLE
+	gate_root.add_child(vis_root)
 
 	# ── One facade per lane, each with its own neon so the roll can sweep ───
 	var blocks: Array[Node3D] = []
@@ -293,7 +314,7 @@ func build_visual(vis_root: Node3D, gate_index: int, track_width: float,
 	# ── Approach marks: the runway points at the middle, where he goes in ───
 	@warning_ignore("integer_division")
 	var mid_x: float = lane_xs[lanes / 2] if lane_xs.size() > 0 else 0.0
-	pieces.approach_marks(vis_root, mid_x, blocker_w * 0.80, TINT)
+	pieces.approach_marks(gate_root, mid_x, blocker_w * 0.80, TINT)
 
 	# ── Cracks ──────────────────────────────────────────────────────────────
 	# Neon tubes over the front faces, revealed nearest the middle first — the
@@ -351,7 +372,7 @@ func build_visual(vis_root: Node3D, gate_index: int, track_width: float,
 	s["vis"] = {"root": vis_root, "blocks": blocks, "block_mats": block_mats,
 		"kick": PackedFloat32Array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]).slice(0, lanes),
 		"cracks": cracks, "cracks_shown": 0, "crack_mat": crack_mat,
-		"charge": 0.0, "leak": leak, "base_x": vis_root.position.x,
+		"charge": 0.0, "leak": leak, "base_x": vis_root.position.x, "gate_root": gate_root,
 		"height": height, "pieces": pieces}
 
 
@@ -534,6 +555,8 @@ func _hold_player(s: Dictionary, t_s: float, delta: float) -> void:
 
 
 func _on_press(s: Dictionary) -> void:
+	# Rumble builds with the mash.
+	GameConfig.rumble(0.25 + 0.3 * clampf(progress(), 0.0, 1.0), 0.1 * clampf(progress(), 0.0, 1.0), 0.05)
 	if _thump != null:
 		_thump.pitch_scale = lerpf(0.9, 1.4, clampf(progress(), 0.0, 1.3)) * randf_range(0.96, 1.04)
 		_thump.play()
@@ -895,7 +918,7 @@ func _update_aftermath(t_s: float, delta: float) -> void:
 		_punch = maxf(0.0, _punch - delta * 3.2)
 		section.set("_smash_punch", _punch)
 		if _cam != null:
-			var sh: float = _punch * _punch * 0.32 * GameConfig.flash_scale()
+			var sh: float = _punch * _punch * 0.42 * GameConfig.flash_scale()
 			_cam.h_offset = randf_range(-sh, sh)
 			_cam.v_offset = randf_range(-sh, sh)
 
@@ -974,6 +997,17 @@ func _hp_cost(presses: int, target: int, dur: float) -> float:
 	return lerpf(HP_WORST, HP_MET, k)
 
 
+## Practice mode: walls whose window ends before `t` are already behind him.
+## Mark them done without breaking them or touching the score.
+func skip_before(t: float) -> void:
+	for s: Dictionary in _smashes:
+		if float(s["t1"]) < t and int(s["state"]) == 0:
+			s["state"] = 2
+			var vis: Dictionary = s["vis"]
+			if not vis.is_empty() and vis.get("root") != null and is_instance_valid(vis["root"]):
+				(vis["root"] as Node3D).visible = false
+
+
 func _resolve(s: Dictionary) -> void:
 	s["state"] = 2
 	_active = -1
@@ -1021,6 +1055,7 @@ func _resolve(s: Dictionary) -> void:
 ## the wall rain down beside the track and keep tumbling for a few seconds.
 ## The arch stays — the door frame he just came through.
 func _shatter(s: Dictionary, over: float) -> void:
+	GameConfig.rumble(1.0, 1.0, 0.6)
 	var vis: Dictionary = s["vis"]
 	if vis.is_empty():
 		return
@@ -1086,13 +1121,17 @@ func _shatter(s: Dictionary, over: float) -> void:
 	# White frame and camera punch.
 	var hud: Object = section.get("_hud")
 	if hud != null:
-		hud.call("flash", Color(1.0, 1.0, 1.0, 0.55 * flash), 0.28)
-	_punch = 1.0 + 0.3 * over
+		# Softer when the impact frame is playing: the frame is the flash.
+		hud.call("flash", Color(1.0, 1.0, 1.0, 0.2 if flash >= 0.99 else 0.55 * flash), 0.28)
+	_punch = 1.35 + 0.4 * over
 
+	var zs: PackedFloat32Array = section.get("gate_world_zs")
+	var gi: int = int(s["gi"])
 	var v: float = float(section.get("player").get("forward_speed"))
-	var wall_pd: float = float(s["t1"]) * v
+	var wall_pd: float = (zs[gi] if gi < zs.size() else float(s["t1"]) * v) + WALL_SHIFT
 	_launch_shards(pieces, wall_pd, h, debris_col, over)
 	_spawn_wreck(pieces, wall_pd, h, debris_col, over)
+	_impact(pieces, blocks, wall_pd, h, debris_col, over)
 
 	# Shockwave down the track.
 	_shock_pd = wall_pd
@@ -1112,6 +1151,228 @@ func _shatter(s: Dictionary, over: float) -> void:
 		(section.get("world_fx_root") as Node3D).add_child(_shock_ring)
 	NeonMat.set_tint(_shock_mat, debris_col.lightened(0.3))
 	_shock_ring.visible = false
+
+
+## The moment of contact, on top of the facades flying and the shockwave:
+##   * an impact frame — two or three frames of the picture punched to a hard,
+##     inverted, speed-lined still, then a radial blast blur that settles out
+##   * a flash of light at the wall that lights him and the whole street
+##   * a ring of dust and light racing out across the ground from his feet
+##   * the facades blowing apart into chunks that fly, land and tumble
+##   * a fountain of sparks, and a deep boom under the crash
+## Reduced flashing keeps the chunks, the ring and the boom, and drops the
+## impact frame and most of the light.
+func _impact(pieces: GatePieces, blocks: Array, wall_pd: float, h: float, col: Color,
+		over: float) -> void:
+	var flash: float = GameConfig.flash_scale()
+	var world: Node3D = section.get("world_fx_root") as Node3D
+	var fwd: Vector3 = section.call("_path_forward_at", wall_pd)
+	var right: Vector3 = section.call("_path_right_at", wall_pd)
+	var ground: Vector3 = section.call("_path_world_pos", wall_pd, 0.0, 0.0)
+	var hit: Vector3 = ground + Vector3(0.0, h * 0.5, 0.0)
+
+	# Impact frame and blast blur.
+	_impact_overlay(flash)
+
+	# Light.
+	var l := OmniLight3D.new()
+	l.light_color = col.lerp(Color.WHITE, 0.5)
+	l.light_energy = (6.0 + 26.0 * flash) * (1.0 + 0.4 * over)
+	l.omni_range = 26.0
+	world.add_child(l)
+	l.global_position = hit - fwd * 1.5
+	var lt: Tween = l.create_tween()
+	lt.tween_property(l, "light_energy", 0.0, 0.5).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_EXPO)
+	lt.tween_callback(l.queue_free)
+
+	# Ground ring.
+	var tm := TorusMesh.new()
+	tm.inner_radius = 0.92
+	tm.outer_radius = 1.0
+	tm.rings = 48
+	tm.ring_segments = 6
+	var rm: ShaderMaterial = NeonMat.ring(col.lerp(Color.WHITE, 0.35), 0.0)
+	var ring := MeshInstance3D.new()
+	ring.mesh = tm
+	ring.material_override = rm
+	ring.set_meta("no_cycle", true)
+	ring.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	world.add_child(ring)
+	ring.global_position = ground + Vector3(0.0, 0.06, 0.0)
+	var rt: Tween = ring.create_tween()
+	rt.set_parallel(true)
+	rt.tween_method(func(k: float) -> void:
+		var r: float = lerpf(0.6, 14.0, 1.0 - pow(1.0 - k, 3.0))
+		ring.scale = Vector3(r, 1.0, r)
+		NeonMat.set_energy(rm, (1.0 - k) * (7.0 * maxf(flash, 0.35))), 0.0, 1.0, 0.6)
+	rt.chain().tween_callback(ring.queue_free)
+
+	# The facades blowing apart into chunks.
+	for b: Node3D in blocks:
+		var bx: float = b.position.x
+		for k in int(7 + 5 * over):
+			var sz: float = randf_range(0.2, 0.5)
+			var chunk: MeshInstance3D = pieces.box_mesh(
+				Vector3(randf_range(0.3, 0.8), randf_range(0.25, 0.7), randf_range(0.2, 0.45)) * sz * 1.6,
+				TINT.lerp(col, randf()).darkened(randf_range(0.0, 0.35)), NeonMat.PANEL, 3.0)
+			chunk.set_meta("no_cycle", true)
+			chunk.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+			world.add_child(chunk)
+			var start: Vector3 = ground + right * (bx + randf_range(-0.7, 0.7)) \
+				+ Vector3(0.0, randf_range(0.3, h - 0.2), 0.0)
+			chunk.global_position = start
+			chunk.rotation = Vector3(randf() * TAU, randf() * TAU, randf() * TAU)
+			# Clear of the lens, like the facades: the camera comes through this
+			# spot a fifth of a second after the impact, so every chunk is thrown
+			# hard out to the side, and the ones from the middle — right in his
+			# path — are punched down the track faster than he runs as well.
+			var mid: bool = absf(bx) <= 0.3
+			var out: float = signf(bx) if not mid else (-1.0 if k % 2 == 0 else 1.0)
+			var vel: Vector3 = right * out * randf_range(9.0, 16.0) \
+				+ fwd * (randf_range(24.0, 32.0) if mid else randf_range(3.0, 10.0)) \
+				+ Vector3(0.0, randf_range(2.0, 7.0), 0.0)
+			vel *= 1.0 + 0.5 * over
+			_wreck.append({"node": chunk, "vel": vel,
+				"spin": Vector3(randf_range(-12, 12), randf_range(-12, 12), randf_range(-12, 12)),
+				"life": randf_range(2.2, 3.4), "fade": 0.6, "size": 1.0,
+				"floor": ground.y + 0.15 * sz, "bounce": true})
+
+	# Sparks.
+	if _impact_sparks == null:
+		var sm := SphereMesh.new()
+		sm.radius = 0.045
+		sm.height = 0.09
+		sm.radial_segments = 6
+		sm.rings = 3
+		var spm := StandardMaterial3D.new()
+		spm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+		spm.vertex_color_use_as_albedo = true
+		spm.emission_enabled = true
+		spm.emission = Color(1.0, 0.85, 0.7)
+		spm.emission_energy_multiplier = 6.0
+		sm.material = spm
+		_impact_sparks = CPUParticles3D.new()
+		_impact_sparks.one_shot = true
+		_impact_sparks.emitting = false
+		_impact_sparks.amount = 140
+		_impact_sparks.lifetime = 0.9
+		_impact_sparks.explosiveness = 0.95
+		_impact_sparks.local_coords = false
+		_impact_sparks.mesh = sm
+		_impact_sparks.emission_shape = CPUParticles3D.EMISSION_SHAPE_SPHERE
+		_impact_sparks.emission_sphere_radius = 0.6
+		_impact_sparks.spread = 75.0
+		_impact_sparks.initial_velocity_min = 6.0
+		_impact_sparks.initial_velocity_max = 18.0
+		_impact_sparks.gravity = Vector3(0, -14, 0)
+		_impact_sparks.damping_min = 1.0
+		_impact_sparks.damping_max = 3.0
+		var shrink := Curve.new()
+		shrink.add_point(Vector2(0, 1))
+		shrink.add_point(Vector2(1, 0))
+		_impact_sparks.scale_amount_curve = shrink
+		_impact_sparks.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		world.add_child(_impact_sparks)
+	var grad := Gradient.new()
+	grad.set_color(0, Color(1, 1, 1))
+	grad.set_color(1, col.lerp(TINT, 0.5))
+	_impact_sparks.color_ramp = grad
+	_impact_sparks.global_position = hit
+	_impact_sparks.global_basis = Basis.looking_at(fwd, Vector3.UP)
+	_impact_sparks.direction = Vector3(0, 0.35, -1)   # forward, along the track
+	_impact_sparks.restart()
+	_impact_sparks.emitting = true
+
+	if _boom != null:
+		_boom.play()
+
+
+var _impact_sparks: CPUParticles3D = null
+var _boom: AudioStreamPlayer = null
+var _imp_rect: ColorRect = null
+var _imp_mat: ShaderMaterial = null
+
+const IMPACT_SHADER: String = """
+shader_type canvas_item;
+uniform sampler2D screen_tex : hint_screen_texture, filter_linear;
+uniform float frame_k = 0.0;   // 1 for the impact frame itself
+uniform float blur = 0.0;      // the blast blur after it
+uniform vec2 centre = vec2(0.5, 0.48);
+uniform vec4 tint : source_color = vec4(1.0, 0.3, 0.7, 1.0);
+float h(float n) { return fract(sin(n) * 43758.5453); }
+void fragment() {
+	vec2 uv = SCREEN_UV;
+	vec2 d = uv - centre;
+	vec3 c = vec3(0.0);
+	for (int i = 0; i < 8; i++) {
+		c += texture(screen_tex, uv - d * blur * float(i) / 7.0).rgb;
+	}
+	c /= 8.0;
+	if (frame_k > 0.0) {
+		// The still: luminance pushed hard, inverted, with speed lines.
+		float l = dot(c, vec3(0.299, 0.587, 0.114));
+		// Only the hottest neon goes to ink, so he stays a pale shape on it.
+		float ink = smoothstep(0.62, 0.85, l);
+		vec3 still = mix(vec3(1.0), tint.rgb * 0.15, ink);
+		float ang = atan(d.y, d.x);
+		float line = step(0.82, h(floor(ang * 70.0)));
+		float r = length(d * vec2(1.6, 1.0));
+		still = mix(still, tint.rgb * 0.15, line * smoothstep(0.18, 0.6, r));
+		c = mix(c, still, frame_k);
+	}
+	COLOR = vec4(c, 1.0);
+}
+"""
+
+
+func _impact_overlay(flash: float) -> void:
+	var hud: Object = section.get("_hud")
+	if hud == null:
+		return
+	if _imp_rect == null:
+		var root: Control = hud.call("overlay_root") as Control
+		if root == null:
+			return
+		_imp_rect = ColorRect.new()
+		_imp_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		_imp_rect.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		var sh := Shader.new()
+		sh.code = IMPACT_SHADER
+		_imp_mat = ShaderMaterial.new()
+		_imp_mat.shader = sh
+		_imp_rect.material = _imp_mat
+		root.add_child(_imp_rect)
+		root.move_child(_imp_rect, 0)
+	_imp_mat.set_shader_parameter("tint", TINT)
+	_imp_rect.visible = true
+	var tw: Tween = _imp_rect.create_tween()
+	if flash >= 0.99:
+		# Three frames of the still, then the blur takes over.
+		_imp_mat.set_shader_parameter("frame_k", 1.0)
+		_imp_mat.set_shader_parameter("blur", 0.0)
+		tw.tween_interval(0.055)
+		tw.tween_callback(func() -> void: _imp_mat.set_shader_parameter("frame_k", 0.0))
+	else:
+		_imp_mat.set_shader_parameter("frame_k", 0.0)
+	tw.tween_method(func(b: float) -> void: _imp_mat.set_shader_parameter("blur", b),
+		0.09 * maxf(flash, 0.35), 0.0, 0.35).set_ease(Tween.EASE_OUT).set_trans(Tween.TRANS_QUAD)
+	tw.tween_callback(func() -> void: _imp_rect.visible = false)
+
+
+## A deep boom under the crash: a falling sub sweep with a hard transient.
+func _gen_boom() -> AudioStreamWAV:
+	var n: int = int(1.2 * SR)
+	var out := PackedFloat32Array()
+	out.resize(n)
+	var ph: float = 0.0
+	for i in n:
+		var t: float = float(i) / float(SR)
+		var f: float = lerpf(95.0, 32.0, minf(1.0, t / 0.6))
+		ph += TAU * f / float(SR)
+		var body: float = sin(ph) * exp(-t * 3.2)
+		var click: float = randf_range(-1.0, 1.0) * exp(-t * 90.0) * 0.8
+		out[i] = clampf((body * 1.4 + click) * minf(1.0, t * 600.0), -1.0, 1.0) * 0.9
+	return _wav(out)
 
 
 ## Shards that come back at the lens: they leave the wall slower than he runs,

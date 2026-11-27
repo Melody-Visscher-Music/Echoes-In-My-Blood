@@ -502,8 +502,38 @@ func apply_lod():
 		lod_shells.append(shells[next])
 		lod_shell_levels.append(next)
 
+## Echoes In My Blood: true while set_growth() assigns its fields, so their
+## setters do not each run the full setup_materials() pass.
+var _defer_setup: bool = false
+
+
+## Echoes In My Blood: changes the four growth values the game animates (static
+## charge, electric shock) in one go, touching only those four shader
+## parameters. Setting the properties one by one re-sent every parameter of
+## every shell four times over — tens of thousands of calls a frame while
+## animating, which is what made an electric-zone miss hitch.
+func set_growth(p_length: float, p_normal_strength: float, p_static_world: Vector3,
+		p_scruffiness: float) -> void:
+	_defer_setup = true
+	length = p_length
+	normal_strength = p_normal_strength
+	static_direction_world = p_static_world
+	scruffiness = p_scruffiness
+	_defer_setup = false
+	for mat: Material in shells:
+		var sm: ShaderMaterial = mat as ShaderMaterial
+		if sm == null:
+			continue
+		sm.set_shader_parameter("height", length)
+		sm.set_shader_parameter("normal_strength", normal_strength)
+		sm.set_shader_parameter("static_direction_world", static_direction_world)
+		sm.set_shader_parameter("scruffiness", scruffiness)
+
+
 # setup parameters for all shell materials
 func setup_materials():
+	if _defer_setup:
+		return
 	if mesh == null:
 		return
 	if shells.size() == 0:

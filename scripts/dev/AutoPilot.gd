@@ -30,8 +30,15 @@ var section: Node = null
 ## Per level, God .. Noob.
 const FUMBLE:    PackedFloat32Array = [0.00, 0.02, 0.07, 0.15, 0.30]
 const TIMING_SD: PackedFloat32Array = [0.00, 0.02, 0.045, 0.07, 0.11]
-const LANE_LEAD: PackedFloat32Array = [0.55, 0.45, 0.36, 0.28, 0.21]
+## Seconds before the beat a lane change starts. The game grades a lane press
+## against 0.10 s before the beat (Section_BeatRunner3d._GRADE_LANE_LEAD_S), so
+## God sits right on it; the others drift off it the way a person would.
+const LANE_LEAD: PackedFloat32Array = [0.12, 0.16, 0.22, 0.28, 0.21]
 var _skill: int = 0
+const WJ_NONE: int = 0
+const WJ_STEER: int = 1   # owns the steering only
+const WJ_ALL: int = 2     # owns everything
+
 var _wj_launched: Dictionary = {}   # wall-jump slot -> true once jumped from (or given up)
 var _wj_base_y: float = NAN         # his standing height at the foot of the climb
 var _grind_held: bool = false       # whether we are holding the grind action down
@@ -139,15 +146,20 @@ func _physics_process(_delta: float) -> void:
 	var lanes: int = (p.get("lane_xs") as PackedFloat32Array).size() \
 		if p.get("lane_xs") is PackedFloat32Array else 3
 
+	# Jumps peak, and slides are at their middle, as the gate arrives — which is
+	# also what the game grades as PERFECT.
 	var air_s: float = 2.0 * float(p.get("jump_velocity")) / maxf(float(p.get("gravity")), 0.1)
 	var slide_s: float = float(p.get("slide_duration"))
 
 	if _grind(p, pd, speed):
 		return
-	if _wall_jumps(p, pd, speed):
+	var wj: int = _wall_jumps(p, pd, speed)
+	if wj == WJ_ALL:
 		return
 
-	var lane_set: bool = false
+	# On the climb's runway the climb logic owns the steering (the runway is one
+	# lane wide), but a jump or slide gate placed there still has to be played.
+	var lane_set: bool = wj == WJ_STEER
 	for i in range(start, mini(start + 8, zs.size())):
 		if i >= judged.size() or bool(judged[i]):
 			continue
@@ -197,11 +209,13 @@ func _physics_process(_delta: float) -> void:
 ## jump before, which is why it cannot be driven from the gate list (the gate
 ## for ledge k is judged on that landing and is gone by then).
 ##
-## Returns true while he is inside the climb, so the gate loop stays out of it.
-func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
+## Returns WJ_ALL while he is inside the climb, so the gate loop stays out of
+## it; WJ_STEER on the runway before the first ledge, where it only owns the
+## steering; WJ_NONE elsewhere.
+func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> int:
 	var zs: Array = section.get("_wj_slot_zs")
 	if zs.is_empty():
-		return false
+		return WJ_NONE
 	# His position projected onto the path right now. The section's tracked
 	# distance only updates once per rendered frame, so after a hitch several
 	# physics steps in a row all read the same stale value.
@@ -217,11 +231,11 @@ func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
 	# Before the climb: be in the take-off lane for the first jump by the time
 	# he reaches the approach runway (the chart's own lane gates lead there too).
 	if pd < float(zs[0]) - 12.0:
-		return false
+		return WJ_NONE
 	var take_off: int = 0 if String(acts[0]) == "wall_left" else max_lane
 	if pd < float(zs[0]) - 6.0:
 		_steer_to(p, take_off)
-		return true
+		return WJ_STEER
 	if not _wj_launched.has(0):
 		_steer_to(p, take_off)   # the runway is one lane wide
 
@@ -234,8 +248,8 @@ func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
 			var ramp: int = int(section.get("_wj_ramp_lane"))
 			if ramp >= 0:
 				_steer_to(p, ramp)
-			return true
-		return false
+			return WJ_ALL
+		return WJ_NONE
 
 	# The next ledge he has not jumped from yet. One he has already overshot
 	# (fell, or a late landing past its far end) is given up on.
@@ -249,7 +263,7 @@ func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
 		k = s
 		break
 	if k < 0:
-		return true
+		return WJ_ALL
 
 	var key: String = "wj%d" % k
 	var pl: Dictionary = _plan_wall(key)
@@ -264,15 +278,15 @@ func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
 		# first costs a physics step or two of sliding forward before take-off.
 		var vy: float = (p as CharacterBody3D).velocity.y
 		if k == 0 or vy >= 0.0 or is_nan(_wj_base_y) or _skill >= 3:
-			return true   # beginners and noobs do not buffer
+			return WJ_ALL   # beginners and noobs do not buffer
 		var hts: Array = section.get("_wj_slot_heights")
 		var h: float = y - (_wj_base_y + float(hts[k]))
 		if h < -0.3:
-			return true   # below the ledge: falling past it, nothing to press for
+			return WJ_ALL   # below the ledge: falling past it, nothing to press for
 		var gg: float = maxf(float(p.get("gravity")), 0.1)
 		var t_land: float = (vy + sqrt(maxf(vy * vy + 2.0 * gg * maxf(h, 0.0), 0.0))) / gg
 		if t_land > 0.12:
-			return true
+			return WJ_ALL
 		buffered = true
 
 	# Aim the LANDING, not the take-off. The geometry tunes the jump for the
@@ -304,15 +318,16 @@ func _wall_jumps(p: Node, pd_tracked: float, speed: float) -> bool:
 	# Timing error in metres: positive offset = early, as everywhere else here.
 	var early_m: float = float(pl["offset"]) * real_speed
 	if lands_at + early_m < target:
-		return true
+		# Still on the runway before the first take-off: gates there still count.
+		return WJ_STEER if k == 0 else WJ_ALL
 	_wj_launched[k] = true
 	if bool(pl["skip"]):
-		return true   # froze: stands there and runs off the end of the ledge
+		return WJ_ALL   # froze: stands there and runs off the end of the ledge
 	var a: String = String(acts[k])
 	if bool(pl["wrong"]):
 		a = "wall_right" if a == "wall_left" else "wall_left"
 	p.call("request_action", a)
-	return true
+	return WJ_ALL
 
 
 ## Grind rails, and the spark taps on the wall-jump descent ramp.

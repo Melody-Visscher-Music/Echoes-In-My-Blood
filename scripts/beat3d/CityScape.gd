@@ -259,8 +259,10 @@ func pulse(delta: float, vitality: float, beat_s_in: float, player_pd: float,
 	# at high vitality they strobe hard on every beat.
 	var peak_e:  float = lerpf(0.5, 2.5, vit)
 	var peak_l:  float = lerpf(0.15, 1.8, vit)
-	var energy:  float = lerpf(lerpf(0.1, 0.6, vit), peak_e, _pulse_t)
-	var light_e: float = lerpf(lerpf(0.0, 0.3, vit), peak_l, _pulse_t)
+	# Reduced flashing: the buildings breathe instead of strobing on the beat.
+	var k: float = _pulse_t * GameConfig.flash_scale()
+	var energy:  float = lerpf(lerpf(0.1, 0.6, vit), peak_e, k)
+	var light_e: float = lerpf(lerpf(0.0, 0.3, vit), peak_l, k)
 
 	# Six shared palette materials rather than one per building (see
 	# _spawn_city_buildings), so this loop is a handful of writes.

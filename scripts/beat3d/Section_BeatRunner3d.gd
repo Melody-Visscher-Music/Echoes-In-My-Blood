@@ -103,6 +103,7 @@ var gate_actions:     PackedStringArray = PackedStringArray()
 var gate_is_electric: Array[bool]       = []
 
 var _judge_index: int = 0
+var _sink_cursor: int = 0   # first gate _sink_passed_gates() still has to look at
 var _vis_start_idx: int = 0   # lower-bound cursor for visibility loop
 var _world_index: int = 0
 @warning_ignore("unused_private_class_variable")
@@ -473,6 +474,12 @@ var _fx_beat_tween:  Tween              = null
 # Melody visual system — env reference for fog colour pulses
 var _melody_env: Environment = null
 var _sky_mat:    ShaderMaterial = null
+## Time of day on the story map's clock (SkyClock). Built on the first frame,
+## once the path exists to give the sun a bearing.
+var _sky_clock: SkyClock = null
+## The melody's fog tint, decaying back to the hour's own fog colour.
+var _fog_pulse_col: Color = Color.BLACK
+var _fog_pulse_k: float = 0.0
 var _fx_tween_host: Node = null   # PROCESS_MODE_INHERIT — pauses with SceneTree
 var _lyrics_scan_idx: int = 0   # monotonic cursor for _update_lyrics (see there)
 # Pooled world FX — halo rings, melody spires and wisps. Every one of these used
@@ -695,12 +702,28 @@ var _grind_cinema: GrindCinema = null
 ## Set by GrindCinema: added to the camera FOV while riding, and a multiplier
 ## on the rail's glow (the flow, the beat kicks, the stutter when dropped).
 var _grind_fov: float = 0.0
+# Wall-jump climb and charge tunnel, filmed (WallJumpCinema.gd / ChargeCinema.gd).
+var _wj_cinema: WallJumpCinema = null
+## FEVER (FeverMode.gd) and combo shields (ComboShield.gd).
+var _fever: FeverMode = null
+var _shield: ComboShield = null
+var _fever_beat_count: int = 0
+## Records the run and replays its best moment behind the results.
+var _replay: ReplayMoments = null
+var _perfect_streak: int = 0
+## Speed ramp: the camera widens as the combo multiplier climbs (RunnerFlair).
+var _speed_fov: float = 0.0
+var _charge_cinema: ChargeCinema = null
+var _wj_fov: float = 0.0
+var _charge_fov: float = 0.0
 var _grind_rail_boost: float = 1.0
 ## The running sections' extra visuals — see RunnerFlair.gd. Cosmetic only.
 var _flair: RunnerFlair = null
 ## Set by RunnerFlair from the combo: city window glow and laser brightness.
 var _flair_city_glow: float = 1.0
 var _flair_laser_k: float = 1.0
+## Reduced flashing: gate neon is built at this share of its normal glow.
+const _REDUCED_GATE_GLOW: float = 0.6
 var _grind_rail_root:    Node3D    = null   # parent for rail mesh segments
 var _grind_seg_start_pd: float     = 0.0
 var _grind_seg_end_pd:   float     = 0.0
@@ -964,7 +987,29 @@ func _ready() -> void:
 		_grind_cinema = GrindCinema.new()
 		add_child(_grind_cinema)
 		_grind_cinema.setup(self)
+	if not _wj_slot_zs.is_empty() and _wj_cinema == null:
+		_wj_cinema = WallJumpCinema.new()
+		add_child(_wj_cinema)
+		_wj_cinema.setup(self)
+	if not _drop_buildups.is_empty() and _charge_cinema == null:
+		_charge_cinema = ChargeCinema.new()
+		add_child(_charge_cinema)
+		_charge_cinema.setup(self)
+	if _fever == null:
+		_fever = FeverMode.new()
+		add_child(_fever)
+		_fever.setup(self)
+	if _replay == null:
+		_replay = ReplayMoments.new()
+		add_child(_replay)
+		_replay.setup(self)
+	if _shield == null:
+		_shield = ComboShield.new()
+		add_child(_shield)
+		_shield.setup(self)
 	_cam_prev_lane = player.current_lane
+	_practice_setup()
+	_practice_hud()
 
 	if _loading_layer != null:
 		_loading_layer.queue_free()
@@ -1074,6 +1119,20 @@ func _process(delta: float) -> void:
 	if dt_rainbow > 0.0:
 		_update_hud_rainbow(dt_rainbow)
 
+	# The sky runs on the story map's clock, in real time — pause and practice
+	# slow-down included, as the map's own clock keeps running through both.
+	if _sky_clock == null and _sky_mat != null and not _track_segs.is_empty():
+		_sky_clock = SkyClock.new()
+		_sky_clock.setup(_world_env, _sky_mat, _path_forward_at(0.0))
+	elif _sky_clock != null:
+		_sky_clock.advance(delta / maxf(Engine.time_scale, 0.05))
+	if _melody_env != null:
+		var base_fog: Color = _sky_clock.fog_color if _sky_clock != null else Color(0.12, 0.04, 0.25)
+		_fog_pulse_k = maxf(0.0, _fog_pulse_k - delta / 1.4)
+		var fc: Color = base_fog.lerp(_fog_pulse_col, _fog_pulse_k)
+		fc.a = 1.0
+		_melody_env.fog_light_color = fc
+
 	# ── Countdown phase — wait for engine to settle before starting music ────
 	# (runs even if stream is null so the countdown can still fire and unblock input)
 	# The pause check has to come FIRST: this branch returns, so a _paused test
@@ -1117,22 +1176,26 @@ func _process(delta: float) -> void:
 	# ...and the HUD chassis breathes on the same value, so the whole UI is
 	# locked to the song rather than free-running on its own clock.
 	if _hud != null:
-		_hud.pulse_beat(_beat_phase)
+		_hud.pulse_beat(_beat_phase * GameConfig.flash_scale())
 	# Beat camera pulse decays — drives FOV kick
 	_beat_cam_t = maxf(0.0, _beat_cam_t - delta * 5.0)
 	# Vitality drifts gently toward 0.50 baseline when nothing is happening
 	_world_vitality = lerpf(_world_vitality, 0.5, delta * 0.07)
 	_update_camera_fx(delta)
+	_sink_passed_gates()
 
 	# Game paused — only update the HUD so the overlay stays responsive
 	if _paused:
 		return
 
 	player.set_song_time(t_s)
+	if _practice_on and t_s >= _practice_t1 and not _song_finish_pending:
+		_practice_reached_end()
+		return
 
 	# First frames of a song on a device whose sound runs late: the stream is
 	# playing but none of it has reached the ear yet. Let him go when it does.
-	if _sync_hold and _song_clock() >= 0.0:
+	if _sync_hold and _song_clock() >= _practice_t0:
 		_sync_hold = false
 		player.set_physics_process(true)
 
@@ -1262,8 +1325,17 @@ func _process(delta: float) -> void:
 	# Running sections: gate shards, trail, city heat, sky, trackside (RunnerFlair.gd)
 	if _flair != null:
 		_flair.update(t_s, delta)
+	if _fever != null:
+		_fever.update(delta)
+	if _replay != null and not _song_finish_pending:
+		_replay.record(delta, t_s)
+	if _shield != null:
+		_shield.update(delta)
 	# Charge tunnel — drop buildups (free-slide hoop threading → ×100 overdrive)
 	_update_charge_tunnel(t_s, delta)
+	# ...filmed: hoop ignition, aura, letterbox, the drop (ChargeCinema.gd)
+	if _charge_cinema != null:
+		_charge_cinema.update(t_s, delta)
 	# Smash gates — the mash window, the wall's cracks, the impact
 	if _smash != null:
 		_smash.update(t_s, delta)
@@ -1273,6 +1345,9 @@ func _process(delta: float) -> void:
 	# here, after the path-tracking block above, so it tests a _player_path_dist
 	# that is current this frame rather than one frame stale.
 	_update_wj_bonus(delta)
+	# The climb, filmed: crane cam, wall prints, target ring, dive (WallJumpCinema.gd)
+	if _wj_cinema != null:
+		_wj_cinema.update(t_s, delta)
 	_update_lyrics(t_s)
 
 	# Floor glow under each foot strike
@@ -1281,7 +1356,7 @@ func _process(delta: float) -> void:
 	# Fall detection — show death/retry screen if player drops into the void
 	if not _fell and player.global_position.y < -12.0:
 		# DEVTOOLS — no-death puts him back on the track instead. Remove with the console.
-		if dev_no_death and DevTools.no_death:
+		if (dev_no_death and DevTools.no_death) or _practice_on:
 			_dev_rescue()
 		else:
 			_fell = true
@@ -1402,12 +1477,15 @@ func _start_level() -> void:
 	# opens below zero (it is "position minus offset") and he waits at the line
 	# until it gets there — _process releases him. Starting him now and letting
 	# the sync claw the offset back would play the opening bars visibly slow.
-	_sync_origin_dist = _path_dist_of_player_unclamped()
+	# Practice starts the song part-way in; he was already moved to match, so
+	# the origin (where he stood at song time 0) is that far back along the path.
+	_sync_origin_dist = _path_dist_of_player_unclamped() - _practice_t0 * player.forward_speed
 	_sync_err_s = 0.0
 	player.sync_speed_scale = 1.0
 	player.input_disabled = false
+	_practice_apply_speed()
 	if music.stream != null:
-		music.play()
+		music.play(_practice_t0)
 	_sync_hold = music.stream != null and GameConfig.get_audio_offset_s() > 0.0
 	player.set_physics_process(not _sync_hold)
 
@@ -1482,6 +1560,14 @@ func _update_song_sync(delta: float) -> void:
 	_sync_err_s = (_player_path_dist - target) / maxf(player.forward_speed, 0.001)
 	var want: float = 1.0 - clampf(_sync_err_s * _SYNC_GAIN,
 		-_SYNC_MAX_TRIM, _SYNC_MAX_TRIM)
+	# No trim on the wall-jump climb. Every launch is tuned so the arc lands on
+	# the next ledge at normal speed; after a long frame hitch the trim ran at
+	# +12 % for a second or more and carried him off the far end of a ledge.
+	# The climb is judged by position, not time, so being a little behind the
+	# music there costs nothing — he catches up on the platform and the ramp.
+	if _wj_climb_top_z >= 0.0 and is_finite(_wj_zone_start_z) \
+			and _player_path_dist >= _wj_zone_start_z and _player_path_dist < _wj_climb_top_z + 1.0:
+		want = 1.0
 	player.sync_speed_scale = lerpf(player.sync_speed_scale, want,
 		1.0 - exp(-_SYNC_SMOOTH * delta))
 
@@ -1598,6 +1684,7 @@ func _load_chart_and_build_plan() -> void:
 	runner_plan = _build_runner_plan_from_beats(gameplay_events)
 	_insert_smash_entries()
 	_parse_drop_buildups(d)
+	_force_charge_exit_lanes()
 	_parse_electric_zones(d)
 	_link_smash_zones()
 	_parse_lyrics(d)
@@ -1760,6 +1847,10 @@ func _smash_roll_pulse() -> void:
 ## Called by SmashGate when a wall breaks: score it, charge the health.
 func _on_smash_resolved(gi: int, presses: int, target: int, hp_cost: float,
 		heal_hp: float = 0.0) -> void:
+	_sec_add("smash", clampf(float(presses) / float(maxi(target, 1)), 0.0, 1.0))
+	var smash_k: float = float(presses) / float(maxi(target, 1))
+	if _replay != null and smash_k >= 0.6:
+		_replay.mark(70.0 + 30.0 * minf(smash_k, 1.0), "SMASH", _song_time())
 	if gi >= 0 and gi < gate_judged.size():
 		gate_judged[gi] = true
 		gate_success[gi] = true
@@ -3963,6 +4054,14 @@ func _build_gate_body(gate_index: int) -> void:
 		_looks.build(vis_root, action, post_lane, tint, _is_electric_at(t_s), gate_index)
 
 	_gate_cycle_mats[gate_index] = _collect_cycle_mats(gate)
+	# Reduced flashing: the gates' neon burns lower. They are the biggest,
+	# brightest things on screen and sweep past the camera on every beat, so a
+	# softer glow is what takes the beat-to-beat swing out of the frame. Their
+	# colours are untouched — they still read by type.
+	if GameConfig.reduced_flashing and action != "smash":
+		for m: Material in _gate_cycle_mats[gate_index]:
+			if m != null:
+				NeonMat.set_energy(m, NeonMat.get_energy(m) * _REDUCED_GATE_GLOW)
 	_gate_vis_built[gate_index] = true
 
 
@@ -4376,7 +4475,8 @@ func _update_electric_dark(delta: float, t_s: float) -> void:
 	_elec_dark = move_toward(_elec_dark, want, delta * _ELEC_DARK_RATE)
 
 	if _world_env != null:
-		_world_env.ambient_light_energy = lerpf(0.18, _ELEC_AMBIENT_ENV, _elec_dark)
+		var amb0: float = _sky_clock.ambient_energy if _sky_clock != null else 0.18
+		_world_env.ambient_light_energy = lerpf(amb0, _ELEC_AMBIENT_ENV, _elec_dark)
 		# The sky and the fog are most of what is left once the lamps are out.
 		# A sweep of the zone with each group of the level hidden in turn put
 		# the frame at 140/255 average with everything visible, and hiding
@@ -4733,6 +4833,9 @@ func _update_electric_gate_visuals(t_s: float) -> void:
 						or (show_third and i == rank2)):
 					_gate_revealed[i] = true
 				want = _gate_revealed[i]
+		# Shorted out on a miss (ElecShortOut): gone for good.
+		if gate.has_meta("shorted"):
+			want = false
 		if vis.visible != want:
 			vis.visible = want
 			# Revealed by the preview, not by coming into range: play the
@@ -5543,6 +5646,11 @@ func _spawn_wj_geometry_on_path() -> void:
 	# ── 8. Gate culling for WJ section ───────────────────────────────────────
 	var first_wj_z:    float = active_zs[0]
 	var desc_zone_end: float = slide_end_z
+	# The ramp is one lane wide over a void and locks jumping until 4 m past its
+	# foot, so a gate just past the bottom could not be made: a lane gate there
+	# would need him off the ramp before it ends, a jump gate a jump the lock
+	# refuses. Hide those too — a short, clean landing before the chart resumes.
+	var cull_end: float = slide_end_z + maxf(4.0 + gate_depth, player.forward_speed * 0.45)
 	for gi in range(gate_nodes.size()):
 		var gz:    float  = gate_world_zs[gi]
 		var act:   String = String(runner_plan[gi].get("action", ""))
@@ -5552,9 +5660,10 @@ func _spawn_wj_geometry_on_path() -> void:
 			should_cull = false        # approach zone — keep setup gates
 		elif gz >= first_wj_z and gz < elev_start_z:
 			should_cull = not is_wj    # climbing void — only WJ gates visible
-		elif gz >= elev_start_z and gz < desc_zone_end:
-			should_cull = true         # elevated floor + descent — clean cooldown, hide all gates
+		elif gz >= elev_start_z and gz < cull_end:
+			should_cull = not is_wj    # elevated floor + descent + landing — clean cooldown
 		if should_cull:
+			gate_nodes[gi].set_meta("wj_culled", true)   # never shown, not even in a replay
 			gate_nodes[gi].visible = false
 			gate_nodes[gi].process_mode = Node.PROCESS_MODE_DISABLED
 			if gi < gate_judged.size():
@@ -5743,7 +5852,10 @@ func _judge_passed_unhit_gates_by_position() -> void:
 
 		# ── Charge-tunnel skip: player is free-sliding through a drop buildup ──
 		# They can't act on normal gates while threading hoops; auto-pass silently.
-		if player.is_charge_sliding():
+		# Only gates INSIDE the tunnel: this loop looks up to 30 m ahead, so without
+		# the bound the first few gates after the drop were skipped too (never
+		# counted as a hit or a miss) just because the slide had not ended yet.
+		if player.is_charge_sliding() and gate_z < _charge_seg_end_pd:
 			gate_judged[i] = true
 			gate_success[i] = false
 			if i < gate_nodes.size() and is_instance_valid(gate_nodes[i]):
@@ -6131,6 +6243,40 @@ func _is_in_rap_segment(t_s: float) -> bool:
 # Charge tunnel — drop-buildup hoop threading → ×100 multiplier window
 # ════════════════════════════════════════════════════════════════════════════
 
+## The lane nearest where a buildup's weave ends — where he comes out of the
+## tunnel if he followed it, and the lane the free-slide hands him back to.
+func _charge_exit_lane(seg: Dictionary) -> int:
+	var run_m: float = (float(seg.get("end_t", 0.0)) - float(seg.get("start_t", 0.0))) * player.forward_speed
+	var gx: float = sin(run_m * _CHARGE_WEAVE_FREQ) * _CHARGE_WEAVE_AMP
+	var best_i: int = 0
+	var best_d: float = INF
+	for i in range(player.lane_xs.size()):
+		var dd: float = absf(player.lane_xs[i] - gx)
+		if dd < best_d:
+			best_d = dd
+			best_i = i
+	return best_i
+
+
+## The first gate after a charge tunnel is on the lane the weave ends in. He
+## spends the whole buildup steering freely, so a gate on any other lane right
+## at the drop could only be reacted to, never lined up for — same rule as the
+## middle-lane gate after a smash. Wall-jump and smash entries keep their own.
+func _force_charge_exit_lanes() -> void:
+	for seg: Dictionary in _drop_buildups:
+		var et: float = float(seg.get("end_t", 0.0))
+		var lane: int = _charge_exit_lane(seg)
+		for e: Dictionary in runner_plan:
+			if float(e.get("t", 0.0)) < et:
+				continue
+			var act: String = String(e.get("action", ""))
+			if act.begins_with("wall") or act == "smash":
+				break
+			e["pre_lane"] = lane
+			e["post_lane"] = lane
+			break
+
+
 ## Lateral offset (metres from track centre) of the hoop opening at a path distance.
 ## A smooth side-to-side weave the player must follow to keep threading hoops.
 func _gap_curve_x(pd: float) -> float:
@@ -6355,8 +6501,8 @@ func _spawn_charge_tunnel(seg: Dictionary) -> void:
 	var ring := TorusMesh.new()
 	ring.inner_radius  = _CHARGE_GAP_RADIUS
 	ring.outer_radius  = _CHARGE_GAP_RADIUS + 0.16
-	ring.rings         = 8
-	ring.ring_segments = 20
+	ring.rings         = 40   # round, not an octagon, now the hoops are lit up
+	ring.ring_segments = 10
 
 	var pd:  float = _charge_seg_start_pd
 	var idx: int   = 0
@@ -6388,14 +6534,22 @@ func _spawn_charge_tunnel(seg: Dictionary) -> void:
 		idx += 1
 		pd  += _CHARGE_HOOP_SPACING
 
+	if _charge_cinema != null:
+		_charge_cinema.on_spawn(_charge_root, _charge_seg_start_pd, _CHARGE_HOOP_SPACING, _CHARGE_GAP_RADIUS)
 	_update_charge_hud()
 
 
 func _despawn_charge_tunnel() -> void:
 	if _charge_root != null and is_instance_valid(_charge_root):
-		_charge_root.queue_free()
+		# Kept (hidden) rather than freed, so the results replay can show it.
+		if _replay != null:
+			_replay.keep_tunnel(_charge_root, _charge_seg_start_pd, _CHARGE_HOOP_SPACING)
+		else:
+			_charge_root.queue_free()
 	_charge_root     = null
 	_charge_active   = false
+	if _charge_cinema != null:
+		_charge_cinema.on_despawn()
 	_charge_building = false
 	if player != null:
 		player.set_charge_slide(false)
@@ -6420,6 +6574,7 @@ func _finalize_charge(t_s: float) -> void:
 		timing = 0.0
 
 	var fill: float = _charge * lerpf(0.45, 1.0, timing)
+	_sec_add("charge", clampf(fill, 0.0, 1.0))
 
 	player.set_charge_slide(false)   # hand back to lane play for the drop
 
@@ -6432,8 +6587,14 @@ func _finalize_charge(t_s: float) -> void:
 		_show_grind_banner("⚡  ×%d  OVERDRIVE  (%.1fs)" % [_CHARGE_MULT_VALUE, _charge_mult_timer],
 			Color(0.40, 0.90, 1.00), 0.85)
 		_shake_camera()
+		if _charge_cinema != null:
+			_charge_cinema.on_payoff(true)
+		if _replay != null:
+			_replay.mark(90.0, "OVERDRIVE", _song_time())
 	else:
 		_show_grind_banner("…charge fizzled", Color(0.60, 0.60, 0.72))
+		if _charge_cinema != null:
+			_charge_cinema.on_payoff(false)
 	_charge = 0.0
 
 
@@ -6938,6 +7099,7 @@ func _check_missed_sparks() -> void:
 			# Only counts against you while you're actually riding the rail. Breaks the
 			# FLOW multiplier and, after too many in a row, drops you off the rail.
 			if player.is_grinding() and not _grind_failed:
+				_sec_add("grind", 0.0)
 				_grind_flow_streak = 0
 				_grind_flow_mult   = 1
 				_grind_miss_streak += 1
@@ -6969,6 +7131,7 @@ func _on_grind_tap() -> void:
 
 func _catch_spark(idx: int) -> void:
 	_spark_caught[idx]    = true
+	_sec_add("grind", 1.0)
 	_grind_caught_this_seg += 1
 
 	# Ramping FLOW multiplier: climbs with each consecutive catch, resets on a miss.
@@ -7028,6 +7191,7 @@ func _grind_fail_off() -> void:
 		return
 	_grind_failed = true
 	_show_grind_banner("✕  DROPPED!", Color(1.0, 0.35, 0.30))
+	GameConfig.rumble(0.3, 0.7, 0.25)
 	if _grind_cinema != null:
 		_grind_cinema.on_drop()
 	if _hud != null:
@@ -7076,6 +7240,8 @@ func _score_multiplier() -> int:
 	# third of a second, the bonus itself does not.
 	if _wj_mult_active:
 		base *= 2
+	if _fever != null:
+		base *= _fever.multiplier()
 	return base
 
 
@@ -7086,6 +7252,8 @@ func _update_wj_bonus(delta: float) -> void:
 	if _wj_mult_active:
 		if _wj_climb_top_z >= 0.0 and _player_path_dist >= _wj_climb_top_z:
 			_wj_mult_active = false
+			if _replay != null:
+				_replay.mark(80.0, "WALL JUMP", _song_time())
 			_wj_mult_fade   = _WJ_MULT_FADE_S
 			# Push the score card immediately so the multiplier readout drops back
 			# to the combo value on the same frame the bonus ends, rather than
@@ -7276,6 +7444,14 @@ func _on_gate_scored(success: bool) -> void:
 			_gates_missed += 1
 			_update_hud_score()
 			return
+		# A combo shield takes the miss: it still counts as one in the results,
+		# but the combo, the multiplier and the health all survive it.
+		if _shield != null and _shield.try_absorb():
+			_gates_missed += 1
+			_update_hud_score()
+			return
+		if _fever != null:
+			_fever.on_miss()
 		var miss_in_zone: bool = _is_electric_at(_song_time())
 		_combo = 0
 		_gates_missed += 1
@@ -7289,7 +7465,10 @@ func _on_gate_scored(success: bool) -> void:
 			# Clipping a live gate arcs. The room comes back for a third of a
 			# second — every lamp, every surface — and then the dark slams shut
 			# again, which costs you the night vision you had just earned.
-			_elec_blind_t = _ELEC_BLIND_S
+			# Reduced flashing: no relight — the room stays dark, the miss
+			# still reads through the HUD and the sound.
+			if not GameConfig.reduced_flashing:
+				_elec_blind_t = _ELEC_BLIND_S
 			_hud_flash_color(Color(0.85, 0.95, 1.00, 0.55), 0.22)
 			# Same damage as before; this is only what it looks and sounds like.
 			if _menace != null and player != null:
@@ -7311,6 +7490,9 @@ func _on_gate_scored(success: bool) -> void:
 
 
 func _show_streak_milestone(combo: int) -> void:
+	# A small moment for the replay, so a run with nothing bigger still has one.
+	if _replay != null:
+		_replay.mark(minf(15.0 + float(combo) * 0.1, 45.0), "×%d STREAK" % combo, _song_time())
 	if _flair != null:
 		_flair.on_milestone(combo)
 	if _hud == null:
@@ -7363,6 +7545,7 @@ func _trigger_death() -> void:
 	if _song_finish_pending:
 		return
 	_song_finish_pending = true   # blocks further scoring and re-entry
+	GameConfig.rumble(0.6, 1.0, 0.6)
 	_warm_exit_screen()
 
 	music.stop()
@@ -7471,20 +7654,24 @@ func _update_camera_fx(delta: float) -> void:
 		return
 
 	# FOV breathe on beat — very subtle, just enough to feel alive
-	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5 - _smash_squeeze * 6.0 \
-		+ _smash_punch * _smash_punch * 9.0 + _grind_fov
+	# Reduced flashing also calms the camera: the beat bounce, the lane-change
+	# tilt and the miss nudge all shrink with the same scale.
+	var cam_fs: float = GameConfig.flash_scale()
+	_camera.fov = _cam_fov_base + _beat_cam_t * 1.5 * cam_fs - _smash_squeeze * 6.0 \
+		+ _smash_punch * _smash_punch * 9.0 + _grind_fov + _wj_fov + _charge_fov 		+ _speed_fov + (_fever.fov_add if _fever != null else 0.0)
 
 	# Tilt toward new lane — gentle, barely-there weight
 	var cur_lane: int = player.current_lane
 	if cur_lane != _cam_prev_lane:
 		var dir: int = cur_lane - _cam_prev_lane
-		_cam_tilt = clamp(_cam_tilt + dir * 0.6, -1.2, 1.2)
+		_cam_tilt = clamp(_cam_tilt + dir * 0.6 * cam_fs, -1.2, 1.2)
 		_cam_prev_lane = cur_lane
 	_cam_tilt = lerpf(_cam_tilt, 0.0, delta * 7.0)
 
 	# Arc lean — smooth z-roll that builds into corners and unwinds after.
 	# arc_bank_raw (-1..1) is also forwarded to the player for character banking.
-	const ARC_LEAN_MAX_DEG: float = 5.0
+	# Corner lean stays (it is the turn, not a flourish) but gentler.
+	var ARC_LEAN_MAX_DEG: float = 5.0 * lerpf(0.5, 1.0, cam_fs)
 	var arc_lean_target: float = 0.0
 	var arc_bank_raw:    float = 0.0
 	while _arc_fx_cursor < _turn_arc_ends.size() \
@@ -7504,12 +7691,182 @@ func _update_camera_fx(delta: float) -> void:
 	_cam_arc_tilt = lerpf(_cam_arc_tilt, arc_lean_target, delta * 3.0)
 	player.set_arc_bank(arc_bank_raw)
 
-	_camera.rotation_degrees.z = _cam_tilt + _cam_arc_tilt
+	_camera.rotation_degrees.z = _cam_tilt + _cam_arc_tilt 		+ (_fever.roll_deg if _fever != null else 0.0)
+
+
+# ── Practice mode ─────────────────────────────────────────────────────────────
+# Song select hands over Run.practice = {song, t0, t1, speed, loop, label}.
+# The level is built exactly as normal (same seed, so a loop is the same
+# layout), then everything before t0 is skipped silently, he is moved down the
+# track to where the song will be, and the music starts at t0. At t1 it either
+# reloads (loop) or shows the results. Nothing is saved, and he cannot fail:
+# health never runs out and a fall puts him back on the track.
+
+var _practice_on: bool = false
+var _practice_t0: float = 0.0
+var _practice_t1: float = INF
+var _practice_speed: float = 1.0
+var _practice_loop: bool = false
+var _practice_pitch_fx: AudioEffectPitchShift = null
+
+
+func _practice_setup() -> void:
+	var pr: Dictionary = Run.practice
+	if pr.is_empty() or Run.in_story_mode() or String(pr.get("song", "")) != Run.current_song_key:
+		return
+	_practice_on = true
+	_practice_speed = clampf(float(pr.get("speed", 1.0)), 0.25, 1.0)
+	_practice_loop = bool(pr.get("loop", false))
+	_practice_t1 = float(pr.get("t1", INF))
+	dev_no_death = true
+	var spd: float = player.forward_speed
+	var t0: float = maxf(0.0, float(pr.get("t0", 0.0)))
+	# Never drop him into the middle of something that has to be entered from
+	# its start: back up to just before it instead.
+	for _pass in 2:
+		if not _wj_slot_zs.is_empty() and is_finite(_wj_zone_start_z):
+			var wz0: float = (_wj_zone_start_z - 30.0) / spd
+			var wz1: float = (_wj_slide_end_z + 4.0) / spd
+			if t0 > wz0 and t0 < wz1:
+				t0 = maxf(0.0, wz0)
+		for h: Dictionary in _smash_holds:
+			if t0 > float(h["t0"]) - 2.5 and t0 < float(h["t1"]) + 0.6:
+				t0 = maxf(0.0, float(h["t0"]) - 3.0)
+		for seg: Dictionary in _drop_buildups:
+			if t0 > float(seg["start_t"]) - _CHARGE_LEAD_S and t0 < float(seg["end_t"]):
+				t0 = maxf(0.0, float(seg["start_t"]) - _CHARGE_LEAD_S - 0.5)
+		for rs: Dictionary in _rap_segs:
+			var r0: float = float(rs.get("start_t", 0.0))
+			var r1: float = float(rs.get("end_t", 0.0))
+			if t0 > r0 - 1.5 and t0 < r1:
+				t0 = maxf(0.0, r0 - 2.0)
+	_practice_t0 = t0
+	if t0 <= 0.05:
+		_practice_t0 = 0.0
+		return
+	# Everything before the start: judged and gone, without scoring.
+	for i in mini(gate_nodes.size(), runner_plan.size()):
+		if float(runner_plan[i].get("t", 0.0)) < t0 - 0.05:
+			if i < gate_judged.size():
+				gate_judged[i] = true
+				gate_success[i] = true
+			if is_instance_valid(gate_nodes[i]):
+				gate_nodes[i].visible = false
+				gate_nodes[i].process_mode = Node.PROCESS_MODE_DISABLED
+	if _smash != null:
+		_smash.skip_before(t0)
+	while _gameplay_pulse_index < gameplay_events.size() \
+			and float(gameplay_events[_gameplay_pulse_index].get("t", 0.0)) < t0:
+		_gameplay_pulse_index += 1
+	while _world_index < world_events.size() \
+			and float(world_events[_world_index].get("t", 0.0)) < t0:
+		_world_index += 1
+	# Move him to where the song will be.
+	var here: float = _path_dist_of_player_unclamped()
+	var pd: float = here + t0 * spd
+	# On the path line: he stands ~0.5 below it, so this is a short settle
+	# rather than the drop from the spawn height.
+	var pos: Vector3 = _path_world_pos(pd, player.lane_xs[player.target_lane], 0.0)
+	player.velocity = Vector3.ZERO
+	player.global_position = pos
+	_player_path_dist = pd
+	if not _track_segs.is_empty():
+		_last_seg_idx = _path_seg_idx_at(pd)
+		var seg2: TrackSeg = _track_segs[_last_seg_idx] as TrackSeg
+		player.set_forward_dir(seg2.direction, seg2.right, seg2.direction)
+		player.set_track_center(_path_pos_at(pd))
+		player.rotation.y = atan2(seg2.direction.x, seg2.direction.z)
+	_update_gate_visibility()
+
+
+func _practice_hud() -> void:
+	if not _practice_on or _hud == null or not _hud.has_method("set_practice_tag"):
+		return
+	_hud.set_practice_tag("PRACTICE  ·  %d%%%s" % [roundi(_practice_speed * 100.0),
+		"  ·  LOOP" if _practice_loop else ""])
+
+
+## Slow-down: the whole game runs slower (physics, animation, effects), and the
+## song with it, pitch-corrected so it stays in key. Jump arcs and the climb
+## are identical in song time, so nothing becomes impossible at a low speed.
+func _practice_apply_speed() -> void:
+	if not _practice_on or _practice_speed >= 0.999:
+		return
+	Engine.time_scale = _practice_speed
+	music.pitch_scale = _practice_speed
+	var bus: int = AudioServer.get_bus_index("Music")
+	if bus >= 0:
+		_practice_pitch_fx = AudioEffectPitchShift.new()
+		_practice_pitch_fx.pitch_scale = 1.0 / _practice_speed
+		AudioServer.add_bus_effect(bus, _practice_pitch_fx)
+
+
+func _practice_restore_speed() -> void:
+	Engine.time_scale = 1.0
+	if _practice_pitch_fx != null:
+		var bus: int = AudioServer.get_bus_index("Music")
+		if bus >= 0:
+			for k in range(AudioServer.get_bus_effect_count(bus) - 1, -1, -1):
+				if AudioServer.get_bus_effect(bus, k) == _practice_pitch_fx:
+					AudioServer.remove_bus_effect(bus, k)
+		_practice_pitch_fx = null
+
+
+## The end of the practice part.
+func _practice_reached_end() -> void:
+	if _practice_loop:
+		get_tree().reload_current_scene()   # same seed → the same layout again
+		return
+	_song_finish_pending = true
+	_practice_restore_speed()
+	player.forward_speed = 0.0
+	player.velocity = Vector3.ZERO
+	music.stop()
+	_spawn_results_panel()
+
+
+## Anything between the camera and Meeko is a gate he has already passed. Left
+## standing, a tall one fills the whole frame for the moment the camera rides
+## through it (a block right after the charge-tunnel drop hid him completely).
+## So a passed gate sinks into the floor as the camera closes in on it — late
+## enough that its pass/miss reaction is still seen, early enough that the lens
+## never ends up inside it.
+func _sink_passed_gates() -> void:
+	if _camera == null or player == null:
+		return
+	var off: Vector3 = _camera.global_position - player.global_position
+	var cam_back: float = Vector2(off.x, off.z).length()
+	if cam_back < 1.0:
+		return
+	var pd: float = _player_path_dist
+	var n: int = mini(gate_nodes.size(), gate_world_zs.size())
+	# Gates sorted by Z: skip the ones the camera is well past.
+	while _sink_cursor < n and gate_world_zs[_sink_cursor] < pd - cam_back - 2.0:
+		var g0: Node3D = gate_nodes[_sink_cursor]
+		if is_instance_valid(g0) and g0.scale.y != 1.0:
+			g0.scale = Vector3.ONE
+		_sink_cursor += 1
+	for i in range(_sink_cursor, n):
+		var gz: float = gate_world_zs[i]
+		if gz > pd:
+			break
+		var g: Node3D = gate_nodes[i]
+		if not is_instance_valid(g) or not g.visible:
+			continue
+		var act: String = gate_actions[i] if i < gate_actions.size() else ""
+		if act == "smash" or act.begins_with("wall"):
+			continue
+		# 0 while it is still more than (cam_back - 1.5) m ahead of the lens, 1 by
+		# the time the lens is a metre short of it.
+		var behind: float = pd - gz
+		var k: float = clampf((behind - (cam_back - 3.2)) / 1.7, 0.0, 1.0)
+		k = k * k * (3.0 - 2.0 * k)
+		g.scale = Vector3(1.0, maxf(0.02, 1.0 - k), 1.0)
 
 
 func _shake_camera() -> void:
 	# Small impulse on miss — camera nudges slightly then recovers
-	_cam_tilt = clamp(_cam_tilt - 1.2, -2.0, 2.0)
+	_cam_tilt = clamp(_cam_tilt - 1.2 * GameConfig.flash_scale(), -2.0, 2.0)
 
 
 # ── World environment (neon cyberpunk look) ───────────────────────────────────
@@ -7755,6 +8112,7 @@ func _vp() -> Vector2:
 func _pause_game() -> void:
 	_warm_exit_screen()
 	_paused = true
+	Engine.time_scale = 1.0   # practice slow-down: menus run at full speed
 	self.process_mode   = Node.PROCESS_MODE_ALWAYS  # keep input + HUD alive
 	get_tree().paused   = true                       # freeze everything else
 	music.stream_paused = true
@@ -7769,6 +8127,9 @@ func _pause_confirm(option: int) -> void:
 			_resume_game()
 		1:  # Restart — costs one life, reloads the game scene
 			_resume_game()   # unpause first so scene change is clean
+			if _practice_on:
+				get_tree().reload_current_scene()   # practice: same part, no life spent
+				return
 			Run.song_lives -= 1
 			var exhausted: bool = (Run.song_lives <= 0)
 			if exhausted:
@@ -7781,11 +8142,13 @@ func _pause_confirm(option: int) -> void:
 			get_tree().reload_current_scene()
 		2:  # Main Menu
 			_resume_game()
+			Run.practice   = {}
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file("res://scenes/Main.tscn")
 		3:  # Song Select / Story Map
 			_resume_game()
+			Run.practice   = {}
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file(Run.level_exit_scene())
@@ -7813,6 +8176,8 @@ func _resume_game() -> void:
 	get_tree().paused   = false                       # unfreeze everything
 	_paused = false
 	music.stream_paused = false
+	if _practice_on and _level_started:
+		Engine.time_scale = _practice_speed
 	# Only hand physics back if the level is actually running. Pausing during the
 	# countdown and resuming used to switch physics on regardless, so the runner
 	# started moving (forward_speed is applied whether or not input is enabled)
@@ -7827,6 +8192,19 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 	if idx < 0 or idx >= gate_nodes.size():
 		return
 	_on_gate_scored(success)
+	if not _song_finish_pending:
+		var sact: String = gate_actions[idx] if idx < gate_actions.size() else ""
+		if sact.begins_with("wall"):
+			_sec_add("climb", 1.0 if success else 0.0)
+		elif sact in ["left", "right", "jump", "slide"]:
+			_sec_add("gates", 1.0 if success else 0.0)
+	if success and not _song_finish_pending:
+		_apply_timing_grade(idx)
+	if not _song_finish_pending:
+		if success:
+			GameConfig.rumble(0.35, 0.0, 0.06)
+		else:
+			GameConfig.rumble(0.2, 0.6, 0.18)
 	var gate: Node3D = gate_nodes[idx]
 	var hit_color: Color = Color(0.30, 1.00, 0.40, 1.0) if success else Color(1.00, 0.20, 0.20, 1.0)
 
@@ -7847,12 +8225,19 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 		# Relative, not absolute. The old code set 1.35 flat, which brightened a
 		# StandardMaterial3D whose base was 0.35 — but the world shaders sit at
 		# 2–5.5, so the same literal would have DIMMED the gate on a clean hit.
-		NeonMat.set_energy(mat, maxf(NeonMat.get_energy(mat) * 1.8, 4.0))
+		# Reduced flashing: the colour change carries the result (green / red)
+		# without the brightness jump — the gate is right in front of the
+		# camera on its beat, so this was one of the biggest flashes in the game.
+		var fs_gate: float = GameConfig.flash_scale()
+		if fs_gate >= 1.0:
+			NeonMat.set_energy(mat, maxf(NeonMat.get_energy(mat) * 1.8, 4.0))
+		else:
+			NeonMat.set_energy(mat, NeonMat.get_energy(mat) * lerpf(1.0, 1.8, fs_gate))
 
 	# Light burst on hit/miss at the gate position
 	var flash := OmniLight3D.new()
 	flash.light_color  = hit_color
-	flash.light_energy = 2.5 if success else 1.2
+	flash.light_energy = (2.5 if success else 1.2) * GameConfig.flash_scale()
 	flash.omni_range   = 14.0
 	flash.position     = gate.global_position + Vector3(0.0, 1.5, 0.0)
 	world_fx_root.add_child(flash)
@@ -7866,6 +8251,95 @@ func _mark_gate_result(idx: int, success: bool) -> void:
 	# Shards on a hit, the screen glitch on a miss (RunnerFlair).
 	if _flair != null:
 		_flair.on_gate(idx, success, gate_color)
+
+# ── Timing grades ─────────────────────────────────────────────────────────────
+# A hit gate is also graded on WHEN the press came, against the beat the gate
+# sits on: PERFECT / GREAT / GOOD. It is a bonus on top of the gate's normal
+# points (+50 % / +20 % / +0), so nothing scores less than it used to and old
+# high scores stay comparable. Passing is unchanged — a GOOD is still a hit.
+#
+# The target is the press that puts him exactly right AT the beat: a jump that
+# peaks over the gate (half its airtime early), a slide whose middle is under
+# the bar (half its length early), a lane change that has arrived (a touch
+# early). Pressing dead on the beat looks like the "rhythm" answer, but it
+# cannot clear two jumps or slides close together — he is still in the air or
+# the slide is still cooling down — so grading that would punish the timing
+# the game actually needs. A lane gate he was already lined up for well in
+# advance has nothing to time and is not graded.
+
+const GRADE_PERFECT: int = 0
+const GRADE_GREAT:   int = 1
+const GRADE_GOOD:    int = 2
+const GRADE_NAMES: PackedStringArray = ["PERFECT", "GREAT", "GOOD"]
+const _GRADE_BONUS: PackedFloat32Array = [0.5, 0.2, 0.0]
+const _GRADE_PERFECT_S: float = 0.07
+const _GRADE_GREAT_S:   float = 0.14
+const _GRADE_LANE_LEAD_S: float = 0.10
+## [perfect, great, good] this run — the results screen reads it.
+var grade_counts: PackedInt32Array = PackedInt32Array([0, 0, 0])
+
+
+## The grade for a hit gate, or -1 when it has nothing to time.
+func _grade_gate(idx: int) -> int:
+	if idx >= runner_plan.size() or player == null:
+		return -1
+	var e: Dictionary = runner_plan[idx]
+	var act: String = gate_actions[idx] if idx < gate_actions.size() else String(e.get("action", ""))
+	var beat: float = float(e.get("t", 0.0))
+	var press: float
+	var target: float = beat
+	match act:
+		"jump":
+			press = player.last_jump_song_t
+			target = beat - player.jump_velocity / maxf(player.gravity, 0.1)   # half the airtime
+		"slide":
+			press = player.last_slide_song_t
+			target = beat - player.slide_duration * 0.5
+		"left", "right":
+			press = maxf(player.last_left_song_t, player.last_right_song_t)
+			target = beat - _GRADE_LANE_LEAD_S
+			# Already there long before: nothing was timed.
+			if press < beat - 0.6 or press > beat + 0.3:
+				return -1
+		_:
+			return -1
+	var d: float = absf(press - target)
+	if d <= _GRADE_PERFECT_S:
+		return GRADE_PERFECT
+	if d <= _GRADE_GREAT_S:
+		return GRADE_GREAT
+	return GRADE_GOOD
+
+
+## FeverMode tells the section when it kicks in: a gold flash, and the HUD
+## combo flares gold.
+func _fever_started() -> void:
+	if _replay != null:
+		_replay.mark(60.0, "FEVER", _song_time())
+	_hud_flash_color(Color(1.0, 0.82, 0.25, 0.22 * GameConfig.flash_scale()), 0.4)
+	if _hud != null:
+		_hud.combo_flash(Color(1.6, 1.25, 0.3, 1.0), 0.08, 0.4)
+
+
+func _apply_timing_grade(idx: int) -> void:
+	var g: int = _grade_gate(idx)
+	if g < 0:
+		return
+	grade_counts[g] += 1
+	if _fever != null:
+		_fever.on_grade(g)
+	_perfect_streak = _perfect_streak + 1 if g == GRADE_PERFECT else 0
+	if _replay != null and _perfect_streak >= 10 and _perfect_streak % 10 == 0:
+		_replay.mark(minf(30.0 + float(_perfect_streak) * 0.5, 75.0),
+			"%d PERFECTS" % _perfect_streak, _song_time())
+	var base: int = 1000 if _is_electric_at(_song_time()) else 500
+	var bonus: int = int(float(base * _score_multiplier()) * _GRADE_BONUS[g])
+	if bonus > 0:
+		_score += bonus
+		_update_hud_score()
+	if _hud != null and _hud.has_method("show_judgement"):
+		_hud.show_judgement(g)
+
 
 ## Slot pool for the hit echo.
 ##
@@ -8166,8 +8640,9 @@ func _pulse_world(pass_id: String, note_dur: float = 0.0) -> void:
 	# bloom with light, then dissolve — like ghost pillars rising together.
 	# Both sides get the same colour and energy, so these are hoisted out of the
 	# loop; the pool owns the node, mesh and material for each one.
-	var spire_e: float = lerpf(2.5, 6.0, vit)
-	var bloom_e: float = lerpf(1.8, 4.0, vit)
+	var fs_mel: float = maxf(GameConfig.flash_scale(), 0.25)
+	var spire_e: float = lerpf(2.5, 6.0, vit) * fs_mel
+	var bloom_e: float = lerpf(1.8, 4.0, vit) * fs_mel
 	for spire_lat: float in [-7.2, 7.2]:
 		_fx_pool.spawn_spire(_path_world_pos(spire_pd, spire_lat, -0.8), pulse_color, spire_e)
 		# Light bloom at spire peak
@@ -8223,11 +8698,8 @@ func _pulse_world(pass_id: String, note_dur: float = 0.0) -> void:
 	# The world's atmospheric fog briefly absorbs the melody's colour —
 	# a full-scene tint that feels cinematic without cluttering the track.
 	if _melody_env != null:
-		var fog_target: Color = pulse_color.darkened(0.50)
-		fog_target.a = 1.0
-		_melody_env.fog_light_color = fog_target
-		var ftw := create_tween()
-		ftw.tween_property(_melody_env, "fog_light_color", Color(0.12, 0.04, 0.25, 1.0), 1.4)
+		_fog_pulse_col = pulse_color.darkened(0.50)
+		_fog_pulse_k = GameConfig.flash_scale()
 
 func _run_floor_beats(t_s: float) -> void:
 	while _gameplay_pulse_index < gameplay_events.size():
@@ -8244,6 +8716,10 @@ func _pulse_floor_beat(t_s: float) -> void:
 	# Snap beat phase to 1 — decays in _process to drive per-frame brightness spikes
 	_beat_phase   = 1.0
 	_beat_cam_t   = 1.0   # camera FOV pulse
+	_fever_beat_count += 1
+	# Rumble: a soft tick on every beat, so the pad keeps time with the song.
+	if not (player != null and player.is_grinding()):
+		GameConfig.rumble(0.10, 0.0, 0.04)
 	# The character punctuates the beat too, rather than free-running on its own
 	# clock while the whole rest of the world pulses with the song.
 	if player != null:
@@ -8257,12 +8733,16 @@ func _pulse_floor_beat(t_s: float) -> void:
 
 	# Floor emission pulse — peak height and decay speed scale with vitality
 	if _floor_material != null:
-		var peak: float = lerpf(0.15, 0.90, vit)
+		# Reduced flashing: the floor still marks the beat, but as a soft swell
+		# rather than the whole track flashing.
+		var fs_floor: float = GameConfig.flash_scale()
+		var peak: float = lerpf(0.15, 0.90, vit) * fs_floor
 		_floor_material.emission_enabled = true
 		_floor_material.emission = pulse_color
 		_floor_material.emission_energy_multiplier = peak
 		var tw: Tween = create_tween()
-		tw.tween_property(_floor_material, "emission_energy_multiplier", 0.02, lerpf(0.25, 0.14, vit))
+		tw.tween_property(_floor_material, "emission_energy_multiplier", 0.02,
+			lerpf(0.25, 0.14, vit) / maxf(fs_floor, 0.5))
 		tw.tween_property(_floor_material, "emission", Color(0.0, 0.0, 0.0, 1.0), 0.14)
 
 	# Beat light burst at player — range and energy scale with vitality.
@@ -8273,7 +8753,7 @@ func _pulse_floor_beat(t_s: float) -> void:
 			_fx_beat_light.light_energy = 0.0
 			world_fx_root.add_child(_fx_beat_light)
 		_fx_beat_light.light_color  = pulse_color
-		_fx_beat_light.light_energy = lerpf(0.3, 2.2, vit)
+		_fx_beat_light.light_energy = lerpf(0.3, 2.2, vit) * GameConfig.flash_scale()
 		_fx_beat_light.omni_range   = lerpf(6.0, 16.0, vit)
 		_fx_beat_light.position     = player.global_position + Vector3(0.0, 2.2, 0.0)
 		if _fx_beat_tween != null and _fx_beat_tween.is_valid():
@@ -8439,7 +8919,7 @@ func _ensure_speed_streaks() -> void:
 	# Y is the streak's LENGTH: Y_TO_VELOCITY aligns the mesh's Y axis with the
 	# particle's direction of travel, whichever way that happens to point.
 	var qm := QuadMesh.new()
-	qm.size = Vector2(0.045, 1.10)
+	qm.size = Vector2(0.035, 0.80)   # was 0.045 × 1.10 — read as white bars
 	qm.surface_set_material(0, _streak_material())
 
 	var jc: Color = GameConfig.jacket_color
@@ -8501,7 +8981,7 @@ func _update_speed_streaks() -> void:
 	# like the fastest the game gets, whatever combo happens to be behind it.
 	var od:      bool  = _charge_mult_timer > 0.0
 	var combo_f: float = float(_combo)
-	var flare:   float = _beat_phase * _beat_phase   # snappier than raw phase
+	var flare:   float = _beat_phase * _beat_phase * GameConfig.flash_scale()   # snappier than raw phase
 
 	var t: float = 1.0 if od else clampf(combo_f / _STREAK_FULL_COMBO, 0.0, 1.0)
 	# A floor rather than a fade from zero: below ×2 there is no multiplier and
@@ -8510,6 +8990,11 @@ func _update_speed_streaks() -> void:
 	# too faint to see from the rear camera.
 	var dens: float = 0.0 if (not od and combo_f < _STREAK_MIN_COMBO) \
 		else lerpf(0.34, 1.0, t)
+	# On the wall-jump climb he zig-zags sideways and up, so the burst sprays
+	# diagonally across the frame instead of trailing behind him: keep a hint.
+	var climbing: bool = _wj_climb_top_z >= 0.0 and is_finite(_wj_zone_start_z) 		and _player_path_dist >= _wj_zone_start_z and _player_path_dist < _wj_climb_top_z + 2.0
+	if climbing:
+		dens *= 0.25
 	_speed_streaks.amount_ratio = clampf(dens + flare * 0.15, 0.0, 1.0)
 	var vel: float = lerpf(12.0, 22.0, t) + flare * 8.0
 	_speed_streaks_mat.initial_velocity_min = vel
@@ -8519,7 +9004,7 @@ func _update_speed_streaks() -> void:
 	# and bloom without a second material write.
 	var base: Color = Color(1.00, 0.82, 0.25) if od \
 		else GameConfig.jacket_color.lerp(Color(1.0, 1.0, 1.0), t * 0.55)
-	var energy: float = lerpf(1.45, 2.20, t) + flare * 0.90
+	var energy: float = lerpf(0.95, 1.50, t) + flare * 0.60
 	_speed_streaks_mat.color = Color(base.r * energy, base.g * energy, base.b * energy, 1.0)
 
 
@@ -8829,6 +9314,66 @@ func _finish_story_run() -> void:
 ## needs every one of these anyway. Cached and handed back on any later call: it
 ## MUTATES _score and writes to the save, and a perfect bonus quietly applying
 ## twice is not the kind of bug that announces itself.
+# ── Per-section results ───────────────────────────────────────────────────────
+# Each kind of section keeps a running score so the results screen can say
+# what went well and what to work on: gates (hit rate), grind rails (sparks
+# caught while riding), the wall-jump climb (ledges landed), the charge tunnel
+# (final fill) and smash gates (presses against the target). Each is a 0..1
+# sum over its attempts; the screen shows the average as a percentage and a
+# letter. The best per section per song is kept, so a section can show NEW
+# BEST even on a run that is not a new high score.
+
+const SECTION_ORDER: PackedStringArray = ["gates", "grind", "climb", "charge", "smash"]
+const SECTION_NAMES: Dictionary = {"gates": "GATES", "grind": "GRIND RAILS",
+	"climb": "WALL JUMPS", "charge": "CHARGE TUNNEL", "smash": "SMASH GATES"}
+var _sec_stats: Dictionary = {}   # key -> Vector2(sum, attempts)
+
+
+func _sec_add(key: String, v: float) -> void:
+	if _song_finish_pending:
+		return
+	var cur: Vector2 = _sec_stats.get(key, Vector2.ZERO)
+	_sec_stats[key] = cur + Vector2(v, 1.0)
+
+
+static func section_letter(pct: float) -> String:
+	if pct >= 0.9999: return "S"
+	if pct >= 0.90: return "A"
+	if pct >= 0.75: return "B"
+	if pct >= 0.60: return "C"
+	if pct >= 0.40: return "D"
+	return "F"
+
+
+## [{key, name, pct, letter, detail, new_best, best}] for the sections this run had.
+func _section_results() -> Array[Dictionary]:
+	var out: Array[Dictionary] = []
+	var save_ok: bool = DevTools.may_save_score() and not _practice_on
+	for key: String in SECTION_ORDER:
+		if not _sec_stats.has(key):
+			continue
+		var st: Vector2 = _sec_stats[key]
+		if st.y <= 0.0:
+			continue
+		var pct: float = st.x / st.y
+		var detail: String
+		match key:
+			"gates": detail = "%d / %d" % [roundi(st.x), roundi(st.y)]
+			"grind": detail = "%d / %d SPARKS" % [roundi(st.x), roundi(st.y)]
+			"climb": detail = "%d / %d LEDGES" % [roundi(st.x), roundi(st.y)]
+			"charge": detail = "%d%% FILL" % roundi(pct * 100.0)
+			"smash": detail = "%d WALL%s" % [roundi(st.y), "" if roundi(st.y) == 1 else "S"]
+			_: detail = ""
+		var best: float = Save.get_section_best(Run.current_song_key, key)
+		var new_best: bool = pct > best + 0.0001 and best >= 0.0
+		if save_ok and pct > best:
+			Save.set_section_best(Run.current_song_key, key, pct)
+		out.append({"key": key, "name": SECTION_NAMES.get(key, key.to_upper()), "pct": pct,
+			"letter": section_letter(pct), "detail": detail,
+			"new_best": new_best and save_ok, "best": best})
+	return out
+
+
 func _finalise_score() -> Dictionary:
 	if not _score_final.is_empty():
 		return _score_final
@@ -8841,7 +9386,7 @@ func _finalise_score() -> Dictionary:
 	# Save high score and find out if it is a new record
 	# DEVTOOLS — dev-assisted runs only reach the save when the console says so.
 	var is_new_hs: bool = false
-	if DevTools.may_save_score():
+	if DevTools.may_save_score() and not _practice_on:
 		is_new_hs = Save.save_high_score(Run.current_song_key, _score, _max_combo)
 	var hs: Dictionary = Save.get_high_score(Run.current_song_key)
 
@@ -8864,6 +9409,9 @@ func _finalise_score() -> Dictionary:
 		grade = "F";  grade_col = Color(1.00, 0.30, 0.30)   # red
 
 	_score_final = {
+		"sections": _section_results(),
+		"timing": grade_counts,
+		"practice": _practice_on,
 		"score": _score,
 		"best": int(hs.get("score", 0)),
 		"is_perfect": is_perfect,
@@ -9248,13 +9796,17 @@ func _spawn_finish_orb_burst() -> void:
 ## decided here, because _finalise_score() is also what writes the high score.
 func _spawn_results_panel() -> void:
 	player.input_disabled = true
+	var replay_on: bool = _replay != null and _replay.has_clip()
 	_menus.open_results(_overlay_root(), {
+		"replay": replay_on,
 		"result": _finalise_score(),
 		"score": _score,
 		"gates_hit": _gates_hit,
 		"gates_missed": _gates_missed,
 		"max_combo": _max_combo,
 	})
+	if replay_on:
+		_replay.play(_overlay_root())
 
 
 func _end_confirm(option: int) -> void:
@@ -9262,10 +9814,12 @@ func _end_confirm(option: int) -> void:
 		0:  # Play Again — relaunch with the same song key and mode
 			get_tree().change_scene_to_file("res://scenes/GameScene.tscn")
 		1:  # Song Select / Story Map
+			Run.practice   = {}
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file(Run.level_exit_scene())
 		2:  # Main Menu
+			Run.practice   = {}
 			Run.run_seed   = 0
 			Run.song_lives = GameConfig.lives_per_song
 			get_tree().change_scene_to_file("res://scenes/Main.tscn")
@@ -10644,6 +11198,7 @@ func _tile_authored_straights(body: Node3D, r_len: float) -> void:
 
 
 func _exit_tree() -> void:
+	_practice_restore_speed()
 	if _piece_lib != null:
 		_piece_lib.clear()   # free orphan authored-piece templates
 		_piece_lib = null
